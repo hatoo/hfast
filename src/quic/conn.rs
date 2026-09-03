@@ -4,6 +4,7 @@
 //! the transport around it.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rustls::Side;
 use rustls::quic::{DirectionalKeys, KeyChange, Keys, ServerConnection, Version};
@@ -110,6 +111,11 @@ struct SpaceState {
     crypto_out: Vec<u8>,
     crypto_offset: u64,
     crypto_in: Assembler,
+    /// TLS bytes handed to a packet that has not been acknowledged, and the
+    /// packet they went in. A handshake flight is a few of these at most.
+    crypto_flight: Vec<(u64, u64, Vec<u8>)>,
+    /// When the oldest unacknowledged packet in this space went out
+    oldest_sent: Option<Instant>,
 }
 
 pub struct Connection {
@@ -155,6 +161,16 @@ pub struct Connection {
     data_seen: u64,
     max_streams_bidi: u64,
     initial_max_data: u64,
+
+    // ---- loss recovery ----
+    /// Smoothed round trip time, and how much it varies (RFC 9002 Section 5)
+    srtt: Duration,
+    rttvar: Duration,
+    /// When the packet a round trip is being measured from went out
+    rtt_probe: Option<(Space, u64, Instant)>,
+    /// How many probe timeouts have fired in a row without an acknowledgement,
+    /// which is what backs the timer off
+    pto_count: u32,
 }
 
 impl Connection {
@@ -215,6 +231,11 @@ impl Connection {
             data_seen: 0,
             max_streams_bidi,
             initial_max_data,
+            // RFC 9002 Section 6.2.2: 333ms until a round trip has been seen
+            srtt: Duration::from_millis(333),
+            rttvar: Duration::from_millis(166),
+            rtt_probe: None,
+            pto_count: 0,
         })
     }
 
@@ -298,6 +319,19 @@ impl Connection {
                 continue;
             }
             self.recv_packet(&mut datagram[at..end], space)?;
+            // RFC 9001 Section 4.9.1: a Handshake packet from the client
+            // proves it has moved on, and the Initial space is done with
+            if space == Space::Handshake {
+                self.discard(Space::Initial);
+                self.initial = None;
+            }
+            // Section 4.9.2: once the handshake is complete the Handshake
+            // space is done too. Holding on to either means sending packets
+            // the peer threw away the keys for, for ever.
+            if self.handshake.is_some() && !self.tls.is_handshaking() {
+                self.discard(Space::Handshake);
+                self.handshake = None;
+            }
             at = end;
         }
         Ok(())
@@ -369,9 +403,19 @@ impl Connection {
             } => {
                 let st = &mut self.spaces[space as usize];
                 st.largest_acked = Some(st.largest_acked.map_or(largest, |l| l.max(largest)));
+                st.crypto_flight.retain(|&(pn, _, _)| pn > largest);
+                self.pto_count = 0;
+                if let Some((probe_space, pn, at)) = self.rtt_probe
+                    && probe_space == space
+                    && pn <= largest
+                {
+                    self.rtt_probe = None;
+                    self.on_rtt(Instant::now() - at);
+                }
                 if space == Space::Data && !self.unacked.is_empty() {
                     self.on_ack(largest, first_range, rest);
                 }
+                self.settle_timer(space, Instant::now());
             }
             frame::Frame::PathChallenge(data) => self.path_response = Some(data),
             frame::Frame::Close => self.closed = true,
@@ -428,25 +472,43 @@ impl Connection {
         }
     }
 
-    /// Retire every answer the peer has acknowledged
+    /// Retire every answer the peer has acknowledged, and send again the ones
+    /// far enough behind an acknowledged packet to be lost
+    ///
+    /// RFC 9002 Section 6.1.1: three packets acknowledged after one is enough
+    /// to call it lost, and waiting for the probe timer instead is the
+    /// difference between recovering in a round trip and recovering in tens of
+    /// milliseconds.
+    const LOSS_THRESHOLD: u64 = 3;
+
     fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) {
         let ranges: Vec<(u64, u64)> = frame::AckRanges::new(largest, first_range, rest).collect();
         let mut retired = false;
+        let lost_before = largest.saturating_sub(Self::LOSS_THRESHOLD);
+        let ready = &mut self.ready;
+        let streams = &mut self.streams;
+        let base = self.base_stream;
+        let mut finished = self.finished;
         self.unacked.retain(|&(pn, id)| {
             if !ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi) {
+                if pn < lost_before {
+                    ready.push(id);
+                    return false;
+                }
                 return true;
             }
             if let Some(i) = (id >> 2)
-                .checked_sub(self.base_stream)
+                .checked_sub(base)
                 .and_then(|n| usize::try_from(n).ok())
-                && i < self.streams.len()
+                && i < streams.len()
             {
-                self.streams[i] = None;
-                self.finished += 1;
+                streams[i] = None;
+                finished += 1;
                 retired = true;
             }
             false
         });
+        self.finished = finished;
         if retired {
             self.retire();
         }
@@ -489,7 +551,7 @@ impl Connection {
     pub fn wants_send(&self) -> bool {
         !self.ready.is_empty()
             || self.path_response.is_some()
-            || (self.connected && !self.handshake_done_sent)
+            || (!self.tls.is_handshaking() && !self.handshake_done_sent)
             || (self.connected && self.control_sent < CONTROL_PRELUDE.len())
             || self.credit_owed()
             || self
@@ -580,6 +642,7 @@ impl Connection {
             frame::put_ack(&mut body, &st.ack.ranges, 0);
             st.ack.owed = false;
         }
+        let ack_only_len = body.len();
         if !st.crypto_out.is_empty() {
             let n = st
                 .crypto_out
@@ -588,6 +651,9 @@ impl Connection {
             if n > 0 {
                 let chunk: Vec<u8> = st.crypto_out.drain(..n).collect();
                 frame::put_crypto(&mut body, st.crypto_offset, &chunk);
+                // Kept until acknowledged: a lost handshake packet is the one
+                // loss a connection cannot get past on its own
+                st.crypto_flight.push((pn, st.crypto_offset, chunk));
                 st.crypto_offset += n as u64;
             }
         }
@@ -596,7 +662,12 @@ impl Connection {
                 put_varint(&mut body, frame::PATH_RESPONSE);
                 body.extend_from_slice(&data);
             }
-            if self.connected && !self.handshake_done_sent {
+            // RFC 9001 Section 4.1.2: this says the handshake is confirmed,
+            // which it is not until the client's Finished has arrived. Sending
+            // it as soon as rustls hands over 1-RTT keys tells the client it is
+            // done before it is, so it throws away its handshake keys and never
+            // sends the Finished at all - and then nothing ever confirms.
+            if !self.tls.is_handshaking() && !self.handshake_done_sent {
                 put_varint(&mut body, frame::HANDSHAKE_DONE);
                 self.handshake_done_sent = true;
             }
@@ -605,6 +676,7 @@ impl Connection {
         if body.is_empty() {
             return Ok(());
         }
+        let ack_eliciting = body.len() > ack_only_len;
         // Header protection samples 16 bytes starting four past where the
         // packet number begins, so a packet has to carry that much whatever it
         // has to say (RFC 9001 Section 5.4.2). A HANDSHAKE_DONE on its own
@@ -668,7 +740,95 @@ impl Connection {
             pn_offset - packet_start,
             pn_len,
         )?;
+
+        // A packet carrying nothing but an acknowledgement is not itself
+        // acknowledged, so waiting for one would be waiting for ever
+        if ack_eliciting {
+            let now = Instant::now();
+            self.spaces[space as usize].oldest_sent.get_or_insert(now);
+            if self.rtt_probe.is_none() {
+                self.rtt_probe = Some((space, pn, now));
+            }
+        }
         Ok(())
+    }
+
+    /// When to give up waiting and send what has not been acknowledged again
+    ///
+    /// RFC 9002 Section 6.2. This is the fallback, not the usual way a loss is
+    /// noticed: three packets acknowledged past one is what normally catches
+    /// it, and this only has to be short enough that a connection with nothing
+    /// left in flight to trigger that does not sit there. Making it tight
+    /// instead turns every quiet moment into a resend of everything.
+    pub fn timeout(&self) -> Option<Instant> {
+        let oldest = self.spaces.iter().filter_map(|s| s.oldest_sent).min()?;
+        let pto = (self.srtt
+            + (4 * self.rttvar).max(Duration::from_millis(1))
+            + Duration::from_millis(25))
+            * (1 << self.pto_count.min(6));
+        Some(oldest + pto)
+    }
+
+    /// Put back everything still in flight, to be sent again
+    pub fn on_timeout(&mut self, now: Instant) {
+        if self.timeout().is_none_or(|t| now < t) {
+            return;
+        }
+        self.pto_count = self.pto_count.saturating_add(1);
+        self.rtt_probe = None;
+        for st in &mut self.spaces {
+            st.oldest_sent = None;
+            // Crypto goes back on the front, in order
+            if !st.crypto_flight.is_empty() {
+                st.crypto_flight.sort_by_key(|(_, offset, _)| *offset);
+                let first = st.crypto_flight[0].1;
+                let mut back = Vec::new();
+                for (_, _, chunk) in st.crypto_flight.drain(..) {
+                    back.extend_from_slice(&chunk);
+                }
+                back.extend_from_slice(&st.crypto_out);
+                st.crypto_out = back;
+                st.crypto_offset = first;
+            }
+        }
+        // An answer that was not acknowledged is queued to go again
+        for (_, id) in self.unacked.drain(..) {
+            self.ready.push(id);
+        }
+    }
+
+    /// Forget a space: its keys are gone, so nothing in it can be sent or
+    /// acknowledged any more
+    fn discard(&mut self, space: Space) {
+        let st = &mut self.spaces[space as usize];
+        st.crypto_out.clear();
+        st.crypto_flight.clear();
+        st.ack.ranges.clear();
+        st.ack.owed = false;
+        st.oldest_sent = None;
+        if self.rtt_probe.is_some_and(|(s, _, _)| s == space) {
+            self.rtt_probe = None;
+        }
+    }
+
+    /// Whether this space is waiting on an acknowledgement for anything
+    fn in_flight(&self, space: Space) -> bool {
+        !self.spaces[space as usize].crypto_flight.is_empty()
+            || (space == Space::Data && !self.unacked.is_empty())
+    }
+
+    /// An acknowledgement arrived: the timer either has nothing left to wait
+    /// for, or starts again from now for whatever is still out there
+    fn settle_timer(&mut self, space: Space, now: Instant) {
+        let running = self.in_flight(space).then_some(now);
+        self.spaces[space as usize].oldest_sent = running;
+    }
+
+    /// Fold a round trip sample in (RFC 9002 Section 5.3)
+    fn on_rtt(&mut self, sample: Duration) {
+        let var = self.srtt.abs_diff(sample);
+        self.rttvar = (self.rttvar * 3 + var) / 4;
+        self.srtt = (self.srtt * 7 + sample) / 8;
     }
 }
 

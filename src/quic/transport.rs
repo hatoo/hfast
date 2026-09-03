@@ -119,7 +119,7 @@ pub fn encode(l: &Local) -> Vec<u8> {
         // The client's control stream and its two QPACK streams
         (INITIAL_MAX_STREAMS_UNI, 8),
         (ACK_DELAY_EXPONENT, 3),
-        (MAX_ACK_DELAY, 25),
+        (MAX_ACK_DELAY, 1),
     ] {
         put_varint(&mut out, id);
         put_varint(&mut out, super::wire::varint_len(value) as u64);

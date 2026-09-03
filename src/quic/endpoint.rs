@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::conn::Connection;
 use super::packet::{self, Kind, LOCAL_CID_LEN};
@@ -19,10 +20,17 @@ use crate::sys;
 /// making a connection for (RFC 9000 Section 14.1)
 const MIN_INITIAL: usize = 1200;
 
+/// How many datagrams may go by before the timers are looked at
+const TICK_EVERY: u32 = 2048;
+
+/// A client that has said nothing for this long is forgotten. It matches the
+/// idle timeout the transport parameters promise.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Endpoint {
     socket: UdpSocket,
     config: Arc<rustls::ServerConfig>,
-    conns: HashMap<SocketAddr, Connection>,
+    conns: HashMap<SocketAddr, (Connection, Instant)>,
     max_streams: u32,
     next_cid: u64,
     out: Vec<u8>,
@@ -42,11 +50,53 @@ impl Endpoint {
 
     pub fn run(&mut self) {
         let mut buf = vec![0u8; 65536];
+        // Short enough that a connection waiting on a lost packet does not
+        // wait on the socket as well, long enough that a quiet server is not
+        // spinning
+        let _ = self.socket.set_read_timeout(Some(Duration::from_millis(5)));
+        let mut since_tick = 0u32;
         loop {
-            let Ok((n, from)) = self.socket.recv_from(&mut buf) else {
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    self.datagram(&mut buf[..n], from);
+                    since_tick += 1;
+                    // Under load the socket never goes quiet, so the timers
+                    // would never be looked at if this were the only way in
+                    if since_tick >= TICK_EVERY {
+                        since_tick = 0;
+                        self.tick();
+                    }
+                }
+                Err(_) => {
+                    since_tick = 0;
+                    self.tick();
+                }
+            }
+        }
+    }
+
+    /// Give every connection that is waiting on something a chance to send it
+    /// again, and forget the ones that have gone away
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let due: Vec<SocketAddr> = self
+            .conns
+            .iter()
+            .filter(|(_, (c, last))| {
+                now.duration_since(*last) > IDLE_TIMEOUT || c.timeout().is_some_and(|t| now >= t)
+            })
+            .map(|(a, _)| *a)
+            .collect();
+        for addr in due {
+            let Some((conn, last)) = self.conns.get_mut(&addr) else {
                 continue;
             };
-            self.datagram(&mut buf[..n], from);
+            if now.duration_since(*last) > IDLE_TIMEOUT {
+                self.conns.remove(&addr);
+                continue;
+            }
+            conn.on_timeout(now);
+            self.flush(addr);
         }
     }
 
@@ -54,9 +104,10 @@ impl Endpoint {
         if !self.conns.contains_key(&from) && !self.accept(datagram, from) {
             return;
         }
-        let Some(conn) = self.conns.get_mut(&from) else {
+        let Some((conn, last)) = self.conns.get_mut(&from) else {
             return;
         };
+        *last = Instant::now();
         if conn.recv(datagram).is_err() || conn.closed {
             self.conns.remove(&from);
             return;
@@ -93,12 +144,12 @@ impl Endpoint {
         ) else {
             return false;
         };
-        self.conns.insert(from, conn);
+        self.conns.insert(from, (conn, Instant::now()));
         true
     }
 
     fn flush(&mut self, to: SocketAddr) {
-        let Some(conn) = self.conns.get_mut(&to) else {
+        let Some((conn, _)) = self.conns.get_mut(&to) else {
             return;
         };
         while conn.wants_send() {
