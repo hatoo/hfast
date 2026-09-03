@@ -22,8 +22,9 @@ fn main() {
     let mut quic_port = DEFAULT_QUIC;
     let mut threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut max_streams = DEFAULT_MAX_STREAMS;
-    // The QUIC stack being built here rather than quinn
-    let mut own_quic = false;
+    // Answer HTTP/3 from quinn rather than from the stack in `quic`, which is
+    // what this serves it from by default
+    let mut use_quinn = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -37,7 +38,7 @@ fn main() {
             "--quic" => quic_port = value() as u16,
             "--threads" => threads = value(),
             "--max-streams" => max_streams = value() as u32,
-            "--own-quic" => own_quic = true,
+            "--quinn" => use_quinn = true,
             _ => usage(),
         }
     }
@@ -48,9 +49,9 @@ fn main() {
     let mut running = Vec::new();
     if quic_port != 0 {
         eprintln!("hfast: HTTP/3 on udp/{quic_port}, {threads} threads");
-        running.push(std::thread::spawn(move || match own_quic {
-            true => quic::endpoint::serve(quic_port, threads, max_streams),
-            false => h3::serve(quic_port, threads, max_streams),
+        running.push(std::thread::spawn(move || match use_quinn {
+            true => h3::serve(quic_port, threads, max_streams),
+            false => quic::endpoint::serve(quic_port, threads, max_streams),
         }));
     }
     if tcp_port != 0 {
@@ -75,12 +76,15 @@ fn main() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: hfast [--tcp PORT] [--quic PORT] [--threads N] [--max-streams N]\n\
+        "usage: hfast [--tcp PORT] [--quic PORT] [--threads N] [--max-streams N] [--quinn]\n\
          \n\
          HTTP/1.1 and HTTP/2 (cleartext, told apart by the client's first\n\
          bytes) share the TCP port; HTTP/3 has the UDP one. A port of 0\n\
          turns that side off, which is worth doing when measuring the other:\n\
          each side takes a full set of threads.\n\
+         \n\
+         --quinn serves HTTP/3 from quinn instead of the QUIC stack here,\n\
+         which is slower and is kept for comparing the two.\n\
          \n\
          --max-streams is how many HTTP/3 requests a connection may have in\n\
          flight. Raising it costs server CPU per request, so raise it only to\n\

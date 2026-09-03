@@ -42,13 +42,12 @@ impl Kind {
     }
 }
 
-pub struct Header<'a> {
+pub struct Header {
     pub kind: Kind,
     pub dcid: ConnectionId,
     /// The peer's own id, which only a long header carries
     pub scid: ConnectionId,
     pub version: u32,
-    pub token: &'a [u8],
     /// Where the packet number starts, counted from the start of the datagram
     pub pn_offset: usize,
     /// Where this packet ends. A long header says so; a short header runs to
@@ -60,7 +59,7 @@ pub struct Header<'a> {
 ///
 /// A datagram may hold several packets, one after another, as long as every
 /// one but the last has a long header (RFC 9000 Section 12.2).
-pub fn parse(datagram: &[u8], at: usize) -> Result<Header<'_>> {
+pub fn parse(datagram: &[u8], at: usize) -> Result<Header> {
     let mut r = Reader::new(&datagram[at.min(datagram.len())..]);
     let first = r.peek()?;
     if first & 0x80 == 0 {
@@ -72,7 +71,6 @@ pub fn parse(datagram: &[u8], at: usize) -> Result<Header<'_>> {
             dcid,
             scid: ConnectionId::default(),
             version: VERSION_1,
-            token: &[],
             pn_offset: at + r.position(),
             end: datagram.len(),
         });
@@ -102,16 +100,16 @@ pub fn parse(datagram: &[u8], at: usize) -> Result<Header<'_>> {
             dcid,
             scid,
             version,
-            token: &[],
             pn_offset: at + r.position(),
             end: datagram.len(),
         });
     }
 
-    let token = match kind {
-        Kind::Initial => r.varint_slice()?,
-        _ => &[],
-    };
+    // An Initial carries a token, which this server never asks for and so
+    // never reads. It still has to be stepped over to find the length.
+    if kind == Kind::Initial {
+        r.varint_slice()?;
+    }
     let length = r.varint()?;
     let pn_offset = at + r.position();
     let end = pn_offset
@@ -125,7 +123,6 @@ pub fn parse(datagram: &[u8], at: usize) -> Result<Header<'_>> {
         dcid,
         scid,
         version,
-        token,
         pn_offset,
         end,
     })
@@ -208,7 +205,6 @@ mod tests {
         assert_eq!(h.kind, Kind::Initial);
         assert_eq!(h.dcid.as_slice(), &[1, 2, 3, 4]);
         assert_eq!(h.scid.as_slice(), &[9, 9]);
-        assert_eq!(h.token, b"tok");
         assert_eq!(h.end, d.len());
         assert_eq!(h.kind.space(), Some(Space::Initial));
     }

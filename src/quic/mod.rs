@@ -8,10 +8,6 @@
 //! See README.md for what it leaves out and why a load generator does not
 //! notice.
 
-// Being built: nothing calls into this yet, and the pieces land before the
-// thing that uses them does. Comes off when h3 is served from here.
-#![allow(dead_code)]
-
 pub mod assemble;
 pub mod conn;
 pub mod endpoint;

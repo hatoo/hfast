@@ -24,12 +24,14 @@ is the number that decides whether the server or the client is the bottleneck.
 |---|---|---|---|
 | HTTP/1.1 | 1,116,909 rps · 16.54 us/req | 1,697,440 rps · 8.95 us/req | 1.85x cheaper |
 | HTTP/2   | 1,408,387 rps · 18.56 us/req | 32,863,903 rps · 0.40 us/req | 46x cheaper |
-| HTTP/3   | 2,045,749 rps · 5.69 us/req | 2,973,451 rps · 3.07 us/req | 1.85x cheaper |
+| HTTP/3   | 1,948,323 rps · 6.05 us/req | 3,359,834 rps · 0.88 us/req | 6.9x cheaper |
 
 The HTTP/1.1 figure is within 6% of [faf](https://github.com/errantmind/faf),
 which is the fastest HTTP/1.1 implementation on the TechEmpower plaintext
 board and needs a nightly compiler; this needs stable. The HTTP/3 figure is
-what it is at 16 requests in flight per connection; at 64 it is 1.37 us.
+at 16 requests in flight per connection; at 64 it is 0.32us, and four threads
+answer 9.7 million requests a second - which is the load generator's ceiling,
+not this one's.
 
 ## What it skips, and why that is allowed
 
@@ -83,7 +85,32 @@ it puts sixteen requests in a TCP segment, and the kernel charges per segment.
 **No allocation per request.** Reads are parsed where they land, and only a
 trailing partial request is copied anywhere.
 
-## HTTP/3, and what a stream limit costs
+## HTTP/3
+
+The QUIC is ours. quinn's cost 1.53us of server CPU a request against the
+0.32us this does, and none of it was configuration: what a request cost there
+was hashing streams into a map and allocating per chunk, which is a fair way
+for a general-purpose stack to be built and not one a benchmark target has to
+pay. `--quinn` still serves HTTP/3 from quinn, for comparing the two.
+
+rustls does TLS 1.3, the QUIC key schedule and the AEAD, as it does for quinn.
+What is ours is the transport: packets, frames, acknowledgement, flow control
+and enough loss recovery to get through a path that drops things. Against a
+relay dropping 5% each way, 3000 requests all arrive at 3,922 a second, where
+quinn manages 3,960.
+
+Nothing in a request is read. A request's stream id is what says which stream
+to answer on and the end of the stream is what says to answer at all, so there
+is no reassembly and no allocation per request; the answer is a constant. That
+is the whole of the difference.
+
+What it leaves out, all of which a load generator does without: address
+validation and Retry, connection migration (connections are found by the
+address they came from), 0-RTT, key update, and congestion control - it sends
+what flow control allows, which for 25-byte answers on a benchmark path is
+what a controller would allow anyway.
+
+## What a stream limit costs
 
 `--max-streams` is how many requests a connection may have in flight, and it
 is the single setting that decides what HTTP/3 costs here. Raising it is not

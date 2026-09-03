@@ -285,13 +285,6 @@ pub fn put_ack(out: &mut Vec<u8>, ranges: &[(u64, u64)], delay: u64) {
     }
 }
 
-pub fn put_close(out: &mut Vec<u8>, code: u64) {
-    put_varint(out, CONNECTION_CLOSE);
-    put_varint(out, code);
-    put_varint(out, 0); // no frame type
-    put_varint(out, 0); // no reason
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
