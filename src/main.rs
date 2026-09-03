@@ -7,6 +7,7 @@
 mod h1;
 mod h2;
 mod h3;
+mod quic;
 mod sys;
 mod tcp;
 
