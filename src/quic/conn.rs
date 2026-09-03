@@ -15,6 +15,33 @@ use super::wire::{
 };
 use super::{MAX_DATAGRAM, TAG_LEN, assemble::Assembler, frame, transport};
 
+/// Stream type 0 (control) and an empty SETTINGS frame, which RFC 9114
+/// Sections 6.2 and 7.2.4 require to be the first thing a server says. It has
+/// nothing to say in it.
+const CONTROL_PRELUDE: &[u8] = b"\x00\x04\x00";
+
+/// The one answer this server gives, framed for HTTP/3: a HEADERS frame
+/// carrying a QPACK field section against the static table only, then a DATA
+/// frame carrying the body. See `h3.rs` for what each byte is.
+const RESPONSE: &[u8] = b"\x01\x08\x00\x00\xd9\xf5\x54\x02\x31\x33\x00\x0dHello, World!";
+
+/// The uni stream this server opens for its control stream. Server-initiated
+/// unidirectional streams are 3, 7, 11 (RFC 9000 Section 2.1) and this opens
+/// exactly one.
+const CONTROL_STREAM: u64 = 3;
+
+/// A request stream. Nothing about a request changes the answer, so the only
+/// thing worth keeping is how far it got.
+#[derive(Default)]
+struct Request {
+    /// The largest offset seen, which is the request's size once it ends
+    size: u64,
+    /// The client has said where the request ends
+    fin: bool,
+    /// The answer has been queued
+    answered: bool,
+}
+
 /// Room a packet's header and tag need before any payload fits
 const PACKET_OVERHEAD: usize = 1 + 4 + 1 + ConnectionId::MAX + 1 + ConnectionId::MAX + 1 + 4 + 4;
 
@@ -43,18 +70,32 @@ impl AckState {
         self.insert(pn);
     }
 
+    /// Out of order, or filling a gap. Ranges are kept largest first, and one
+    /// that ends up next to another is joined to it: an ACK frame is a list of
+    /// gaps, so two ranges with nothing between them cost a frame more to say
+    /// and mean the same thing.
     #[cold]
     fn insert(&mut self, pn: u64) {
         let at = self.ranges.partition_point(|r| r.0 > pn);
-        if let Some(r) = self.ranges.get_mut(at)
+        if let Some(r) = self.ranges.get(at)
             && pn >= r.0
             && pn <= r.1
         {
             return;
         }
-        self.ranges.insert(at, (pn, pn));
-        // An ACK frame that reaches back for ever costs more than it is worth;
-        // a peer that has not had one of these acknowledged by now will not.
+        let joins_above = at > 0 && self.ranges[at - 1].0 == pn + 1;
+        let joins_below = self.ranges.get(at).is_some_and(|r| r.1 + 1 == pn);
+        match (joins_above, joins_below) {
+            (true, true) => {
+                self.ranges[at - 1].0 = self.ranges[at].0;
+                self.ranges.remove(at);
+            }
+            (true, false) => self.ranges[at - 1].0 = pn,
+            (false, true) => self.ranges[at].1 = pn,
+            (false, false) => self.ranges.insert(at, (pn, pn)),
+        }
+        // Reaching back for ever costs more than it is worth: a peer that has
+        // not had one of these acknowledged by now will not.
         self.ranges.truncate(8);
     }
 }
@@ -91,6 +132,29 @@ pub struct Connection {
     /// A PATH_CHALLENGE waiting to be answered
     path_response: Option<[u8; 8]>,
     pub closed: bool,
+
+    // ---- streams ----
+    /// Client bidirectional streams, which requests are, indexed by number
+    /// from `base_stream`. A stream id says where its stream is, so nothing is
+    /// searched for.
+    streams: Vec<Option<Request>>,
+    base_stream: u64,
+    /// Streams whose answer is written but not yet in a packet
+    ready: Vec<u64>,
+    /// `(packet number, stream)` for every answer sent and not yet
+    /// acknowledged, so a lost one can be sent again
+    unacked: Vec<(u64, u64)>,
+    /// How much of the control stream has gone out
+    control_sent: usize,
+    /// Requests finished, which is the credit the client gets back
+    finished: u64,
+    /// The largest stream count and data limit told to the client
+    streams_told: u64,
+    data_told: u64,
+    /// Bytes the client has sent us across all streams
+    data_seen: u64,
+    max_streams_bidi: u64,
+    initial_max_data: u64,
 }
 
 impl Connection {
@@ -140,7 +204,54 @@ impl Connection {
             handshake_done_sent: false,
             path_response: None,
             closed: false,
+            streams: Vec::new(),
+            base_stream: 0,
+            ready: Vec::new(),
+            unacked: Vec::new(),
+            control_sent: 0,
+            finished: 0,
+            streams_told: max_streams_bidi,
+            data_told: initial_max_data,
+            data_seen: 0,
+            max_streams_bidi,
+            initial_max_data,
         })
+    }
+
+    /// The slot for a client bidirectional stream, made if it is new
+    ///
+    /// Client bidirectional streams are 0, 4, 8 (RFC 9000 Section 2.1), so the
+    /// id says which slot without anything being searched for.
+    fn stream_mut(&mut self, id: u64) -> Option<&mut Request> {
+        if id & 3 != 0 {
+            return None;
+        }
+        let n = id >> 2;
+        let i = usize::try_from(n.checked_sub(self.base_stream)?).ok()?;
+        // A client that opens more than it was allowed is not answered
+        if i >= self.max_streams_bidi as usize + self.streams.len() {
+            return None;
+        }
+        if i >= self.streams.len() {
+            self.streams.resize_with(i + 1, || None);
+        }
+        Some(self.streams[i].get_or_insert_with(Request::default))
+    }
+
+    /// Forget the streams at the front that have been answered and
+    /// acknowledged, so the table does not grow for the life of the run
+    fn retire(&mut self) {
+        let n = self
+            .streams
+            .iter()
+            .position(|s| s.is_some())
+            .unwrap_or(self.streams.len());
+        if n > 0 {
+            // Counted first and shifted once: taking them off the front one at
+            // a time would move the rest as many times as there are of them
+            self.streams.drain(..n);
+            self.base_stream += n as u64;
+        }
     }
 
     fn remote_keys(&self, space: Space) -> Option<&DirectionalKeys> {
@@ -250,9 +361,17 @@ impl Connection {
                     self.pump_tls();
                 }
             }
-            frame::Frame::Ack { largest, .. } => {
+            frame::Frame::Ack {
+                largest,
+                first_range,
+                rest,
+                ..
+            } => {
                 let st = &mut self.spaces[space as usize];
                 st.largest_acked = Some(st.largest_acked.map_or(largest, |l| l.max(largest)));
+                if space == Space::Data && !self.unacked.is_empty() {
+                    self.on_ack(largest, first_range, rest);
+                }
             }
             frame::Frame::PathChallenge(data) => self.path_response = Some(data),
             frame::Frame::Close => self.closed = true,
@@ -262,13 +381,75 @@ impl Connection {
             | frame::Frame::Ping
             | frame::Frame::Padding
             | frame::Frame::Ignored => {}
-            // Streams arrive once the handshake is done; the layer above this
-            // takes them, and until it exists they are not an error
-            frame::Frame::Stream { .. }
-            | frame::Frame::StopSending { .. }
-            | frame::Frame::ResetStream { .. } => {}
+            frame::Frame::Stream {
+                id,
+                offset,
+                data,
+                fin,
+            } => self.on_stream(id, offset, data, fin),
+            // A client that gives up on a stream is answered by forgetting it
+            frame::Frame::StopSending { id } | frame::Frame::ResetStream { id } => {
+                if let Some(i) = (id >> 2)
+                    .checked_sub(self.base_stream)
+                    .and_then(|n| usize::try_from(n).ok())
+                    && i < self.streams.len()
+                {
+                    self.streams[i] = None;
+                    self.finished += 1;
+                    self.retire();
+                }
+            }
         }
         Ok(())
+    }
+
+    /// A request stream, or one of the client's own unidirectional streams
+    ///
+    /// The bytes are not read. A request's stream id is what says which stream
+    /// to answer on, and its end is what says to answer at all; nothing in it
+    /// changes the answer, so nothing in it is put back together.
+    fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) {
+        let end = offset + data.len() as u64;
+        let Some(req) = self.stream_mut(id) else {
+            // The client's control and QPACK streams. They have to be counted
+            // against the connection's flow control and read no further:
+            // neither side may insert into a table both said has no room.
+            self.data_seen += data.len() as u64;
+            return;
+        };
+        let fresh = end.saturating_sub(req.size);
+        req.size = req.size.max(end);
+        req.fin |= fin;
+        let answer = req.fin && !req.answered;
+        req.answered |= answer;
+        self.data_seen += fresh;
+        if answer {
+            self.ready.push(id);
+        }
+    }
+
+    /// Retire every answer the peer has acknowledged
+    fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) {
+        let ranges: Vec<(u64, u64)> = frame::AckRanges::new(largest, first_range, rest).collect();
+        let mut retired = false;
+        self.unacked.retain(|&(pn, id)| {
+            if !ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi) {
+                return true;
+            }
+            if let Some(i) = (id >> 2)
+                .checked_sub(self.base_stream)
+                .and_then(|n| usize::try_from(n).ok())
+                && i < self.streams.len()
+            {
+                self.streams[i] = None;
+                self.finished += 1;
+                retired = true;
+            }
+            false
+        });
+        if retired {
+            self.retire();
+        }
     }
 
     /// Collect whatever rustls now has to say, and the keys it hands over
@@ -306,8 +487,11 @@ impl Connection {
 
     /// Whether anything is waiting to go out
     pub fn wants_send(&self) -> bool {
-        self.path_response.is_some()
+        !self.ready.is_empty()
+            || self.path_response.is_some()
             || (self.connected && !self.handshake_done_sent)
+            || (self.connected && self.control_sent < CONTROL_PRELUDE.len())
+            || self.credit_owed()
             || self
                 .spaces
                 .iter()
@@ -326,6 +510,52 @@ impl Connection {
         Ok(out.len() > start)
     }
 
+    /// What the client may open and send by now
+    fn streams_limit(&self) -> u64 {
+        self.max_streams_bidi + self.finished
+    }
+
+    fn data_limit(&self) -> u64 {
+        self.initial_max_data + self.data_seen
+    }
+
+    /// Whether a credit has grown enough to be worth a frame. Half a window at
+    /// a time keeps the client from ever waiting without saying so on every
+    /// request.
+    fn credit_owed(&self) -> bool {
+        self.streams_limit() >= self.streams_told + self.max_streams_bidi / 2
+            || self.data_limit() >= self.data_told + self.initial_max_data / 2
+    }
+
+    /// The 1-RTT payload: the control stream, credit, and answers
+    fn write_data(&mut self, body: &mut Vec<u8>, body_room: usize, pn: u64) {
+        if self.control_sent < CONTROL_PRELUDE.len() {
+            frame::put_stream(body, CONTROL_STREAM, 0, false, CONTROL_PRELUDE);
+            self.control_sent = CONTROL_PRELUDE.len();
+        }
+        if self.streams_limit() >= self.streams_told + self.max_streams_bidi / 2 {
+            self.streams_told = self.streams_limit();
+            put_varint(body, frame::MAX_STREAMS_BIDI);
+            put_varint(body, self.streams_told);
+        }
+        if self.data_limit() >= self.data_told + self.initial_max_data / 2 {
+            self.data_told = self.data_limit();
+            put_varint(body, frame::MAX_DATA);
+            put_varint(body, self.data_told);
+        }
+        // Answers, as many as the packet holds. They go out newest first,
+        // which costs nothing: every one of them is the same answer.
+        while let Some(&id) = self.ready.last() {
+            let need = frame::stream_overhead(id, 0, RESPONSE.len()) + RESPONSE.len();
+            if body.len() + need > body_room {
+                break;
+            }
+            self.ready.pop();
+            frame::put_stream(body, id, 0, true, RESPONSE);
+            self.unacked.push((pn, id));
+        }
+    }
+
     fn write_packet(
         &mut self,
         out: &mut Vec<u8>,
@@ -338,7 +568,12 @@ impl Connection {
         }
         let body_room = room - PACKET_OVERHEAD;
 
-        // What this packet will say
+        // The packet number is needed while the body is built, because an
+        // answer written into it has to be remembered against the packet it
+        // went in. It is only spent if the packet turns out to have something
+        // in it.
+        let pn = self.spaces[space as usize].next_pn;
+
         let mut body = Vec::with_capacity(body_room.min(MAX_DATAGRAM));
         let st = &mut self.spaces[space as usize];
         if st.ack.owed && !st.ack.ranges.is_empty() {
@@ -365,6 +600,7 @@ impl Connection {
                 put_varint(&mut body, frame::HANDSHAKE_DONE);
                 self.handshake_done_sent = true;
             }
+            self.write_data(&mut body, body_room, pn);
         }
         if body.is_empty() {
             return Ok(());
@@ -382,7 +618,6 @@ impl Connection {
         }
 
         let st = &mut self.spaces[space as usize];
-        let pn = st.next_pn;
         st.next_pn += 1;
         let (truncated, pn_len) = encode_packet_number(pn, st.largest_acked);
 
@@ -434,5 +669,61 @@ impl Connection {
             pn_len,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acknowledgement_ranges_grow_from_the_newest_end() {
+        let mut a = AckState::default();
+        for pn in [0u64, 1, 2, 3] {
+            a.record(pn, true);
+        }
+        assert_eq!(a.ranges, [(0, 3)], "one run, extended in place");
+        assert!(a.owed);
+        // A gap opens a range in front of it
+        a.record(6, true);
+        assert_eq!(a.ranges, [(6, 6), (0, 3)]);
+        // And the gap filling in makes a third
+        a.record(5, true);
+        assert_eq!(a.ranges, [(5, 6), (0, 3)]);
+    }
+
+    /// A packet that arrives twice, or out of order behind what we have, must
+    /// not open a range that overlaps one already there
+    #[test]
+    fn a_repeat_changes_nothing() {
+        let mut a = AckState::default();
+        for pn in [0u64, 1, 2] {
+            a.record(pn, true);
+        }
+        a.record(1, true);
+        a.record(0, true);
+        assert_eq!(a.ranges, [(0, 2)]);
+    }
+
+    /// An ACK frame that reaches back for ever costs more than it is worth
+    #[test]
+    fn the_ranges_remembered_are_bounded() {
+        let mut a = AckState::default();
+        for pn in (0..40u64).step_by(2) {
+            a.record(pn, true);
+        }
+        assert!(a.ranges.len() <= 8, "{} ranges", a.ranges.len());
+        assert_eq!(a.ranges[0], (38, 38), "the newest is kept");
+    }
+
+    /// Only a packet that asks to be acknowledged makes one owed
+    #[test]
+    fn an_ack_only_packet_owes_nothing_back() {
+        let mut a = AckState::default();
+        a.record(0, false);
+        assert!(!a.owed);
+        assert_eq!(a.ranges, [(0, 0)]);
+        a.record(1, true);
+        assert!(a.owed);
     }
 }
