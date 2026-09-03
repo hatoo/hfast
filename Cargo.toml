@@ -1,0 +1,19 @@
+[package]
+name = "hfast"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+memchr = "2"
+# HTTP/3 only. A QUIC stack is not something to hand-roll for a benchmark
+# target, so the transport is quinn's and only the HTTP/3 layer is ours.
+quinn = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
