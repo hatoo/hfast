@@ -4,7 +4,7 @@
 //! to its connection and find where the protected part starts, and a short
 //! header read against the connection id length this server hands out.
 
-use super::wire::{varint_len, ConnectionId, Error, Reader, Result};
+use super::wire::{ConnectionId, Error, Reader, Result, varint_len};
 
 /// QUIC version 1 (RFC 9000 Section 15)
 pub const VERSION_1: u32 = 0x0000_0001;

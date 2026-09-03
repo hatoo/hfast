@@ -22,6 +22,8 @@ fn main() {
     let mut quic_port = DEFAULT_QUIC;
     let mut threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut max_streams = DEFAULT_MAX_STREAMS;
+    // The QUIC stack being built here rather than quinn
+    let mut own_quic = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -35,6 +37,7 @@ fn main() {
             "--quic" => quic_port = value() as u16,
             "--threads" => threads = value(),
             "--max-streams" => max_streams = value() as u32,
+            "--own-quic" => own_quic = true,
             _ => usage(),
         }
     }
@@ -45,8 +48,9 @@ fn main() {
     let mut running = Vec::new();
     if quic_port != 0 {
         eprintln!("hfast: HTTP/3 on udp/{quic_port}, {threads} threads");
-        running.push(std::thread::spawn(move || {
-            h3::serve(quic_port, threads, max_streams)
+        running.push(std::thread::spawn(move || match own_quic {
+            true => quic::endpoint::serve(quic_port, threads, max_streams),
+            false => h3::serve(quic_port, threads, max_streams),
         }));
     }
     if tcp_port != 0 {

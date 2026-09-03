@@ -12,8 +12,12 @@
 // thing that uses them does. Comes off when h3 is served from here.
 #![allow(dead_code)]
 
+pub mod assemble;
+pub mod conn;
+pub mod endpoint;
 pub mod frame;
 pub mod packet;
+pub mod transport;
 pub mod wire;
 
 /// The AEAD tag every packet carries (RFC 9001 Section 5.3)

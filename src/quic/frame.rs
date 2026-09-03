@@ -4,7 +4,7 @@
 //! Anything else with a known shape is skipped rather than refused, because a
 //! frame this server has no use for is not a reason to drop the connection.
 
-use super::wire::{put_varint, varint_len, Error, Reader, Result};
+use super::wire::{Error, Reader, Result, put_varint, varint_len};
 
 pub const PADDING: u64 = 0x00;
 pub const PING: u64 = 0x01;
