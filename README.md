@@ -24,11 +24,12 @@ is the number that decides whether the server or the client is the bottleneck.
 |---|---|---|---|
 | HTTP/1.1 | 1,116,909 rps · 16.54 us/req | 1,697,440 rps · 8.95 us/req | 1.85x cheaper |
 | HTTP/2   | 1,408,387 rps · 18.56 us/req | 32,863,903 rps · 0.40 us/req | 46x cheaper |
-| HTTP/3   | 2,168,188 rps · 5.57 us/req | 3,016,551 rps · 4.18 us/req | 1.33x cheaper |
+| HTTP/3   | 2,045,749 rps · 5.69 us/req | 2,973,451 rps · 3.07 us/req | 1.85x cheaper |
 
 The HTTP/1.1 figure is within 6% of [faf](https://github.com/errantmind/faf),
 which is the fastest HTTP/1.1 implementation on the TechEmpower plaintext
-board and needs a nightly compiler; this needs stable.
+board and needs a nightly compiler; this needs stable. The HTTP/3 figure is
+what it is at 16 requests in flight per connection; at 64 it is 1.37 us.
 
 ## What it skips, and why that is allowed
 
@@ -82,7 +83,20 @@ it puts sixteen requests in a TCP segment, and the kernel charges per segment.
 **No allocation per request.** Reads are parsed where they land, and only a
 trailing partial request is copied anywhere.
 
-## HTTP/3
+## HTTP/3, and what a stream limit costs
+
+`--max-streams` is how many requests a connection may have in flight, and it
+is the single setting that decides what HTTP/3 costs here. Raising it is not
+free: measured at 8 threads, a request costs 1.27us of server CPU at 128 and
+2.14us at 16384, and the first version of this server set it to 65536 on the
+theory that a limit nobody reaches cannot hurt. It more than doubled the cost
+of every request.
+
+It cannot simply be set low, either. A limit below what the load generator
+asks for does not slow the run down honestly - it caps the concurrency, so the
+run measures the limit rather than either end's speed. The default of 1024 is
+above any load generator's default and cheap enough not to matter; set it to
+what is actually being asked for when that is higher.
 
 The transport is [quinn](https://github.com/quinn-rs/quinn)'s. A QUIC stack is
 packet protection, loss recovery, congestion control and flow control before it

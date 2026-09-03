@@ -12,11 +12,15 @@ mod tcp;
 
 const DEFAULT_TCP: u16 = 8083;
 const DEFAULT_QUIC: u16 = 8443;
+/// Concurrent HTTP/3 requests allowed per connection. Generous enough for any
+/// load generator's default and cheap enough not to matter; see `h3::config`.
+const DEFAULT_MAX_STREAMS: u32 = 1024;
 
 fn main() {
     let mut tcp_port = DEFAULT_TCP;
     let mut quic_port = DEFAULT_QUIC;
     let mut threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut max_streams = DEFAULT_MAX_STREAMS;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -29,6 +33,7 @@ fn main() {
             "--tcp" => tcp_port = value() as u16,
             "--quic" => quic_port = value() as u16,
             "--threads" => threads = value(),
+            "--max-streams" => max_streams = value() as u32,
             _ => usage(),
         }
     }
@@ -39,7 +44,9 @@ fn main() {
     let mut running = Vec::new();
     if quic_port != 0 {
         eprintln!("hfast: HTTP/3 on udp/{quic_port}, {threads} threads");
-        running.push(std::thread::spawn(move || h3::serve(quic_port, threads)));
+        running.push(std::thread::spawn(move || {
+            h3::serve(quic_port, threads, max_streams)
+        }));
     }
     if tcp_port != 0 {
         eprintln!("hfast: HTTP/1.1 and HTTP/2 on tcp/{tcp_port}, {threads} threads");
@@ -63,14 +70,20 @@ fn main() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: hfast [--tcp PORT] [--quic PORT] [--threads N]\n\
+        "usage: hfast [--tcp PORT] [--quic PORT] [--threads N] [--max-streams N]\n\
          \n\
          HTTP/1.1 and HTTP/2 (cleartext, told apart by the client's first\n\
          bytes) share the TCP port; HTTP/3 has the UDP one. A port of 0\n\
          turns that side off, which is worth doing when measuring the other:\n\
          each side takes a full set of threads.\n\
          \n\
-         defaults: --tcp {DEFAULT_TCP} --quic {DEFAULT_QUIC} --threads <cores>"
+         --max-streams is how many HTTP/3 requests a connection may have in\n\
+         flight. Raising it costs server CPU per request, so raise it only to\n\
+         what the load generator actually asks for; leaving it below that\n\
+         measures this limit instead.\n\
+         \n\
+         defaults: --tcp {DEFAULT_TCP}  --quic {DEFAULT_QUIC}  --threads <cores>  \
+         --max-streams {DEFAULT_MAX_STREAMS}"
     );
     std::process::exit(2)
 }

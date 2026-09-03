@@ -31,12 +31,12 @@ const RESPONSE: &[u8] = b"\x01\x08\x00\x00\xd9\xf5\x54\x02\x31\x33\x00\x0dHello,
 /// first thing on it; this server has nothing to say in it.
 const CONTROL_PRELUDE: &[u8] = b"\x00\x04\x00";
 
-pub fn serve(port: u16, threads: usize) {
+pub fn serve(port: u16, threads: usize, max_streams: u32) {
     // One thread, one socket, one endpoint, one single-threaded runtime, the
     // same shape as the TCP side. Sharing an endpoint between threads instead
     // put every connection through the same lock and cost a third of the
     // throughput at 32 of them.
-    let config = config();
+    let config = config(max_streams);
     // Steering by CPU the way the TCP side does would break this. A reuseport
     // program on TCP only picks the listener a new connection is accepted on,
     // and everything after that goes to the accepted socket; on UDP it picks
@@ -85,7 +85,7 @@ fn endpoint(socket: std::net::UdpSocket, config: ServerConfig, cpu: usize) {
 /// A self-signed certificate, generated at startup. This is a benchmark target:
 /// there is nothing here worth authenticating, and a load generator pointed at
 /// it is not checking.
-fn config() -> ServerConfig {
+fn config(max_streams: u32) -> ServerConfig {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed");
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
 
@@ -105,10 +105,14 @@ fn config() -> ServerConfig {
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
 
     let transport = Arc::get_mut(&mut config.transport).expect("sole owner");
-    // Windows and stream limits set out of the way, so a client never waits on
-    // this server for a credit
-    transport.max_concurrent_bidi_streams(65_536u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
+    // What a client may have in flight at once. This is not free to raise: a
+    // request costs 1.27us of server CPU at 128 and 2.14us at 16384, so the
+    // number is a promise to be kept rather than a limit to set out of the way.
+    // It has to be at least what the load generator asks for, or the run is
+    // measuring this limit instead of either end's speed.
+    transport.max_concurrent_bidi_streams(max_streams.into());
+    // The control stream and the two QPACK streams, and room to spare
+    transport.max_concurrent_uni_streams(16u32.into());
     transport.stream_receive_window((256 * 1024u32).into());
     transport.receive_window((16 * 1024 * 1024u32).into());
     transport.send_window(16 * 1024 * 1024);
