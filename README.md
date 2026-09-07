@@ -104,6 +104,10 @@ to answer on and the end of the stream is what says to answer at all, so there
 is no reassembly and no allocation per request; the answer is a constant. That
 is the whole of the difference.
 
+Received frames borrow the decrypted packet directly. Packet assembly and ACK
+range buffers are reused across packets, so these steps do not allocate fresh
+storage for every datagram once the buffers have grown to fit the traffic.
+
 What it leaves out, all of which a load generator does without: address
 validation and Retry, connection migration (connections are found by the
 address they came from), 0-RTT, key update, and congestion control - it sends

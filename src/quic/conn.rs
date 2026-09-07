@@ -150,6 +150,10 @@ pub struct Connection {
     /// `(packet number, stream)` for every answer sent and not yet
     /// acknowledged, so a lost one can be sent again
     unacked: Vec<(u64, u64)>,
+    /// Scratch ranges reused as ACK frames arrive.
+    ack_ranges: Vec<(u64, u64)>,
+    /// Packet assembly storage, returned here after each transmit attempt.
+    packet_body: Vec<u8>,
     /// How much of the control stream has gone out
     control_sent: usize,
     /// Requests finished, which is the credit the client gets back
@@ -224,6 +228,8 @@ impl Connection {
             base_stream: 0,
             ready: Vec::new(),
             unacked: Vec::new(),
+            ack_ranges: Vec::new(),
+            packet_body: Vec::new(),
             control_sent: 0,
             finished: 0,
             streams_told: max_streams_bidi,
@@ -363,17 +369,16 @@ impl Connection {
             .map_err(|_| Error)?;
         let plain_len = plain.len();
 
-        // The borrow of `packet` ends here; the frames are read out of a copy
-        // of the range so the connection can be mutated while walking them.
+        // The caller owns packet independently of the connection. Consume
+        // borrowed frames directly instead of allocating a list per packet.
         let mut ack_eliciting = false;
         let payload_range = header_end..header_end + plain_len;
-        let frames: Vec<_> =
-            frame::Frames::new(&packet[payload_range]).collect::<Result<Vec<_>>>()?;
-        for f in &frames {
+        for f in frame::Frames::new(&packet[payload_range]) {
+            let f = f?;
             if !matches!(f, frame::Frame::Ack { .. } | frame::Frame::Padding) {
                 ack_eliciting = true;
             }
-            self.on_frame(f, space)?;
+            self.on_frame(&f, space)?;
         }
         self.spaces[space as usize].ack.record(pn, ack_eliciting);
         Ok(())
@@ -482,7 +487,9 @@ impl Connection {
     const LOSS_THRESHOLD: u64 = 3;
 
     fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) {
-        let ranges: Vec<(u64, u64)> = frame::AckRanges::new(largest, first_range, rest).collect();
+        let ranges = &mut self.ack_ranges;
+        ranges.clear();
+        ranges.extend(frame::AckRanges::new(largest, first_range, rest));
         let mut retired = false;
         let lost_before = largest.saturating_sub(Self::LOSS_THRESHOLD);
         let ready = &mut self.ready;
@@ -624,6 +631,22 @@ impl Connection {
         space: Space,
         datagram_start: usize,
     ) -> Result<()> {
+        // Take the scratch storage out so write_data can still mutate the
+        // connection. Restore it on errors and empty packets as well.
+        let mut body = std::mem::take(&mut self.packet_body);
+        body.clear();
+        let result = self.write_packet_into(out, space, datagram_start, &mut body);
+        self.packet_body = body;
+        result
+    }
+
+    fn write_packet_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        space: Space,
+        datagram_start: usize,
+        body: &mut Vec<u8>,
+    ) -> Result<()> {
         let room = MAX_DATAGRAM.saturating_sub(out.len() - datagram_start);
         if room < PACKET_OVERHEAD + 4 {
             return Ok(());
@@ -636,10 +659,10 @@ impl Connection {
         // in it.
         let pn = self.spaces[space as usize].next_pn;
 
-        let mut body = Vec::with_capacity(body_room.min(MAX_DATAGRAM));
+        body.reserve(body_room.min(MAX_DATAGRAM));
         let st = &mut self.spaces[space as usize];
         if st.ack.owed && !st.ack.ranges.is_empty() {
-            frame::put_ack(&mut body, &st.ack.ranges, 0);
+            frame::put_ack(body, &st.ack.ranges, 0);
             st.ack.owed = false;
         }
         let ack_only_len = body.len();
@@ -650,7 +673,7 @@ impl Connection {
                 .min(body_room.saturating_sub(body.len() + 8));
             if n > 0 {
                 let chunk: Vec<u8> = st.crypto_out.drain(..n).collect();
-                frame::put_crypto(&mut body, st.crypto_offset, &chunk);
+                frame::put_crypto(body, st.crypto_offset, &chunk);
                 // Kept until acknowledged: a lost handshake packet is the one
                 // loss a connection cannot get past on its own
                 st.crypto_flight.push((pn, st.crypto_offset, chunk));
@@ -659,7 +682,7 @@ impl Connection {
         }
         if space == Space::Data {
             if let Some(data) = self.path_response.take() {
-                put_varint(&mut body, frame::PATH_RESPONSE);
+                put_varint(body, frame::PATH_RESPONSE);
                 body.extend_from_slice(&data);
             }
             // RFC 9001 Section 4.1.2: this says the handshake is confirmed,
@@ -668,10 +691,10 @@ impl Connection {
             // done before it is, so it throws away its handshake keys and never
             // sends the Finished at all - and then nothing ever confirms.
             if !self.tls.is_handshaking() && !self.handshake_done_sent {
-                put_varint(&mut body, frame::HANDSHAKE_DONE);
+                put_varint(body, frame::HANDSHAKE_DONE);
                 self.handshake_done_sent = true;
             }
-            self.write_data(&mut body, body_room, pn);
+            self.write_data(body, body_room, pn);
         }
         if body.is_empty() {
             return Ok(());
@@ -718,7 +741,7 @@ impl Connection {
         let pn_offset = out.len();
         out.extend_from_slice(&truncated.to_be_bytes()[8 - pn_len..]);
         let header_end = out.len();
-        out.extend_from_slice(&body);
+        out.extend_from_slice(body);
 
         if length_at != usize::MAX {
             packet::patch_length(out, length_at, (pn_len + body.len() + TAG_LEN) as u64)?;
@@ -835,6 +858,94 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection() -> Connection {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key)
+        .unwrap();
+        Connection::accept(
+            &Arc::new(config),
+            ConnectionId::new(&[1; 8]).unwrap(),
+            ConnectionId::new(&[2; 8]).unwrap(),
+            ConnectionId::new(&[3; 8]).unwrap(),
+            64,
+            1 << 30,
+            1 << 24,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn successive_packets_decrypt_without_previous_payload_bytes() {
+        let mut conn = connection();
+        let rustls::SupportedCipherSuite::Tls13(suite) =
+            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256;
+        let client_keys = Keys::initial(
+            Version::V1,
+            suite,
+            suite.quic.unwrap(),
+            &[1; 8],
+            Side::Client,
+        );
+        let mut out = Vec::new();
+        for (pn, largest) in [7, 100, 1000].into_iter().enumerate() {
+            let ack = &mut conn.spaces[Space::Initial as usize].ack;
+            ack.ranges.clear();
+            ack.record(largest, true);
+            out.clear();
+            assert!(conn.poll_transmit(&mut out).unwrap());
+            let header = packet::parse(&out, 0).unwrap();
+            assert_eq!(header.end, out.len());
+            let (_, pn_len) = unprotect_header(
+                client_keys.remote.header.as_ref(),
+                &mut out,
+                header.pn_offset,
+            )
+            .unwrap();
+            let (head, body) = out.split_at_mut(header.pn_offset + pn_len);
+            let plain = client_keys
+                .remote
+                .packet
+                .decrypt_in_place(pn as u64, head, body)
+                .unwrap();
+            let frames = frame::Frames::new(plain)
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                matches!(frames.as_slice(), [frame::Frame::Ack { largest: n, .. }] if *n == largest)
+            );
+            out.clear();
+            assert!(!conn.poll_transmit(&mut out).unwrap());
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn successive_acks_only_retire_their_own_ranges() {
+        let mut conn = connection();
+        for id in [0, 4, 8] {
+            conn.on_stream(id, 0, b"request", true);
+        }
+        conn.ready.clear();
+        conn.unacked = vec![(10, 0), (11, 4), (12, 8)];
+        conn.on_ack(11, 0, &[]);
+        assert_eq!(conn.unacked, [(10, 0), (12, 8)]);
+        assert_eq!(conn.finished, 1);
+        conn.on_ack(10, 0, &[]);
+        assert_eq!(conn.unacked, [(12, 8)]);
+        assert_eq!(conn.finished, 2);
+        conn.on_ack(12, 0, &[]);
+        assert!(conn.unacked.is_empty());
+        assert!(conn.streams.is_empty());
+        assert_eq!(conn.finished, 3);
+    }
 
     #[test]
     fn acknowledgement_ranges_grow_from_the_newest_end() {
