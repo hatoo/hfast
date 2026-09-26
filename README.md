@@ -108,6 +108,22 @@ Received frames borrow the decrypted packet directly. Packet assembly and ACK
 range buffers are reused across packets, so these steps do not allocate fresh
 storage for every datagram once the buffers have grown to fit the traffic.
 
+The socket loop receives up to 32 datagrams with `recvmmsg` and sends up to 8
+with `sendmmsg`, using reusable buffers. It waits only for the first incoming
+datagram and sends any partial output batch before receiving again;
+there is no wait to fill a batch. A single outgoing datagram uses `send_to`.
+The receive batch size follows the number of datagrams available on the previous
+receive. With at most one connection, receiving also uses the single-datagram path.
+Receive storage is 2 MiB per QUIC worker so large incoming datagrams still fit.
+
+Within each receive batch, all datagrams are processed before building response
+packets, once per connection. This combines their ACKs and packs more answers
+into each encrypted packet, including when peers interleave their datagrams.
+Pending output is flushed before the next receive; no extra batching wait is
+introduced. Connection lookup on the established path uses one hash-table lookup
+per received datagram. See [the batching measurements](benchmarks/http3-batching.md)
+for the before/after comparison and reproduction commands.
+
 What it leaves out, all of which a load generator does without: address
 validation and Retry, connection migration (connections are found by the
 address they came from), 0-RTT, key update, and congestion control - it sends

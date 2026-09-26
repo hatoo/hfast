@@ -14,6 +14,7 @@ pub mod endpoint;
 pub mod frame;
 pub mod packet;
 pub mod transport;
+mod udp;
 pub mod wire;
 
 /// The AEAD tag every packet carries (RFC 9001 Section 5.3)
