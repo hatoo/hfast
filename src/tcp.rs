@@ -103,6 +103,9 @@ fn settle(buf: &[u8]) -> Which {
 /// [`sys::attach_reuseport_cbpf`] for why each worker has one of its own and
 /// why it is pinned.
 pub fn worker(lfd: RawFd, cpu: usize) {
+    if let Ok(ring) = io_uring::IoUring::new(128) {
+        worker_ring(lfd, cpu, ring);
+    }
     sys::pin_to_cpu(cpu);
     let ep = sys::epoll_create();
     epoll_add(ep, lfd, libc::EPOLLIN as u32, LISTENER);
@@ -177,22 +180,8 @@ fn read_and_drive(fd: RawFd, conn: &mut Conn, scratch: &mut [u8]) -> bool {
             return e == libc::EAGAIN || e == libc::EINTR;
         }
         let n = r as usize;
-        if conn.inbuf.is_empty() {
-            let Some(used) = conn.drive(&scratch[..n]) else {
-                return false;
-            };
-            if used < n {
-                conn.inbuf.extend_from_slice(&scratch[used..n]);
-            }
-        } else {
-            let mut buf = std::mem::take(&mut conn.inbuf);
-            buf.extend_from_slice(&scratch[..n]);
-            let used = conn.drive(&buf);
-            conn.inbuf = buf;
-            match used {
-                Some(used) => conn.inbuf.drain(..used),
-                None => return false,
-            };
+        if !consume(conn, &scratch[..n]) {
+            return false;
         }
         if n < scratch.len() {
             return true;
@@ -234,6 +223,172 @@ fn write_out(ep: RawFd, fd: RawFd, conn: &mut Conn) -> bool {
         epoll_mod(ep, fd, libc::EPOLLIN as u32, fd as u64);
     }
     true
+}
+
+fn consume(conn: &mut Conn, data: &[u8]) -> bool {
+    if conn.inbuf.is_empty() {
+        let Some(used) = conn.drive(data) else {
+            return false;
+        };
+        if used < data.len() {
+            conn.inbuf.extend_from_slice(&data[used..]);
+        }
+    } else {
+        let mut buf = std::mem::take(&mut conn.inbuf);
+        buf.extend_from_slice(data);
+        let used = conn.drive(&buf);
+        conn.inbuf = buf;
+        match used {
+            Some(used) => conn.inbuf.drain(..used),
+            None => return false,
+        };
+    }
+    true
+}
+
+/// Submit the ready sockets' reads and writes in two batches. Completion
+/// barriers keep every kernel buffer borrow inside its batch; no buffer or
+/// connection is moved or changed while the corresponding operation is live.
+fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
+    use io_uring::{opcode, types};
+    const BATCH: usize = 128;
+    const CHUNK: usize = 16 * 1024;
+    sys::pin_to_cpu(cpu);
+    let ep = sys::epoll_create();
+    epoll_add(ep, lfd, libc::EPOLLIN as u32, LISTENER);
+    let mut conns: Vec<Option<Conn>> = Vec::new();
+    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; BATCH];
+    let mut scratch = vec![0u8; BATCH * CHUNK];
+    let mut completions = Vec::with_capacity(BATCH);
+    loop {
+        let n = unsafe { libc::epoll_wait(ep, events.as_mut_ptr(), BATCH as _, -1) };
+        if n < 0 {
+            continue;
+        }
+        let mut reads = 0;
+        for (i, ev) in events[..n as usize].iter().enumerate() {
+            if ev.u64 == LISTENER {
+                accept_all(ep, lfd, &mut conns);
+                continue;
+            }
+            let fd = ev.u64 as RawFd;
+            if conns.get(fd as usize).and_then(Option::as_ref).is_none() {
+                continue;
+            }
+            if ev.events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+                conns[fd as usize] = None;
+                continue;
+            }
+            if ev.events & libc::EPOLLIN as u32 != 0 {
+                let entry = opcode::Recv::new(
+                    types::Fd(fd),
+                    unsafe { scratch.as_mut_ptr().add(i * CHUNK) },
+                    CHUNK as _,
+                )
+                .flags(libc::MSG_DONTWAIT)
+                .build()
+                .user_data(i as _);
+                // scratch is stable and each receive owns a distinct chunk.
+                unsafe {
+                    ring.submission()
+                        .push(&entry)
+                        .expect("receive batch capacity");
+                }
+                reads += 1;
+            }
+        }
+        if reads > 0 {
+            wait_batch(&mut ring, reads);
+            completions.clear();
+            completions.extend(
+                ring.completion()
+                    .map(|c| (c.user_data() as usize, c.result())),
+            );
+            for &(i, result) in &completions {
+                let fd = events[i].u64 as RawFd;
+                let conn = conns[fd as usize].as_mut().unwrap();
+                let alive = if result > 0 {
+                    consume(conn, &scratch[i * CHUNK..i * CHUNK + result as usize])
+                } else {
+                    result == -libc::EAGAIN || result == -libc::EINTR
+                };
+                if !alive {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    conns[fd as usize] = None;
+                }
+            }
+        }
+        let mut writes = 0;
+        for ev in &events[..n as usize] {
+            if ev.u64 == LISTENER {
+                continue;
+            }
+            let fd = ev.u64 as RawFd;
+            let Some(conn) = conns.get_mut(fd as usize).and_then(Option::as_mut) else {
+                continue;
+            };
+            if conn.out_off < conn.outbuf.len() {
+                let entry = opcode::Send::new(
+                    types::Fd(fd),
+                    unsafe { conn.outbuf.as_ptr().add(conn.out_off) },
+                    (conn.outbuf.len() - conn.out_off).min(u32::MAX as usize) as _,
+                )
+                .flags(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+                .build()
+                .user_data(fd as _);
+                // No outbuf is changed until all send completions are drained.
+                unsafe {
+                    ring.submission().push(&entry).expect("send batch capacity");
+                }
+                writes += 1;
+            }
+        }
+        if writes > 0 {
+            wait_batch(&mut ring, writes);
+            completions.clear();
+            completions.extend(
+                ring.completion()
+                    .map(|c| (c.user_data() as usize, c.result())),
+            );
+            for &(fd, result) in &completions {
+                let conn = conns[fd].as_mut().unwrap();
+                if result > 0 {
+                    conn.out_off += result as usize;
+                } else if result != -libc::EAGAIN && result != -libc::EINTR {
+                    unsafe {
+                        libc::close(fd as _);
+                    }
+                    conns[fd] = None;
+                    continue;
+                }
+                let pending = conn.out_off < conn.outbuf.len();
+                if !pending {
+                    conn.outbuf.clear();
+                    conn.out_off = 0;
+                }
+                if pending != conn.want_write {
+                    conn.want_write = pending;
+                    let flags = libc::EPOLLIN | if pending { libc::EPOLLOUT } else { 0 };
+                    epoll_mod(ep, fd as _, flags as _, fd as _);
+                }
+            }
+        }
+    }
+}
+
+fn wait_batch(ring: &mut io_uring::IoUring, count: usize) {
+    while ring.completion().len() < count {
+        match ring.submit_and_wait(count) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => panic!("io_uring batch: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

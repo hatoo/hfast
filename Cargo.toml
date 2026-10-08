@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+io-uring = "0.7.14"
 libc = "0.2"
 memchr = "2"
 # HTTP/3 only. A QUIC stack is not something to hand-roll for a benchmark

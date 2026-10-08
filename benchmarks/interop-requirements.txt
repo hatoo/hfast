@@ -1,0 +1,3 @@
+# Independent clients used only for correctness, never throughput measurement.
+aioquic==1.3.0
+h2==4.4.1

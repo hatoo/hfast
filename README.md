@@ -59,10 +59,19 @@ behind it.
 ## How it is built
 
 **One thread per core, and nothing shared between them.** Each TCP worker has
-its own `SO_REUSEPORT` listener and its own epoll instance; each HTTP/3 worker
+its own `SO_REUSEPORT` listener, epoll instance and io_uring; each HTTP/3 worker
 has its own `SO_REUSEPORT` socket, its own QUIC endpoint and its own
 single-threaded runtime. Sharing one QUIC endpoint between threads instead put
 every connection through the same lock and cost two thirds of the throughput.
+
+**TCP operations submitted in batches.** A worker submits the ready sockets'
+nonblocking receives together, parses their completions, then submits their
+responses together. Each receive has a distinct 16 KiB chunk in a 2 MiB worker
+scratch buffer. Completion barriers keep receive storage and response vectors
+stable until the kernel finishes with them. Partial writes retain their bytes
+and resume on EPOLLOUT. Systems without io_uring use the original syscall loop.
+See [the optimization log](benchmarks/throughput-optimization.md) for pinned
+shb comparisons, rejected experiments and correctness checks.
 
 **Connections steered to the core that will read them.** The TCP listeners
 carry a `SO_ATTACH_REUSEPORT_CBPF` program that returns the CPU the packet
