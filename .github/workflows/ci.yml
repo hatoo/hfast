@@ -34,3 +34,7 @@ jobs:
         run: python benchmarks/interoperability.py target/release/hfast --epoll
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
+      - name: QUIC control recovery with repeated packet loss
+        run: python benchmarks/control-recovery-check.py target/release/hfast
+      - name: QUIC control recovery with epoll
+        run: python benchmarks/control-recovery-check.py target/release/hfast --epoll
