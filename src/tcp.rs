@@ -337,6 +337,9 @@ fn wait_batch(
 }
 
 #[cfg(test)]
+mod h2_continuation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
