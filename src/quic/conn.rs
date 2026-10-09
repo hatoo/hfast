@@ -12,7 +12,7 @@ use rustls::quic::{DirectionalKeys, KeyChange, Keys, ServerConnection, Version};
 use super::packet::{self, Kind, Space};
 use super::wire::{
     ConnectionId, Error, Result, decode_packet_number, encode_packet_number, protect_header,
-    put_varint, unprotect_header,
+    put_varint, unprotect_header, varint_len,
 };
 use super::{MAX_DATAGRAM, TAG_LEN, assemble::Assembler, frame, transport};
 
@@ -101,6 +101,15 @@ impl AckState {
     }
 }
 
+/// A CRYPTO range and every packet that carried it. Keeping earlier packet
+/// numbers lets a late ACK cancel a queued probe or a retransmitted copy.
+struct CryptoFlight {
+    sent_in: Vec<u64>,
+    offset: u64,
+    data: Vec<u8>,
+    pending: bool,
+}
+
 /// One packet number space: what has been sent in it and what has arrived
 #[derive(Default)]
 struct SpaceState {
@@ -113,9 +122,55 @@ struct SpaceState {
     crypto_in: Assembler,
     /// TLS bytes handed to a packet that has not been acknowledged, and the
     /// packet they went in. A handshake flight is a few of these at most.
-    crypto_flight: Vec<(u64, u64, Vec<u8>)>,
+    crypto_flight: Vec<CryptoFlight>,
     /// When the oldest unacknowledged packet in this space went out
     oldest_sent: Option<Instant>,
+}
+
+impl SpaceState {
+    fn write_crypto(&mut self, body: &mut Vec<u8>, body_room: usize, pn: u64) {
+        let retry = self.crypto_flight.iter().position(|f| f.pending);
+        if retry.is_none() && self.crypto_out.is_empty() {
+            return;
+        }
+        let offset = retry.map_or(self.crypto_offset, |i| self.crypto_flight[i].offset);
+        // Use the available room's length encoding as an upper bound, so even
+        // a large CRYPTO offset cannot make the frame exceed the packet.
+        let room = body_room
+            .saturating_sub(body.len() + 1 + varint_len(offset) + varint_len(body_room as u64));
+        if room == 0 {
+            return;
+        }
+        if let Some(i) = retry {
+            let flight = &mut self.crypto_flight[i];
+            if flight.data.len() > room {
+                // ACKs can take more space in a probe than in the original
+                // packet. Both pieces inherit the earlier transmissions.
+                let tail = CryptoFlight {
+                    sent_in: flight.sent_in.clone(),
+                    offset: flight.offset + room as u64,
+                    data: flight.data.split_off(room),
+                    pending: true,
+                };
+                self.crypto_flight.insert(i + 1, tail);
+            }
+            let flight = &mut self.crypto_flight[i];
+            frame::put_crypto(body, flight.offset, &flight.data);
+            flight.sent_in.push(pn);
+            flight.pending = false;
+        } else if !self.crypto_out.is_empty() {
+            let n = self.crypto_out.len().min(room);
+            let chunk: Vec<u8> = self.crypto_out.drain(..n).collect();
+            frame::put_crypto(body, self.crypto_offset, &chunk);
+            self.crypto_flight.push(CryptoFlight {
+                sent_in: vec![pn],
+                offset: self.crypto_offset,
+                data: chunk,
+                pending: false,
+            });
+            self.crypto_offset += n as u64;
+        }
+    }
 }
 
 pub struct Connection {
@@ -408,19 +463,33 @@ impl Connection {
             } => {
                 let st = &mut self.spaces[space as usize];
                 st.largest_acked = Some(st.largest_acked.map_or(largest, |l| l.max(largest)));
-                st.crypto_flight.retain(|&(pn, _, _)| pn > largest);
-                self.pto_count = 0;
+                let acknowledged = |pn| {
+                    frame::AckRanges::new(largest, first_range, rest)
+                        .any(|(lo, hi)| pn >= lo && pn <= hi)
+                };
+                let before = st.crypto_flight.len();
+                st.crypto_flight
+                    .retain(|f| !f.sent_in.iter().copied().any(acknowledged));
+                let mut progress = st.crypto_flight.len() < before;
                 if let Some((probe_space, pn, at)) = self.rtt_probe
                     && probe_space == space
-                    && pn <= largest
+                    && acknowledged(pn)
                 {
                     self.rtt_probe = None;
-                    self.on_rtt(Instant::now() - at);
+                    progress = true;
+                    // The ACK delay describes only the largest acknowledged
+                    // packet (RFC 9002 Section 5.1).
+                    if pn == largest {
+                        self.on_rtt(Instant::now() - at);
+                    }
                 }
                 if space == Space::Data && !self.unacked.is_empty() {
-                    self.on_ack(largest, first_range, rest);
+                    progress |= self.on_ack(largest, first_range, rest);
                 }
-                self.settle_timer(space, Instant::now());
+                if progress {
+                    self.pto_count = 0;
+                    self.settle_timer(space, Instant::now());
+                }
             }
             frame::Frame::PathChallenge(data) => self.path_response = Some(data),
             frame::Frame::Close => self.closed = true,
@@ -486,11 +555,12 @@ impl Connection {
     /// milliseconds.
     const LOSS_THRESHOLD: u64 = 3;
 
-    fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) {
+    fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) -> bool {
         let ranges = &mut self.ack_ranges;
         ranges.clear();
         ranges.extend(frame::AckRanges::new(largest, first_range, rest));
         let mut retired = false;
+        let mut acknowledged = false;
         let lost_before = largest.saturating_sub(Self::LOSS_THRESHOLD);
         let ready = &mut self.ready;
         let streams = &mut self.streams;
@@ -504,6 +574,7 @@ impl Connection {
                 }
                 return true;
             }
+            acknowledged = true;
             if let Some(i) = (id >> 2)
                 .checked_sub(base)
                 .and_then(|n| usize::try_from(n).ok())
@@ -519,6 +590,7 @@ impl Connection {
         if retired {
             self.retire();
         }
+        acknowledged
     }
 
     /// Collect whatever rustls now has to say, and the keys it hands over
@@ -561,10 +633,9 @@ impl Connection {
             || (!self.tls.is_handshaking() && !self.handshake_done_sent)
             || (self.connected && self.control_sent < CONTROL_PRELUDE.len())
             || self.credit_owed()
-            || self
-                .spaces
-                .iter()
-                .any(|s| !s.crypto_out.is_empty() || s.ack.owed)
+            || self.spaces.iter().any(|s| {
+                !s.crypto_out.is_empty() || s.crypto_flight.iter().any(|f| f.pending) || s.ack.owed
+            })
     }
 
     /// Fill `out` with one datagram's worth of packets
@@ -666,20 +737,7 @@ impl Connection {
             st.ack.owed = false;
         }
         let ack_only_len = body.len();
-        if !st.crypto_out.is_empty() {
-            let n = st
-                .crypto_out
-                .len()
-                .min(body_room.saturating_sub(body.len() + 8));
-            if n > 0 {
-                let chunk: Vec<u8> = st.crypto_out.drain(..n).collect();
-                frame::put_crypto(body, st.crypto_offset, &chunk);
-                // Kept until acknowledged: a lost handshake packet is the one
-                // loss a connection cannot get past on its own
-                st.crypto_flight.push((pn, st.crypto_offset, chunk));
-                st.crypto_offset += n as u64;
-            }
-        }
+        st.write_crypto(body, body_room, pn);
         if space == Space::Data {
             if let Some(data) = self.path_response.take() {
                 put_varint(body, frame::PATH_RESPONSE);
@@ -801,17 +859,10 @@ impl Connection {
         self.rtt_probe = None;
         for st in &mut self.spaces {
             st.oldest_sent = None;
-            // Crypto goes back on the front, in order
-            if !st.crypto_flight.is_empty() {
-                st.crypto_flight.sort_by_key(|(_, offset, _)| *offset);
-                let first = st.crypto_flight[0].1;
-                let mut back = Vec::new();
-                for (_, _, chunk) in st.crypto_flight.drain(..) {
-                    back.extend_from_slice(&chunk);
-                }
-                back.extend_from_slice(&st.crypto_out);
-                st.crypto_out = back;
-                st.crypto_offset = first;
+            // An ACK can leave holes between CRYPTO ranges. Retransmit each
+            // at its original offset without rewinding the unsent TLS bytes.
+            for flight in &mut st.crypto_flight {
+                flight.pending = true;
             }
         }
         // An answer that was not acknowledged is queued to go again
@@ -945,6 +996,215 @@ mod tests {
         assert!(conn.unacked.is_empty());
         assert!(conn.streams.is_empty());
         assert_eq!(conn.finished, 3);
+    }
+
+    fn acknowledge(conn: &mut Connection, space: Space, ranges: &[(u64, u64)]) {
+        let mut bytes = Vec::new();
+        frame::put_ack(&mut bytes, ranges, 0);
+        let ack = frame::Frames::new(&bytes).next().unwrap().unwrap();
+        conn.on_frame(&ack, space).unwrap();
+    }
+
+    fn send_crypto(conn: &mut Connection) -> Vec<(u64, Vec<u8>)> {
+        let pn = conn.spaces[Space::Initial as usize].next_pn;
+        let mut packet = Vec::new();
+        assert!(conn.poll_transmit(&mut packet).unwrap());
+        let header = packet::parse(&packet, 0).unwrap();
+        assert_eq!(header.end, packet.len());
+        let keys = conn.local_keys(Space::Initial).unwrap();
+        let (_, pn_len) =
+            unprotect_header(keys.header.as_ref(), &mut packet, header.pn_offset).unwrap();
+        let (head, body) = packet.split_at_mut(header.pn_offset + pn_len);
+        let plain = keys.packet.decrypt_in_place(pn, head, body).unwrap();
+        frame::Frames::new(plain)
+            .filter_map(|f| match f.unwrap() {
+                frame::Frame::Crypto { offset, data } => Some((offset, data.to_vec())),
+                frame::Frame::Ack { .. } | frame::Frame::Padding => None,
+                other => panic!("unexpected frame: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn crypto_connection() -> Connection {
+        let mut conn = connection();
+        conn.spaces[Space::Initial as usize].next_pn = 10;
+        for data in [b"first".as_slice(), b"middle", b"last"] {
+            conn.spaces[Space::Initial as usize]
+                .crypto_out
+                .extend_from_slice(data);
+            send_crypto(&mut conn);
+        }
+        conn
+    }
+
+    #[test]
+    fn sparse_crypto_ack_keeps_gaps_and_rtt_probe() {
+        let mut conn = crypto_connection();
+        let probe = conn.rtt_probe;
+        let rtt = (conn.srtt, conn.rttvar);
+        acknowledge(&mut conn, Space::Initial, &[(12, 12)]);
+        assert_eq!(conn.spaces[0].crypto_flight.len(), 2);
+        assert_eq!(conn.rtt_probe, probe);
+        assert_eq!((conn.srtt, conn.rttvar), rtt);
+        conn.on_timeout(conn.timeout().unwrap());
+        assert_eq!(send_crypto(&mut conn), [(0, b"first".to_vec())]);
+        assert_eq!(send_crypto(&mut conn), [(5, b"middle".to_vec())]);
+    }
+
+    #[test]
+    fn crypto_pto_preserves_holes_and_unsent_offsets() {
+        let mut conn = crypto_connection();
+        acknowledge(&mut conn, Space::Initial, &[(11, 11)]);
+        conn.spaces[0].crypto_out.extend_from_slice(b"new");
+        conn.on_timeout(conn.timeout().unwrap());
+        assert_eq!(send_crypto(&mut conn), [(0, b"first".to_vec())]);
+        assert_eq!(send_crypto(&mut conn), [(11, b"last".to_vec())]);
+        assert_eq!(send_crypto(&mut conn), [(15, b"new".to_vec())]);
+        assert!(!conn.wants_send());
+    }
+
+    #[test]
+    fn duplicate_crypto_ack_does_not_reset_pto() {
+        let mut conn = crypto_connection();
+        acknowledge(&mut conn, Space::Initial, &[(11, 11)]);
+        conn.on_timeout(conn.timeout().unwrap());
+        send_crypto(&mut conn);
+        let deadline = conn.timeout();
+        assert_eq!(conn.pto_count, 1);
+        acknowledge(&mut conn, Space::Initial, &[(11, 11)]);
+        assert_eq!(conn.pto_count, 1);
+        assert_eq!(conn.timeout(), deadline);
+    }
+
+    #[test]
+    fn late_crypto_ack_retires_retransmitted_and_queued_copies() {
+        let mut conn = crypto_connection();
+        conn.on_timeout(conn.timeout().unwrap());
+        send_crypto(&mut conn);
+        // The original pn10 and queued pn12 are covered, but pn11 is not.
+        acknowledge(&mut conn, Space::Initial, &[(12, 12), (10, 10)]);
+        assert_eq!(conn.spaces[0].crypto_flight.len(), 1);
+        assert_eq!(send_crypto(&mut conn), [(5, b"middle".to_vec())]);
+        acknowledge(&mut conn, Space::Initial, &[(11, 11)]);
+        assert!(conn.spaces[0].crypto_flight.is_empty());
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+    }
+
+    #[test]
+    fn crypto_probe_split_keeps_original_transmission_and_offset() {
+        let mut conn = connection();
+        let data: Vec<_> = (0..2000).map(|i| (i % 251) as u8).collect();
+        conn.spaces[0].crypto_out.extend_from_slice(&data);
+        let original = send_crypto(&mut conn);
+        let original_len = original[0].1.len();
+        conn.on_timeout(conn.timeout().unwrap());
+        // A larger ACK leaves less room than the original CRYPTO packet had.
+        for pn in (100..116).step_by(2) {
+            conn.spaces[0].ack.record(pn, true);
+        }
+        let first = send_crypto(&mut conn);
+        let split = first[0].1.len();
+        assert!(split < original_len);
+        assert_eq!(first, [(0, data[..split].to_vec())]);
+        // ACK the new, smaller packet. Only its prefix is delivered.
+        acknowledge(&mut conn, Space::Initial, &[(1, 1)]);
+        assert_eq!(
+            send_crypto(&mut conn),
+            [(split as u64, data[split..original_len].to_vec())]
+        );
+        // A late ACK of the original also covers its retransmitted tail.
+        acknowledge(&mut conn, Space::Initial, &[(0, 0)]);
+        assert!(conn.spaces[0].crypto_flight.is_empty());
+        assert_eq!(
+            send_crypto(&mut conn),
+            [(original_len as u64, data[original_len..].to_vec())]
+        );
+    }
+
+    #[test]
+    fn crypto_repeated_pto_and_ack_of_retransmission() {
+        let mut conn = crypto_connection();
+        let deadline = conn.timeout().unwrap();
+        conn.on_timeout(deadline - Duration::from_nanos(1));
+        assert_eq!(conn.pto_count, 0);
+        assert!(!conn.wants_send());
+        conn.on_timeout(deadline);
+        assert_eq!(send_crypto(&mut conn), [(0, b"first".to_vec())]);
+        conn.on_timeout(conn.timeout().unwrap());
+        assert_eq!(conn.pto_count, 2);
+        assert_eq!(send_crypto(&mut conn), [(0, b"first".to_vec())]);
+        // The first probe is still sufficient, even after the second probe.
+        acknowledge(&mut conn, Space::Initial, &[(13, 13)]);
+        assert_eq!(conn.pto_count, 0);
+        assert_eq!(conn.spaces[0].crypto_flight.len(), 2);
+        assert_eq!(send_crypto(&mut conn), [(5, b"middle".to_vec())]);
+        assert_eq!(send_crypto(&mut conn), [(11, b"last".to_vec())]);
+        acknowledge(&mut conn, Space::Initial, &[(15, 16)]);
+        assert!(conn.timeout().is_none());
+        assert!(!conn.wants_send());
+    }
+
+    #[test]
+    fn crypto_ack_is_scoped_to_its_packet_number_space() {
+        let mut conn = crypto_connection();
+        let probe = conn.rtt_probe;
+        let deadline = conn.timeout();
+        acknowledge(&mut conn, Space::Handshake, &[(10, 12)]);
+        assert_eq!(conn.spaces[0].crypto_flight.len(), 3);
+        assert_eq!(conn.rtt_probe, probe);
+        assert_eq!(conn.timeout(), deadline);
+        acknowledge(&mut conn, Space::Initial, &[(10, 12)]);
+        assert!(conn.spaces[0].crypto_flight.is_empty());
+        assert!(conn.timeout().is_none());
+    }
+
+    #[test]
+    fn crypto_rtt_sample_requires_the_largest_acknowledged_packet() {
+        let mut conn = crypto_connection();
+        let rtt = (conn.srtt, conn.rttvar);
+        acknowledge(&mut conn, Space::Initial, &[(12, 12), (10, 10)]);
+        assert!(conn.rtt_probe.is_none());
+        assert_eq!((conn.srtt, conn.rttvar), rtt);
+        conn.spaces[0].crypto_out.extend_from_slice(b"new");
+        send_crypto(&mut conn);
+        acknowledge(&mut conn, Space::Initial, &[(13, 13)]);
+        assert_ne!((conn.srtt, conn.rttvar), rtt);
+        let rtt = (conn.srtt, conn.rttvar);
+        acknowledge(&mut conn, Space::Initial, &[(13, 13)]);
+        assert_eq!((conn.srtt, conn.rttvar), rtt);
+    }
+
+    #[test]
+    fn discard_cancels_queued_crypto_probes() {
+        let mut conn = crypto_connection();
+        conn.spaces[0].crypto_out.extend_from_slice(b"unsent");
+        conn.on_timeout(conn.timeout().unwrap());
+        assert!(conn.wants_send());
+        conn.discard(Space::Initial);
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+        assert!(conn.spaces[0].crypto_flight.is_empty());
+        let mut out = Vec::new();
+        assert!(!conn.poll_transmit(&mut out).unwrap());
+    }
+
+    #[test]
+    fn duplicate_data_ack_does_not_postpone_recovery() {
+        let mut conn = connection();
+        for id in [0, 4, 8] {
+            conn.on_stream(id, 0, b"request", true);
+        }
+        conn.ready.clear();
+        conn.unacked = vec![(10, 0), (11, 4), (12, 8)];
+        acknowledge(&mut conn, Space::Data, &[(12, 12)]);
+        let deadline = conn.timeout();
+        conn.pto_count = 2;
+        acknowledge(&mut conn, Space::Data, &[(12, 12)]);
+        assert_eq!(conn.pto_count, 2);
+        conn.pto_count = 0;
+        assert_eq!(conn.timeout(), deadline);
+        assert_eq!(conn.unacked, [(10, 0), (11, 4)]);
     }
 
     #[test]
