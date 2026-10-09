@@ -11,6 +11,7 @@ import subprocess
 from aioquic import tls
 from aioquic.asyncio import connect
 from aioquic.buffer import Buffer
+from aioquic.h3.connection import FrameType, encode_frame
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.crypto import CryptoError
 from aioquic.quic.logger import QuicLogger
@@ -211,8 +212,19 @@ async def check(port, logger):
             await asyncio.wait_for(client.ping(), 2)
             future = asyncio.get_running_loop().create_future()
             client.pending[20] = (future, [], bytearray())
+            # The independent sending-direction case is a complete, valid
+            # HTTP/3 POST. Keep its size fixed for the exact-credit assertions.
+            updates, section = client.http._encoder.encode(20, [
+                (b":method", b"POST"), (b":scheme", b"https"),
+                (b":authority", b"localhost"), (b":path", b"/"),
+            ])
+            assert not updates, "the peer advertised no dynamic QPACK table"
+            request = encode_frame(FrameType.HEADERS, section)
+            assert len(request) <= 30
+            request += encode_frame(FrameType.DATA, b"x" * (30 - len(request)))
+            assert len(request) == 32
             await inject([stream(16, 64), reset(16, 128),
-                          stream(20, 32, b"x" * 32, True), reset(20, 32)])
+                          stream(20, 32, request, True), reset(20, 32)])
 
             def sparse(first):
                 return [stream(sid, 1 << 24) for sid in range(first, first + 128, 4)]
