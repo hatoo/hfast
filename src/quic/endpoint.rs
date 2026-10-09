@@ -62,43 +62,50 @@ impl Endpoint {
         let _ = self.socket.set_read_timeout(Some(Duration::from_millis(5)));
         let mut since_tick = 0u32;
         loop {
-            let received = if self.conns.len() <= 1 {
-                // A lone client need not pay for a receive batch on each
-                // request/response round trip. Switch once more clients arrive.
-                self.socket
-                    .recv_from(batch.single_buffer())
-                    .map(|(n, from)| {
-                        self.datagram(&mut batch.single_buffer()[..n], from);
-                        1
-                    })
-            } else {
-                batch.receive(&self.socket).inspect(|&count| {
-                    for i in 0..count {
-                        let (datagram, from) = batch.datagram(i);
-                        self.datagram(datagram, from);
-                    }
+            let _ = self.step(&mut batch, &mut since_tick);
+        }
+    }
+
+    /// Flush each receive's output and service timers before waiting again.
+    fn step(&mut self, batch: &mut ReceiveBatch, since_tick: &mut u32) -> std::io::Result<usize> {
+        let received = if self.conns.is_empty() {
+            // Block for the first peer without preparing receive descriptors.
+            // Even one peer can queue many datagrams when multiplexing streams;
+            // use the adaptive batch receiver once a connection is accepted.
+            self.socket
+                .recv_from(batch.single_buffer())
+                .map(|(n, from)| {
+                    self.datagram(&mut batch.single_buffer()[..n], from);
+                    1
                 })
-            };
-            // Do not wait for another receive to finish a connection's output.
-            self.flush_ready();
-            match received {
-                Ok(count) => {
-                    since_tick += count as u32;
-                    // Under load the socket never goes quiet, so the timers
-                    // would never be looked at if this were the only way in
-                    if since_tick >= TICK_EVERY {
-                        since_tick = 0;
-                        self.tick();
-                    }
+        } else {
+            batch.receive(&self.socket).inspect(|&count| {
+                for i in 0..count {
+                    let (datagram, from) = batch.datagram(i);
+                    self.datagram(datagram, from);
                 }
-                Err(_) => {
-                    since_tick = 0;
+            })
+        };
+        // Do not wait for another receive to finish a connection's output.
+        self.flush_ready();
+        match &received {
+            Ok(count) => {
+                *since_tick += *count as u32;
+                // Under load the socket never goes quiet, so the timers
+                // would never be looked at if this were the only way in
+                if *since_tick >= TICK_EVERY {
+                    *since_tick = 0;
                     self.tick();
                 }
             }
-            // Never wait for another receive to complete a partial send batch.
-            let _ = self.out.flush(&self.socket);
+            Err(_) => {
+                *since_tick = 0;
+                self.tick();
+            }
         }
+        // Never wait for another receive to complete a partial send batch.
+        let _ = self.out.flush(&self.socket);
+        received
     }
 
     /// Give every connection that is waiting on something a chance to send it
@@ -286,6 +293,146 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.set_nonblocking(true).unwrap();
         (Endpoint::new(server, Arc::new(tls_config()), 64), client)
+    }
+
+    fn send_initial(ep: &Endpoint, client: &UdpSocket, pn: u8, payload: &[u8]) {
+        client
+            .send_to(&initial(pn, payload), ep.socket.local_addr().unwrap())
+            .unwrap();
+    }
+
+    fn expect_ack(client: &UdpSocket, pn: u64, largest: u64) {
+        let mut buf = [0; 2048];
+        let n = client.recv(&mut buf).unwrap();
+        let packet = &mut buf[..n];
+        let header = packet::parse(packet, 0).unwrap();
+        let keys = client_keys();
+        let (_, pn_len) =
+            wire::unprotect_header(keys.remote.header.as_ref(), packet, header.pn_offset).unwrap();
+        let (head, body) = packet.split_at_mut(header.pn_offset + pn_len);
+        let plain = keys.remote.packet.decrypt_in_place(pn, head, body).unwrap();
+        let frames = frame::Frames::new(plain)
+            .collect::<wire::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            matches!(frames.as_slice(), [frame::Frame::Ack { largest: got, first_range, .. }]
+            if *got == largest && *first_range == largest)
+        );
+        assert_eq!(
+            client.recv(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "one aggregated ACK, without duplicates"
+        );
+    }
+
+    #[test]
+    fn singleton_burst_is_received_together_and_ack_is_flushed_before_waiting() {
+        let (mut ep, client) = endpoint();
+        ep.socket.set_nonblocking(true).unwrap();
+        let mut batch = ReceiveBatch::new();
+        let mut since_tick = 0;
+        send_initial(&ep, &client, 0, &[frame::PING as u8]);
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 1);
+        expect_ack(&client, 0, 0);
+
+        for pn in 1..=8 {
+            send_initial(&ep, &client, pn, &[frame::PING as u8]);
+        }
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 8);
+        expect_ack(&client, 1, 8);
+        assert_eq!(since_tick, 9);
+        assert!(ep.ready.is_empty());
+
+        // A partial batch must be sent without another input datagram.
+        send_initial(&ep, &client, 9, &[frame::PING as u8]);
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 1);
+        expect_ack(&client, 2, 9);
+        assert_eq!(
+            ep.step(&mut batch, &mut since_tick).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(since_tick, 0);
+    }
+
+    #[test]
+    fn receive_batches_survive_zero_one_many_one_zero_peers() {
+        let (mut ep, first) = endpoint();
+        ep.socket.set_nonblocking(true).unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").unwrap();
+        second.set_nonblocking(true).unwrap();
+        let mut batch = ReceiveBatch::new();
+        let mut since_tick = 0;
+        send_initial(&ep, &first, 0, &[frame::PING as u8]);
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 1);
+        expect_ack(&first, 0, 0);
+        assert_eq!(ep.conns.len(), 1);
+
+        send_initial(&ep, &second, 0, &[frame::PING as u8]);
+        send_initial(&ep, &first, 1, &[frame::PING as u8]);
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 2);
+        assert_eq!(ep.conns.len(), 2);
+        expect_ack(&first, 1, 1);
+        expect_ack(&second, 0, 0);
+
+        send_initial(&ep, &first, 2, &[frame::PING as u8]);
+        send_initial(&ep, &first, 3, &[frame::CONNECTION_CLOSE as u8, 0, 0, 0]);
+        send_initial(&ep, &second, 1, &[frame::PING as u8]);
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 3);
+        assert_eq!(ep.conns.len(), 1);
+        assert!(ep.conns.contains_key(&second.local_addr().unwrap()));
+        expect_ack(&second, 1, 1);
+        assert_eq!(
+            first.recv(&mut [0; 2048]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        for pn in 2..=5 {
+            send_initial(&ep, &second, pn, &[frame::PING as u8]);
+        }
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 4);
+        expect_ack(&second, 2, 5);
+        send_initial(&ep, &second, 6, &[frame::CONNECTION_CLOSE as u8, 0, 0, 0]);
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 1);
+        assert!(ep.conns.is_empty());
+        assert!(ep.ready.is_empty());
+
+        send_initial(&ep, &first, 0, &[frame::PING as u8]);
+        assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 1);
+        expect_ack(&first, 0, 0);
+        assert_eq!(ep.conns.len(), 1);
+    }
+
+    #[test]
+    fn receive_error_and_busy_socket_both_service_idle_timers() {
+        for busy in [false, true] {
+            let (mut ep, client) = endpoint();
+            ep.socket.set_nonblocking(true).unwrap();
+            let mut batch = ReceiveBatch::new();
+            let mut since_tick = 0;
+            send_initial(&ep, &client, 0, &[frame::PING as u8]);
+            ep.step(&mut batch, &mut since_tick).unwrap();
+            expect_ack(&client, 0, 0);
+            ep.conns.get_mut(&client.local_addr().unwrap()).unwrap().1 =
+                Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+            if busy {
+                // Invalid traffic from another address must not starve timers.
+                let noise = UdpSocket::bind("127.0.0.1:0").unwrap();
+                noise.send_to(&[], ep.socket.local_addr().unwrap()).unwrap();
+                since_tick = TICK_EVERY - 1;
+                assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 1);
+            } else {
+                assert_eq!(
+                    ep.step(&mut batch, &mut since_tick).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+            assert!(ep.conns.is_empty());
+            assert!(ep.ready.is_empty());
+            assert_eq!(since_tick, 0);
+            send_initial(&ep, &client, 0, &[frame::PING as u8]);
+            assert_eq!(ep.step(&mut batch, &mut since_tick).unwrap(), 1);
+            expect_ack(&client, 0, 0);
+        }
     }
 
     #[test]

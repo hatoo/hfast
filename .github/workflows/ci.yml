@@ -54,3 +54,7 @@ jobs:
         run: python benchmarks/reset-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit with epoll
         run: python benchmarks/reset-accounting-check.py target/release/hfast --epoll
+      - name: QUIC queued receive bursts and peer transitions
+        run: python benchmarks/receive-batch-check.py target/release/hfast
+      - name: QUIC queued receive bursts with epoll
+        run: python benchmarks/receive-batch-check.py target/release/hfast --epoll
