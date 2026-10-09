@@ -38,3 +38,7 @@ jobs:
         run: python benchmarks/control-recovery-check.py target/release/hfast
       - name: QUIC control recovery with epoll
         run: python benchmarks/control-recovery-check.py target/release/hfast --epoll
+      - name: QUIC request recovery with reordering and loss
+        run: python benchmarks/stream-recovery-check.py target/release/hfast
+      - name: QUIC request recovery with epoll
+        run: python benchmarks/stream-recovery-check.py target/release/hfast --epoll
