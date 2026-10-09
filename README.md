@@ -60,9 +60,9 @@ behind it.
 
 **One thread per core, and nothing shared between them.** Each TCP worker has
 its own `SO_REUSEPORT` listener and io_uring; each HTTP/3 worker
-has its own `SO_REUSEPORT` socket, its own QUIC endpoint and its own
-single-threaded runtime. Sharing one QUIC endpoint between threads instead put
-every connection through the same lock and cost two thirds of the throughput.
+has its own `SO_REUSEPORT` socket, QUIC endpoint and blocking UDP loop. Sharing
+one QUIC endpoint between threads instead put every connection through the same
+lock and cost two thirds of the throughput.
 
 **TCP operations submitted in batches.** A worker submits the ready sockets'
 nonblocking receives together, parses their completions, then submits their
@@ -97,17 +97,18 @@ trailing partial request is copied anywhere.
 
 ## HTTP/3
 
-The QUIC is ours. quinn's cost 1.53us of server CPU a request against the
-0.32us this does, and none of it was configuration: what a request cost there
-was hashing streams into a map and allocating per chunk, which is a fair way
-for a general-purpose stack to be built and not one a benchmark target has to
-pay. `--quinn` still serves HTTP/3 from quinn, for comparing the two.
+The QUIC is ours. The former quinn implementation cost 1.53us of server CPU per
+request against the 0.32us this does, and none of it was configuration: what a
+request cost there was hashing streams into a map and allocating per chunk,
+which is a fair way for a general-purpose stack to be built and not one a
+benchmark target has to pay. HTTP/3 now uses only the in-tree QUIC transport, with no quinn or tokio
+dependency.
 
-rustls does TLS 1.3, the QUIC key schedule and the AEAD, as it does for quinn.
+rustls does TLS 1.3, the QUIC key schedule and the AEAD.
 What is ours is the transport: packets, frames, acknowledgement, flow control
 and enough loss recovery to get through a path that drops things. Against a
 relay dropping 5% each way, 3000 requests all arrive at 3,922 a second, where
-quinn manages 3,960.
+the former quinn implementation managed 3,960.
 
 Nothing in a request is read. A request's stream id is what says which stream
 to answer on and the end of the stream is what says to answer at all, so there
@@ -159,13 +160,6 @@ asks for does not slow the run down honestly - it caps the concurrency, so the
 run measures the limit rather than either end's speed. The default of 1024 is
 above any load generator's default and cheap enough not to matter; set it to
 what is actually being asked for when that is higher.
-
-The transport is [quinn](https://github.com/quinn-rs/quinn)'s. A QUIC stack is
-packet protection, loss recovery, congestion control and flow control before it
-is any use at all, and none of that is worth hand-rolling for something whose
-whole job is to answer quickly. What is ours is the HTTP/3 layer above it,
-which for a server that sends the same response every time is a constant, and
-the threading around it, which is most of what made it fast.
 
 The certificate is self-signed and generated at startup. There is nothing here
 worth authenticating, and a load generator pointed at it is not checking.

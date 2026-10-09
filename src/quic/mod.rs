@@ -1,9 +1,8 @@
 //! A QUIC server, only as much of one as answering a benchmark needs
 //!
-//! The TLS handshake, the key schedule and the AEAD come from rustls, the same
-//! way [`crate::h3`]'s did from quinn. What is here is the transport around
-//! them: packets, frames, streams, acknowledgement and the little recovery a
-//! path that mostly works needs.
+//! The TLS handshake, the key schedule and the AEAD come from rustls.
+//! What is here is the transport around them: packets, frames, streams,
+//! acknowledgement and the little recovery a path that mostly works needs.
 //!
 //! See README.md for what it leaves out and why a load generator does not
 //! notice.
