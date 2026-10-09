@@ -1,17 +1,19 @@
-//! The TCP side: one thread per core, each with its own listener and epoll
+//! The TCP side: one thread per core, each with its own listener and io_uring
 //!
 //! Both HTTP/1.1 and HTTP/2 are served on the same port. Which one a connection
 //! is talking is decided by its first bytes: HTTP/2 over cleartext opens with a
 //! preface (RFC 9113 Section 3.4) that no HTTP/1.1 request can begin with, so
 //! nothing has to be negotiated and no client has to be told which port to use.
 
+use std::collections::VecDeque;
 use std::os::fd::RawFd;
 
-use crate::sys::{self, epoll_add, epoll_mod};
+use crate::sys;
 use crate::{h1, h2};
 
-const READ_SIZE: usize = 64 * 1024;
-const LISTENER: u64 = u64::MAX;
+const BATCH: usize = 128;
+const LISTENER: u64 = u32::MAX as u64;
+const IO: u64 = 1 << 63;
 
 enum Proto {
     /// Too few bytes to tell yet
@@ -28,8 +30,6 @@ struct Conn {
     /// How much of `outbuf` the socket has taken
     out_off: usize,
     proto: Proto,
-    /// EPOLLOUT is armed because a write came up short
-    want_write: bool,
 }
 
 impl Conn {
@@ -42,7 +42,6 @@ impl Conn {
             outbuf: Vec::new(),
             out_off: 0,
             proto: Proto::Unknown,
-            want_write: false,
         }
     }
 
@@ -103,55 +102,18 @@ fn settle(buf: &[u8]) -> Which {
 /// [`sys::attach_reuseport_cbpf`] for why each worker has one of its own and
 /// why it is pinned.
 pub fn worker(lfd: RawFd, cpu: usize) {
-    if let Ok(ring) = io_uring::IoUring::new(128) {
-        worker_ring(lfd, cpu, ring);
-    }
-    sys::pin_to_cpu(cpu);
-    let ep = sys::epoll_create();
-    epoll_add(ep, lfd, libc::EPOLLIN as u32, LISTENER);
+    let ring = io_uring::IoUring::new(BATCH as u32).expect("TCP workers require io_uring");
+    worker_ring(lfd, cpu, ring);
+}
 
-    // Indexed by fd: the kernel hands out the lowest free one, so this stays as
-    // dense as the connection count and costs one bounds check to look up.
-    let mut conns: Vec<Option<Conn>> = Vec::new();
-    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
-    let mut scratch = vec![0u8; READ_SIZE];
-
-    loop {
-        let n = unsafe { libc::epoll_wait(ep, events.as_mut_ptr(), events.len() as i32, -1) };
-        if n < 0 {
+/// Bound accepts so established connections keep making progress.
+fn accept_batch(ring: &mut io_uring::IoUring, lfd: RawFd, conns: &mut Vec<Option<Conn>>) {
+    for _ in 0..BATCH {
+        let fd = sys::accept(lfd);
+        if fd < 0 {
             if sys::errno() == libc::EINTR {
                 continue;
             }
-            return;
-        }
-        for ev in &events[..n as usize] {
-            if ev.u64 == LISTENER {
-                accept_all(ep, lfd, &mut conns);
-                continue;
-            }
-            let fd = ev.u64 as RawFd;
-            if conns.get(fd as usize).and_then(|c| c.as_ref()).is_none() {
-                continue;
-            }
-            let mut close = ev.events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
-            if !close && ev.events & libc::EPOLLIN as u32 != 0 {
-                close = !read_and_drive(fd, conns[fd as usize].as_mut().unwrap(), &mut scratch);
-            }
-            if !close {
-                close = !write_out(ep, fd, conns[fd as usize].as_mut().unwrap());
-            }
-            if close {
-                unsafe { libc::close(fd) };
-                conns[fd as usize] = None;
-            }
-        }
-    }
-}
-
-fn accept_all(ep: RawFd, lfd: RawFd, conns: &mut Vec<Option<Conn>>) {
-    loop {
-        let fd = sys::accept(lfd);
-        if fd < 0 {
             return;
         }
         sys::set_nodelay(fd);
@@ -159,70 +121,8 @@ fn accept_all(ep: RawFd, lfd: RawFd, conns: &mut Vec<Option<Conn>>) {
             conns.resize_with(fd as usize + 1, || None);
         }
         conns[fd as usize] = Some(Conn::new());
-        epoll_add(ep, fd, libc::EPOLLIN as u32, fd as u64);
+        arm_poll(ring, fd, libc::POLLIN, fd as u64);
     }
-}
-
-/// Read until the socket is empty, answering as each read arrives
-///
-/// A read that finds nothing carried over is parsed where it landed, and only
-/// the trailing partial request is copied anywhere. Appending every read to a
-/// buffer first and then shifting that buffer down over what was used was two
-/// copies a request, for the sake of the rare one that spans two reads.
-fn read_and_drive(fd: RawFd, conn: &mut Conn, scratch: &mut [u8]) -> bool {
-    loop {
-        let r = unsafe { libc::read(fd, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len()) };
-        if r == 0 {
-            return false;
-        }
-        if r < 0 {
-            let e = sys::errno();
-            return e == libc::EAGAIN || e == libc::EINTR;
-        }
-        let n = r as usize;
-        if !consume(conn, &scratch[..n]) {
-            return false;
-        }
-        if n < scratch.len() {
-            return true;
-        }
-    }
-}
-
-/// One write per wakeup, however many responses landed in it. This is why
-/// HTTP/2 costs the kernel so much less per request than HTTP/1.1 does.
-fn write_out(ep: RawFd, fd: RawFd, conn: &mut Conn) -> bool {
-    while conn.out_off < conn.outbuf.len() {
-        let w = unsafe {
-            libc::write(
-                fd,
-                conn.outbuf.as_ptr().add(conn.out_off) as *const libc::c_void,
-                conn.outbuf.len() - conn.out_off,
-            )
-        };
-        if w > 0 {
-            conn.out_off += w as usize;
-            continue;
-        }
-        let e = sys::errno();
-        if e == libc::EAGAIN {
-            if !conn.want_write {
-                conn.want_write = true;
-                epoll_mod(ep, fd, (libc::EPOLLIN | libc::EPOLLOUT) as u32, fd as u64);
-            }
-            return true;
-        }
-        if e != libc::EINTR {
-            return false;
-        }
-    }
-    conn.outbuf.clear();
-    conn.out_off = 0;
-    if conn.want_write {
-        conn.want_write = false;
-        epoll_mod(ep, fd, libc::EPOLLIN as u32, fd as u64);
-    }
-    true
 }
 
 fn consume(conn: &mut Conn, data: &[u8]) -> bool {
@@ -251,38 +151,39 @@ fn consume(conn: &mut Conn, data: &[u8]) -> bool {
 /// connection is moved or changed while the corresponding operation is live.
 fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
     use io_uring::{opcode, types};
-    const BATCH: usize = 128;
     const CHUNK: usize = 16 * 1024;
     sys::pin_to_cpu(cpu);
-    let ep = sys::epoll_create();
-    epoll_add(ep, lfd, libc::EPOLLIN as u32, LISTENER);
+    arm_poll(&mut ring, lfd, libc::POLLIN, LISTENER);
     let mut conns: Vec<Option<Conn>> = Vec::new();
-    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; BATCH];
+    let mut ready = VecDeque::new();
+    let mut events = Vec::with_capacity(BATCH);
     let mut scratch = vec![0u8; BATCH * CHUNK];
     let mut completions = Vec::with_capacity(BATCH);
     loop {
-        let n = unsafe { libc::epoll_wait(ep, events.as_mut_ptr(), BATCH as _, -1) };
-        if n < 0 {
-            continue;
-        }
+        // Polls are one-shot: each socket is rearmed only after its I/O batch
+        // finishes, so closing a socket cannot leave a stale poll for a reused fd.
+        submit(&mut ring, usize::from(ready.is_empty()));
+        drain_completions(&mut ring, &mut ready, &mut completions);
+        events.clear();
+        events.extend(ready.drain(..ready.len().min(BATCH)));
         let mut reads = 0;
-        for (i, ev) in events[..n as usize].iter().enumerate() {
-            if ev.u64 == LISTENER {
-                accept_all(ep, lfd, &mut conns);
+        for (i, &(token, result)) in events.iter().enumerate() {
+            if token == LISTENER {
+                assert!(result >= 0, "io_uring listener poll: {result}");
                 continue;
             }
-            let fd = ev.u64 as RawFd;
+            let fd = token as RawFd;
             if conns.get(fd as usize).and_then(Option::as_ref).is_none() {
                 continue;
             }
-            if ev.events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0 {
+            if result < 0 || result & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) as i32 != 0 {
                 unsafe {
                     libc::close(fd);
                 }
                 conns[fd as usize] = None;
                 continue;
             }
-            if ev.events & libc::EPOLLIN as u32 != 0 {
+            if result & libc::POLLIN as i32 != 0 {
                 let entry = opcode::Recv::new(
                     types::Fd(fd),
                     unsafe { scratch.as_mut_ptr().add(i * CHUNK) },
@@ -290,25 +191,16 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
                 )
                 .flags(libc::MSG_DONTWAIT)
                 .build()
-                .user_data(i as _);
+                .user_data(IO | i as u64);
                 // scratch is stable and each receive owns a distinct chunk.
-                unsafe {
-                    ring.submission()
-                        .push(&entry)
-                        .expect("receive batch capacity");
-                }
+                unsafe { push(&mut ring, &entry) };
                 reads += 1;
             }
         }
         if reads > 0 {
-            wait_batch(&mut ring, reads);
-            completions.clear();
-            completions.extend(
-                ring.completion()
-                    .map(|c| (c.user_data() as usize, c.result())),
-            );
+            wait_batch(&mut ring, reads, &mut ready, &mut completions);
             for &(i, result) in &completions {
-                let fd = events[i].u64 as RawFd;
+                let fd = events[i].0 as RawFd;
                 let conn = conns[fd as usize].as_mut().unwrap();
                 let alive = if result > 0 {
                     consume(conn, &scratch[i * CHUNK..i * CHUNK + result as usize])
@@ -324,11 +216,11 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
             }
         }
         let mut writes = 0;
-        for ev in &events[..n as usize] {
-            if ev.u64 == LISTENER {
+        for &(token, _) in &events {
+            if token == LISTENER {
                 continue;
             }
-            let fd = ev.u64 as RawFd;
+            let fd = token as RawFd;
             let Some(conn) = conns.get_mut(fd as usize).and_then(Option::as_mut) else {
                 continue;
             };
@@ -340,21 +232,14 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
                 )
                 .flags(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
                 .build()
-                .user_data(fd as _);
+                .user_data(IO | fd as u64);
                 // No outbuf is changed until all send completions are drained.
-                unsafe {
-                    ring.submission().push(&entry).expect("send batch capacity");
-                }
+                unsafe { push(&mut ring, &entry) };
                 writes += 1;
             }
         }
         if writes > 0 {
-            wait_batch(&mut ring, writes);
-            completions.clear();
-            completions.extend(
-                ring.completion()
-                    .map(|c| (c.user_data() as usize, c.result())),
-            );
+            wait_batch(&mut ring, writes, &mut ready, &mut completions);
             for &(fd, result) in &completions {
                 let conn = conns[fd].as_mut().unwrap();
                 if result > 0 {
@@ -371,23 +256,83 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
                     conn.outbuf.clear();
                     conn.out_off = 0;
                 }
-                if pending != conn.want_write {
-                    conn.want_write = pending;
-                    let flags = libc::EPOLLIN | if pending { libc::EPOLLOUT } else { 0 };
-                    epoll_mod(ep, fd as _, flags as _, fd as _);
-                }
             }
+        }
+        for &(token, _) in &events {
+            if token == LISTENER {
+                continue;
+            }
+            if let Some(conn) = conns[token as usize].as_ref() {
+                let flags = libc::POLLIN
+                    | if conn.out_off < conn.outbuf.len() {
+                        libc::POLLOUT
+                    } else {
+                        0
+                    };
+                arm_poll(&mut ring, token as RawFd, flags, token);
+            }
+        }
+        // Accept only after the old batch is retired: accept4 may reuse any
+        // descriptor closed above, and its poll must be armed exactly once.
+        if events.iter().any(|&(token, _)| token == LISTENER) {
+            accept_batch(&mut ring, lfd, &mut conns);
+            arm_poll(&mut ring, lfd, libc::POLLIN, LISTENER);
         }
     }
 }
 
-fn wait_batch(ring: &mut io_uring::IoUring, count: usize) {
-    while ring.completion().len() < count {
+/// Submit queued entries even when readiness completions are already available.
+fn submit(ring: &mut io_uring::IoUring, count: usize) {
+    loop {
         match ring.submit_and_wait(count) {
-            Ok(_) => {}
+            Ok(_) => return,
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
-            Err(e) => panic!("io_uring batch: {e}"),
+            Err(e) => panic!("io_uring submit: {e}"),
         }
+    }
+}
+
+/// The caller must keep an entry's buffers valid until its completion is drained.
+unsafe fn push(ring: &mut io_uring::IoUring, entry: &io_uring::squeue::Entry) {
+    while unsafe { ring.submission().push(entry) }.is_err() {
+        submit(ring, 0);
+    }
+}
+
+fn arm_poll(ring: &mut io_uring::IoUring, fd: RawFd, flags: i16, token: u64) {
+    let entry = io_uring::opcode::PollAdd::new(io_uring::types::Fd(fd), flags as u32)
+        .build()
+        .user_data(token);
+    // PollAdd borrows no userspace storage.
+    unsafe { push(ring, &entry) };
+}
+
+fn drain_completions(
+    ring: &mut io_uring::IoUring,
+    ready: &mut VecDeque<(u64, i32)>,
+    completions: &mut Vec<(usize, i32)>,
+) {
+    for c in ring.completion() {
+        if c.user_data() & IO == 0 {
+            ready.push_back((c.user_data(), c.result()));
+        } else {
+            completions.push(((c.user_data() & !IO) as usize, c.result()));
+        }
+    }
+}
+
+fn wait_batch(
+    ring: &mut io_uring::IoUring,
+    count: usize,
+    ready: &mut VecDeque<(u64, i32)>,
+    completions: &mut Vec<(usize, i32)>,
+) {
+    completions.clear();
+    while completions.len() < count {
+        // Poll completions can arrive alongside I/O. Save them for the next
+        // batch, and count only I/O completions toward the buffer barrier.
+        submit(ring, 1);
+        drain_completions(ring, ready, completions);
     }
 }
 

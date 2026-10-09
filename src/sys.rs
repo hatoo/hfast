@@ -1,7 +1,7 @@
-//! The socket and epoll calls, straight through libc
+//! The socket calls, straight through libc
 //!
 //! There is no runtime under the TCP side of this server: one thread per core,
-//! each with its own `SO_REUSEPORT` listener and its own epoll instance, so
+//! each with its own `SO_REUSEPORT` listener and its own io_uring, so
 //! nothing is shared and nothing needs locking.
 
 use std::os::fd::RawFd;
@@ -154,20 +154,6 @@ pub fn pin_to_cpu(cpu: usize) {
         libc::CPU_SET(cpu, &mut set);
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
-}
-
-pub fn epoll_create() -> RawFd {
-    unsafe { libc::epoll_create1(0) }
-}
-
-pub fn epoll_add(ep: RawFd, fd: RawFd, events: u32, token: u64) {
-    let mut ev = libc::epoll_event { events, u64: token };
-    unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, fd, &mut ev) };
-}
-
-pub fn epoll_mod(ep: RawFd, fd: RawFd, events: u32, token: u64) {
-    let mut ev = libc::epoll_event { events, u64: token };
-    unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_MOD, fd, &mut ev) };
 }
 
 /// `accept4` with `SOCK_NONBLOCK`, or a negative errno

@@ -143,29 +143,32 @@ def backpressure():
         assert out.count(b"HTTP/1.1 200 OK") == 40000
 
 
-def deny_uring():
-    # Force the fallback without adding a server tuning flag. This filter only
-    # applies to the child server, so independent clients keep their normal I/O.
-    import ctypes
-
-    lib = ctypes.CDLL("libseccomp.so.2")
-    lib.seccomp_init.argtypes = [ctypes.c_uint32]
-    lib.seccomp_init.restype = ctypes.c_void_p
-    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
-    lib.seccomp_rule_add.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_int,
-        ctypes.c_uint,
-    ]
-    lib.seccomp_load.argtypes = [ctypes.c_void_p]
-    lib.seccomp_release.argtypes = [ctypes.c_void_p]
-    ctx = lib.seccomp_init(0x7FFF0000)
-    assert ctx
-    syscall = lib.seccomp_syscall_resolve_name(b"io_uring_setup")
-    assert lib.seccomp_rule_add(ctx, 0x50001, syscall, 0) == 0
-    assert lib.seccomp_load(ctx) == 0
-    lib.seccomp_release(ctx)
+def tcp_poll_batches():
+    # More connections than both ring queues: idle polls must not block active
+    # sockets, and readiness arriving during I/O must survive batch barriers.
+    sockets = []
+    request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    try:
+        for _ in range(384):
+            sockets.append(socket.create_connection(("127.0.0.1", 18083), timeout=5))
+        for turn in range(4):
+            active = sockets[turn % 2::2]
+            for sock in active:
+                sock.sendall(request * 8)
+            for sock in active:
+                out = bytearray()
+                while out.count(BODY) < 8:
+                    data = sock.recv(65536)
+                    assert data, "server closed during poll batch"
+                    out.extend(data)
+                assert out.count(b"HTTP/1.1 200 OK") == 8
+            # Mix peer closes and accepts to exercise descriptor reuse.
+            for i in range(turn % 2, len(sockets), 2):
+                sockets[i].close()
+                sockets[i] = socket.create_connection(("127.0.0.1", 18083), timeout=5)
+    finally:
+        for sock in sockets:
+            sock.close()
 
 
 def main():
@@ -173,15 +176,15 @@ def main():
         [sys.argv[1], "--threads", "1", "--tcp", "18083", "--quic", "18443"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        preexec_fn=deny_uring if "--epoll" in sys.argv[2:] else None,
     )
     try:
         time.sleep(0.2)
         tcp()
         backpressure()
+        tcp_poll_batches()
         asyncio.run(h3())
         print(
-            "HTTP/1.1 fragmented/pipelined POST+GET; hyper-h2 64 streams; aioquic 64 GET + 64 POST: PASS"
+            "HTTP/1.1 fragmented/pipelined POST+GET; hyper-h2 64 streams; TCP poll batches/reconnects; aioquic 64 GET + 64 POST: PASS"
         )
     finally:
         server.terminate()

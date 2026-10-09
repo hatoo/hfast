@@ -30,27 +30,15 @@ jobs:
         run: python -m pip install -r benchmarks/interop-requirements.txt
       - name: Protocol interoperability
         run: python benchmarks/interoperability.py target/release/hfast
-      - name: Protocol interoperability with epoll
-        run: python benchmarks/interoperability.py target/release/hfast --epoll
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
       - name: QUIC control recovery with repeated packet loss
         run: python benchmarks/control-recovery-check.py target/release/hfast
-      - name: QUIC control recovery with epoll
-        run: python benchmarks/control-recovery-check.py target/release/hfast --epoll
       - name: QUIC request recovery with reordering and loss
         run: python benchmarks/stream-recovery-check.py target/release/hfast
-      - name: QUIC request recovery with epoll
-        run: python benchmarks/stream-recovery-check.py target/release/hfast --epoll
       - name: QUIC credit recovery with repeated packet loss
         run: python benchmarks/credit-recovery-check.py target/release/hfast
-      - name: QUIC credit recovery with epoll
-        run: python benchmarks/credit-recovery-check.py target/release/hfast --epoll
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
-      - name: QUIC uni credit with epoll
-        run: python benchmarks/uni-accounting-check.py target/release/hfast --epoll
       - name: QUIC cancellation credit and reset recovery
         run: python benchmarks/reset-accounting-check.py target/release/hfast
-      - name: QUIC cancellation credit with epoll
-        run: python benchmarks/reset-accounting-check.py target/release/hfast --epoll
