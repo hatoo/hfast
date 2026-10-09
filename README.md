@@ -59,7 +59,7 @@ behind it.
 ## How it is built
 
 **One thread per core, and nothing shared between them.** Each TCP worker has
-its own `SO_REUSEPORT` listener, epoll instance and io_uring; each HTTP/3 worker
+its own `SO_REUSEPORT` listener and io_uring; each HTTP/3 worker
 has its own `SO_REUSEPORT` socket, its own QUIC endpoint and its own
 single-threaded runtime. Sharing one QUIC endpoint between threads instead put
 every connection through the same lock and cost two thirds of the throughput.
@@ -69,7 +69,8 @@ nonblocking receives together, parses their completions, then submits their
 responses together. Each receive has a distinct 16 KiB chunk in a 2 MiB worker
 scratch buffer. Completion barriers keep receive storage and response vectors
 stable until the kernel finishes with them. Partial writes retain their bytes
-and resume on EPOLLOUT. Systems without io_uring use the original syscall loop.
+and resume when an io_uring poll reports writability. Socket readiness also uses
+io_uring; TCP workers require io_uring to be available.
 See [the optimization log](benchmarks/throughput-optimization.md) for pinned
 shb comparisons, rejected experiments and correctness checks.
 

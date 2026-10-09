@@ -14,7 +14,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.logger import QuicLogger
 from aioquic.quic.packet import QuicStreamFrame
 
-from interoperability import Client, deny_uring
+from interoperability import Client
 
 
 async def check(port, logger):
@@ -179,7 +179,6 @@ async def main(args):
     server = subprocess.Popen(
         [args.binary, "--threads", "1", "--tcp", "0", "--quic", str(port)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        preexec_fn=deny_uring if args.epoll else None,
     )
     try:
         await asyncio.sleep(0.2)
@@ -196,6 +195,5 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
-    parser.add_argument("--epoll", action="store_true")
     parser.add_argument("--qlog")
     asyncio.run(main(parser.parse_args()))

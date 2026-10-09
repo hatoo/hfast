@@ -56,7 +56,7 @@ fn main() {
     }
     if tcp_port != 0 {
         eprintln!("hfast: HTTP/1.1 and HTTP/2 on tcp/{tcp_port}, {threads} threads");
-        // One listener and one epoll per thread, sharing the port through
+        // One listener and one io_uring per thread, sharing the port through
         // SO_REUSEPORT, so no two of them ever touch the same memory. They are
         // bound here rather than in the workers so that the order they join the
         // group in is known: the steering program returns a CPU number, and the
