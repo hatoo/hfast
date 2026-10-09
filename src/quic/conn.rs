@@ -110,6 +110,51 @@ struct CryptoFlight {
     pending: bool,
 }
 
+/// A fixed control payload, retained until any transmission is acknowledged.
+/// Earlier packet numbers remain valid when a probe is queued or retransmitted.
+struct ControlFlight {
+    sent_in: Vec<u64>,
+    pending: bool,
+}
+
+impl ControlFlight {
+    fn new() -> Self {
+        Self {
+            sent_in: Vec::new(),
+            pending: true,
+        }
+    }
+
+    fn sent(&mut self, pn: u64) {
+        self.sent_in.push(pn);
+        self.pending = false;
+    }
+
+    fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) -> bool {
+        if self.sent_in.iter().any(|&pn| {
+            frame::AckRanges::new(largest, first_range, rest).any(|(lo, hi)| pn >= lo && pn <= hi)
+        }) {
+            self.sent_in.clear();
+            self.pending = false;
+            return true;
+        }
+        // Only the newest copy can require another transmission. An ACK for
+        // an old packet must not repeatedly declare a newer probe lost.
+        if self
+            .sent_in
+            .last()
+            .is_some_and(|&pn| largest >= pn + Connection::LOSS_THRESHOLD)
+        {
+            self.pending = true;
+        }
+        false
+    }
+
+    fn on_timeout(&mut self) {
+        self.pending |= !self.sent_in.is_empty();
+    }
+}
+
 /// One packet number space: what has been sent in it and what has arrived
 #[derive(Default)]
 struct SpaceState {
@@ -189,7 +234,7 @@ pub struct Connection {
     /// answered the ClientHello, so this says nothing about whether the
     /// handshake is confirmed - the older spaces still have a flight to send.
     pub connected: bool,
-    handshake_done_sent: bool,
+    handshake_done: ControlFlight,
     /// A PATH_CHALLENGE waiting to be answered
     path_response: Option<[u8; 8]>,
     pub closed: bool,
@@ -209,8 +254,8 @@ pub struct Connection {
     ack_ranges: Vec<(u64, u64)>,
     /// Packet assembly storage, returned here after each transmit attempt.
     packet_body: Vec<u8>,
-    /// How much of the control stream has gone out
-    control_sent: usize,
+    /// The fixed SETTINGS prelude at control-stream offset zero
+    control: ControlFlight,
     /// Requests finished, which is the credit the client gets back
     finished: u64,
     /// The largest stream count and data limit told to the client
@@ -276,7 +321,7 @@ impl Connection {
             peer_cid,
             peer: transport::Peer::default(),
             connected: false,
-            handshake_done_sent: false,
+            handshake_done: ControlFlight::new(),
             path_response: None,
             closed: false,
             streams: Vec::new(),
@@ -285,7 +330,7 @@ impl Connection {
             unacked: Vec::new(),
             ack_ranges: Vec::new(),
             packet_body: Vec::new(),
-            control_sent: 0,
+            control: ControlFlight::new(),
             finished: 0,
             streams_told: max_streams_bidi,
             data_told: initial_max_data,
@@ -483,8 +528,12 @@ impl Connection {
                         self.on_rtt(Instant::now() - at);
                     }
                 }
-                if space == Space::Data && !self.unacked.is_empty() {
-                    progress |= self.on_ack(largest, first_range, rest);
+                if space == Space::Data {
+                    progress |= self.control.on_ack(largest, first_range, rest);
+                    progress |= self.handshake_done.on_ack(largest, first_range, rest);
+                    if !self.unacked.is_empty() {
+                        progress |= self.on_ack(largest, first_range, rest);
+                    }
                 }
                 if progress {
                     self.pto_count = 0;
@@ -630,8 +679,8 @@ impl Connection {
     pub fn wants_send(&self) -> bool {
         !self.ready.is_empty()
             || self.path_response.is_some()
-            || (!self.tls.is_handshaking() && !self.handshake_done_sent)
-            || (self.connected && self.control_sent < CONTROL_PRELUDE.len())
+            || (!self.tls.is_handshaking() && self.handshake_done.pending)
+            || (self.connected && self.control.pending)
             || self.credit_owed()
             || self.spaces.iter().any(|s| {
                 !s.crypto_out.is_empty() || s.crypto_flight.iter().any(|f| f.pending) || s.ack.owed
@@ -669,9 +718,11 @@ impl Connection {
 
     /// The 1-RTT payload: the control stream, credit, and answers
     fn write_data(&mut self, body: &mut Vec<u8>, body_room: usize, pn: u64) {
-        if self.control_sent < CONTROL_PRELUDE.len() {
+        let control_len = frame::stream_overhead(CONTROL_STREAM, 0, CONTROL_PRELUDE.len())
+            + CONTROL_PRELUDE.len();
+        if self.control.pending && body.len() + control_len <= body_room {
             frame::put_stream(body, CONTROL_STREAM, 0, false, CONTROL_PRELUDE);
-            self.control_sent = CONTROL_PRELUDE.len();
+            self.control.sent(pn);
         }
         if self.streams_limit() >= self.streams_told + self.max_streams_bidi / 2 {
             self.streams_told = self.streams_limit();
@@ -748,9 +799,9 @@ impl Connection {
             // it as soon as rustls hands over 1-RTT keys tells the client it is
             // done before it is, so it throws away its handshake keys and never
             // sends the Finished at all - and then nothing ever confirms.
-            if !self.tls.is_handshaking() && !self.handshake_done_sent {
+            if !self.tls.is_handshaking() && self.handshake_done.pending && body.len() < body_room {
                 put_varint(body, frame::HANDSHAKE_DONE);
-                self.handshake_done_sent = true;
+                self.handshake_done.sent(pn);
             }
             self.write_data(body, body_room, pn);
         }
@@ -869,6 +920,8 @@ impl Connection {
         for (_, id) in self.unacked.drain(..) {
             self.ready.push(id);
         }
+        self.control.on_timeout();
+        self.handshake_done.on_timeout();
     }
 
     /// Forget a space: its keys are gone, so nothing in it can be sent or
@@ -888,7 +941,10 @@ impl Connection {
     /// Whether this space is waiting on an acknowledgement for anything
     fn in_flight(&self, space: Space) -> bool {
         !self.spaces[space as usize].crypto_flight.is_empty()
-            || (space == Space::Data && !self.unacked.is_empty())
+            || (space == Space::Data
+                && (!self.unacked.is_empty()
+                    || !self.control.sent_in.is_empty()
+                    || !self.handshake_done.sent_in.is_empty()))
     }
 
     /// An acknowledgement arrived: the timer either has nothing left to wait
@@ -911,6 +967,10 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
+        connection_and_client().0
+    }
+
+    fn connection_and_client() -> (Connection, rustls::quic::ClientConnection) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -921,7 +981,23 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(vec![cert.cert.der().clone()], key)
         .unwrap();
-        Connection::accept(
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let client = rustls::quic::ClientConnection::new(
+            Arc::new(client_config),
+            Version::V1,
+            "localhost".try_into().unwrap(),
+            vec![],
+        )
+        .unwrap();
+        let conn = Connection::accept(
             &Arc::new(config),
             ConnectionId::new(&[1; 8]).unwrap(),
             ConnectionId::new(&[2; 8]).unwrap(),
@@ -930,7 +1006,247 @@ mod tests {
             1 << 30,
             1 << 24,
         )
-        .unwrap()
+        .unwrap();
+        (conn, client)
+    }
+
+    fn data_connection() -> Connection {
+        let (mut conn, finished) = data_connection_before_finished();
+        finish_handshake(&mut conn, &finished);
+        conn
+    }
+
+    fn finish_handshake(conn: &mut Connection, finished: &[u8]) {
+        conn.tls.read_hs(finished).unwrap();
+        conn.pump_tls();
+        conn.discard(Space::Handshake);
+        conn.handshake = None;
+        assert!(!conn.tls.is_handshaking());
+    }
+
+    fn data_connection_before_finished() -> (Connection, Vec<u8>) {
+        let (mut conn, mut client) = connection_and_client();
+        let mut bytes = Vec::new();
+        client.write_hs(&mut bytes);
+        conn.tls.read_hs(&bytes).unwrap();
+        conn.pump_tls();
+        for space in [Space::Initial, Space::Handshake] {
+            client
+                .read_hs(&conn.spaces[space as usize].crypto_out)
+                .unwrap();
+            bytes.clear();
+            client.write_hs(&mut bytes);
+            conn.discard(space);
+        }
+        assert!(conn.tls.is_handshaking());
+        assert!(!bytes.is_empty());
+        assert!(conn.connected);
+        conn.initial = None;
+        (conn, bytes)
+    }
+
+    /// Decrypt the actual 1-RTT output, including standalone padded probes.
+    fn send_data(conn: &mut Connection) -> (u64, Vec<u8>) {
+        let pn = conn.spaces[Space::Data as usize].next_pn;
+        let mut packet = Vec::new();
+        assert!(conn.poll_transmit(&mut packet).unwrap());
+        let keys = conn.local_keys(Space::Data).unwrap();
+        let pn_offset = 1 + conn.peer_cid.as_slice().len();
+        let (_, pn_len) = unprotect_header(keys.header.as_ref(), &mut packet, pn_offset).unwrap();
+        let (header, body) = packet.split_at_mut(pn_offset + pn_len);
+        let plain = keys.packet.decrypt_in_place(pn, header, body).unwrap();
+        (pn, plain.to_vec())
+    }
+
+    fn assert_control(plain: &[u8]) {
+        let frames = frame::Frames::new(plain)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(frames.contains(&frame::Frame::Stream {
+            id: CONTROL_STREAM,
+            offset: 0,
+            data: CONTROL_PRELUDE,
+            fin: false,
+        }));
+        // With no other frames queued, this byte identifies HANDSHAKE_DONE.
+        assert_eq!(plain[0], frame::HANDSHAKE_DONE as u8);
+    }
+
+    #[test]
+    fn control_recovery_pto_repeats_until_acknowledged() {
+        let mut conn = data_connection();
+        let (original, plain) = send_data(&mut conn);
+        assert_control(&plain);
+        for attempt in 1..=3 {
+            conn.on_timeout(conn.timeout().unwrap());
+            assert_eq!(conn.pto_count, attempt);
+            assert!(conn.wants_send(), "lost control must arm a probe");
+            let (_, plain) = send_data(&mut conn);
+            assert_control(&plain);
+        }
+        acknowledge(&mut conn, Space::Data, &[(original, original)]);
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+        assert_eq!(conn.finished, 0);
+    }
+
+    #[test]
+    fn control_recovery_sparse_response_ack_keeps_timer() {
+        let mut conn = data_connection();
+        send_data(&mut conn); // Lose SETTINGS and HANDSHAKE_DONE.
+        conn.on_stream(0, 0, b"request", true);
+        let (response, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(response, response)]);
+        assert_eq!(conn.finished, 1);
+        assert!(conn.timeout().is_some(), "control is still unacknowledged");
+        conn.on_timeout(conn.timeout().unwrap());
+        let (probe, plain) = send_data(&mut conn);
+        assert_control(&plain);
+        acknowledge(&mut conn, Space::Data, &[(probe, probe)]);
+        assert!(conn.timeout().is_none());
+        assert_eq!(conn.finished, 1);
+    }
+
+    #[test]
+    fn control_recovery_late_ack_cancels_queued_probe() {
+        let mut conn = data_connection();
+        let (pn, _) = send_data(&mut conn);
+        conn.on_timeout(conn.timeout().unwrap());
+        assert!(conn.wants_send());
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+        let mut packet = Vec::new();
+        assert!(!conn.poll_transmit(&mut packet).unwrap());
+    }
+
+    #[test]
+    fn control_recovery_packet_threshold_uses_newest_copy() {
+        let mut conn = data_connection();
+        let (original, _) = send_data(&mut conn);
+        for id in [0, 4, 8] {
+            conn.on_stream(id, 0, b"request", true);
+            let (pn, _) = send_data(&mut conn);
+            // Sparse ACKs exclude the missing control packet.
+            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+            assert_eq!(conn.wants_send(), pn == original + 3);
+        }
+        let (retry, plain) = send_data(&mut conn);
+        assert_control(&plain);
+        acknowledge(&mut conn, Space::Data, &[(original + 3, original + 3)]);
+        assert!(!conn.wants_send(), "old ACK must not lose the new probe");
+        acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
+        assert!(conn.timeout().is_none());
+        assert_eq!(conn.finished, 3);
+    }
+
+    #[test]
+    fn control_recovery_duplicate_ack_keeps_backoff_and_deadline() {
+        let mut conn = data_connection();
+        send_data(&mut conn);
+        conn.on_stream(0, 0, b"request", true);
+        let (response, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(response, response)]);
+        conn.on_timeout(conn.timeout().unwrap());
+        send_data(&mut conn);
+        let deadline = conn.timeout();
+        assert_eq!(conn.pto_count, 1);
+        acknowledge(&mut conn, Space::Data, &[(response, response)]);
+        assert_eq!(conn.pto_count, 1);
+        assert_eq!(conn.timeout(), deadline);
+        assert_eq!(conn.finished, 1);
+    }
+
+    #[test]
+    fn control_recovery_ack_is_scoped_to_data_space() {
+        let mut conn = data_connection();
+        let (pn, _) = send_data(&mut conn);
+        let deadline = conn.timeout();
+        for space in [Space::Initial, Space::Handshake] {
+            acknowledge(&mut conn, space, &[(pn, pn)]);
+            assert_eq!(conn.timeout(), deadline);
+        }
+        conn.on_timeout(deadline.unwrap());
+        assert_control(&send_data(&mut conn).1);
+    }
+
+    #[test]
+    fn control_recovery_settings_ack_does_not_ack_handshake_done() {
+        let (mut conn, finished) = data_connection_before_finished();
+        let (settings_pn, plain) = send_data(&mut conn);
+        assert!(matches!(
+            frame::Frames::new(&plain)
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+                .as_slice(),
+            [frame::Frame::Stream {
+                id: CONTROL_STREAM,
+                ..
+            }]
+        )); // No premature HANDSHAKE_DONE before the client's Finished.
+        acknowledge(&mut conn, Space::Data, &[(settings_pn, settings_pn)]);
+        assert!(conn.timeout().is_none());
+        finish_handshake(&mut conn, &finished);
+        let (confirmation_pn, plain) = send_data(&mut conn);
+        assert_eq!(plain, [frame::HANDSHAKE_DONE as u8, 0, 0]);
+        conn.on_timeout(conn.timeout().unwrap());
+        acknowledge(&mut conn, Space::Data, &[(settings_pn, settings_pn)]);
+        assert!(conn.wants_send());
+        let (_, plain) = send_data(&mut conn);
+        assert_eq!(plain, [frame::HANDSHAKE_DONE as u8, 0, 0]);
+        acknowledge(
+            &mut conn,
+            Space::Data,
+            &[(confirmation_pn, confirmation_pn)],
+        );
+        assert!(conn.timeout().is_none());
+        assert!(!conn.wants_send());
+        assert_eq!(conn.finished, 0);
+    }
+
+    #[test]
+    fn control_recovery_confirmation_ack_keeps_missing_settings() {
+        let (mut conn, finished) = data_connection_before_finished();
+        let (settings_pn, _) = send_data(&mut conn);
+        finish_handshake(&mut conn, &finished);
+        let (confirmation_pn, _) = send_data(&mut conn);
+        acknowledge(
+            &mut conn,
+            Space::Data,
+            &[(confirmation_pn, confirmation_pn)],
+        );
+        conn.on_timeout(conn.timeout().unwrap());
+        let (_, plain) = send_data(&mut conn);
+        assert_eq!(
+            frame::Frames::new(&plain)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            [frame::Frame::Stream {
+                id: CONTROL_STREAM,
+                offset: 0,
+                data: CONTROL_PRELUDE,
+                fin: false,
+            }]
+        );
+        acknowledge(&mut conn, Space::Data, &[(settings_pn, settings_pn)]);
+        assert!(conn.timeout().is_none());
+        assert!(!conn.wants_send());
+    }
+
+    #[test]
+    fn control_recovery_waits_for_packet_room() {
+        let mut conn = data_connection();
+        let mut body = Vec::new();
+        let need = frame::stream_overhead(CONTROL_STREAM, 0, CONTROL_PRELUDE.len())
+            + CONTROL_PRELUDE.len();
+        conn.write_data(&mut body, need - 1, 0);
+        assert!(body.is_empty());
+        assert!(conn.control.sent_in.is_empty());
+        assert!(conn.control.pending);
+        conn.write_data(&mut body, need, 1);
+        assert_eq!(body.len(), need);
+        assert_eq!(conn.control.sent_in, [1]);
+        assert!(!conn.control.pending);
     }
 
     #[test]
