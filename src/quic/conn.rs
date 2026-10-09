@@ -10,6 +10,7 @@ use rustls::Side;
 use rustls::quic::{DirectionalKeys, KeyChange, Keys, ServerConnection, Version};
 
 use super::packet::{self, Kind, Space};
+use super::stream_table::StreamTable;
 use super::wire::{
     ConnectionId, Error, Result, decode_packet_number, encode_packet_number, protect_header,
     put_varint, unprotect_header, varint_len,
@@ -47,16 +48,6 @@ struct Request {
     sent: bool,
     /// The peer acknowledged the response or our RESET_STREAM.
     send_done: bool,
-}
-
-/// A higher stream opens the lower slots too, but their request data may still
-/// be in flight. Only a completed slot can be retired or ignore duplicates.
-#[derive(Default)]
-enum StreamSlot {
-    #[default]
-    Unseen,
-    Active(Request),
-    Complete,
 }
 
 /// Room a packet's header and tag need before any payload fits
@@ -305,11 +296,8 @@ pub struct Connection {
     pub closed: bool,
 
     // ---- streams ----
-    /// Client bidirectional streams, which requests are, indexed by number
-    /// from `base_stream`. A stream id says where its stream is, so nothing is
-    /// searched for.
-    streams: Vec<StreamSlot>,
-    base_stream: u64,
+    /// Request state with a dense fast path and bounded sparse fallback.
+    streams: StreamTable<Request>,
     /// Largest received offsets for the fixed allowance of client uni streams.
     /// Retained after FIN too, so late duplicates cannot grant credit again.
     uni_sizes: [u64; transport::MAX_STREAMS_UNI],
@@ -397,8 +385,7 @@ impl Connection {
             handshake_done: ControlFlight::new(),
             path_response: None,
             closed: false,
-            streams: Vec::new(),
-            base_stream: 0,
+            streams: StreamTable::new(max_streams_bidi),
             uni_sizes: [0; transport::MAX_STREAMS_UNI],
             uni_final: 0,
             stream_max_data: initial_max_stream_data,
@@ -422,52 +409,12 @@ impl Connection {
         })
     }
 
-    /// The slot for a client bidirectional stream, made if it is new
-    ///
-    /// Client bidirectional streams are 0, 4, 8 (RFC 9000 Section 2.1), so the
-    /// id says which slot without anything being searched for.
-    fn stream_slot_mut(&mut self, id: u64) -> Option<&mut StreamSlot> {
-        if id & 3 != 0 {
-            return None;
-        }
-        let n = id >> 2;
-        // The limit is an absolute stream count, independent of gaps and the
-        // current table length. Only credit actually sent permits new ids.
-        if n >= self.streams_credit.told {
-            return None;
-        }
-        let i = usize::try_from(n.checked_sub(self.base_stream)?).ok()?;
-        if i >= self.streams.len() {
-            self.streams.resize_with(i + 1, StreamSlot::default);
-        }
-        Some(&mut self.streams[i])
-    }
-
+    /// Only credit actually sent permits new client bidirectional stream ids.
     fn stream_mut(&mut self, id: u64) -> Option<&mut Request> {
-        let slot = self.stream_slot_mut(id)?;
-        if matches!(slot, StreamSlot::Unseen) {
-            *slot = StreamSlot::Active(Request::default());
+        if id & 3 != 0 || id >> 2 >= self.streams_credit.told {
+            return None;
         }
-        match slot {
-            StreamSlot::Active(req) => Some(req),
-            _ => None,
-        }
-    }
-
-    /// Forget the streams at the front that have been answered and
-    /// acknowledged, so the table does not grow for the life of the run
-    fn retire(&mut self) {
-        let n = self
-            .streams
-            .iter()
-            .position(|s| !matches!(s, StreamSlot::Complete))
-            .unwrap_or(self.streams.len());
-        if n > 0 {
-            // Counted first and shifted once: taking them off the front one at
-            // a time would move the rest as many times as there are of them
-            self.streams.drain(..n);
-            self.base_stream += n as u64;
-        }
+        self.streams.get_or_insert(id >> 2)
     }
 
     fn remote_keys(&self, space: Space) -> Option<&DirectionalKeys> {
@@ -786,12 +733,14 @@ impl Connection {
     }
 
     fn complete_stream(&mut self, id: u64) {
-        if let Some(slot) = self.stream_slot_mut(id)
-            && matches!(slot, StreamSlot::Active(req) if req.fin && req.send_done)
+        if self
+            .streams
+            .get_mut(id >> 2)
+            .is_some_and(|req| req.fin && req.send_done)
+            && self.streams.complete(id >> 2)
         {
-            *slot = StreamSlot::Complete;
             self.finished += 1;
-            self.retire();
+            self.streams.retire();
         }
     }
 
@@ -813,17 +762,11 @@ impl Connection {
         let lost_before = largest.saturating_sub(Self::LOSS_THRESHOLD);
         let ready = &mut self.ready;
         let streams = &mut self.streams;
-        let base = self.base_stream;
         let mut finished = self.finished;
         let mut finish_send = |id: u64| {
-            if let Some(i) = (id >> 2)
-                .checked_sub(base)
-                .and_then(|n| usize::try_from(n).ok())
-                && let Some(StreamSlot::Active(req)) = streams.get_mut(i)
-            {
+            if let Some(req) = streams.get_mut(id >> 2) {
                 req.send_done = true;
-                if req.fin {
-                    streams[i] = StreamSlot::Complete;
+                if req.fin && streams.complete(id >> 2) {
                     finished += 1;
                     retired = true;
                 }
@@ -851,7 +794,7 @@ impl Connection {
         });
         self.finished = finished;
         if retired {
-            self.retire();
+            self.streams.retire();
         }
         acknowledged
     }
@@ -1470,7 +1413,7 @@ mod tests {
         assert!(frame::Frames::new(&plain).any(|f| f.unwrap() == frame::Frame::MaxData(192)));
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 1);
-        assert_eq!(conn.base_stream, 1);
+        assert_eq!(conn.streams.base(), 1);
         assert!(conn.streams.is_empty());
         for id in [0, 2] {
             conn.on_stream(id, 0, &[0; 32], true).unwrap();
@@ -1724,7 +1667,7 @@ mod tests {
             assert!(!conn.wants_send());
             assert!(conn.timeout().is_none());
         }
-        assert_eq!(conn.base_stream, 12);
+        assert_eq!(conn.streams.base(), 12);
         assert_eq!(conn.data_seen, 768);
     }
 
@@ -1965,6 +1908,128 @@ mod tests {
     }
 
     #[test]
+    fn sparse_table_preserves_cancellation_loss_recovery_and_exact_credit() {
+        let mut conn = data_connection();
+        conn.on_stream(0, 0, b"held", false).unwrap();
+        for n in 1..=128 {
+            conn.on_stream(n * 4, 0, b"x", true).unwrap();
+            let (pn, _) = send_data(&mut conn);
+            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        }
+        assert_eq!(conn.finished, 128);
+        assert!(conn.streams.retained_capacity() < 128, "migration happened");
+        let seen = conn.data_seen;
+        conn.on_stream(64 * 4, 0, b"x", true).unwrap();
+        receive_reset(&mut conn, 64 * 4, 1).unwrap();
+        receive_stop(&mut conn, 64 * 4).unwrap();
+        assert_eq!(conn.data_seen, seen);
+        assert!(conn.ready.is_empty());
+        assert!(conn.resets.is_empty());
+
+        // ACK of our reset must keep the receive side until its own FIN.
+        let stopped = 129 * 4;
+        conn.on_stream(stopped, 0, b"begin", false).unwrap();
+        receive_stop(&mut conn, stopped).unwrap();
+        let (pn, plain) = send_data(&mut conn);
+        assert_reset(&plain, stopped, 0);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 128);
+        conn.on_stream(stopped, 5, b"end", true).unwrap();
+        assert_eq!(conn.finished, 129);
+        assert!(conn.ready.is_empty());
+        receive_reset(&mut conn, stopped, 8).unwrap();
+
+        // A late original ACK cancels a retransmitted reset exactly once.
+        let reset = 130 * 4;
+        receive_reset(&mut conn, reset, 17).unwrap();
+        let (original, plain) = send_data(&mut conn);
+        assert_reset(&plain, reset, 0);
+        conn.on_timeout(conn.timeout().unwrap());
+        let (retry, plain) = send_data(&mut conn);
+        assert_reset(&plain, reset, 0);
+        acknowledge(&mut conn, Space::Data, &[(original, original)]);
+        acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
+        assert_eq!(conn.finished, 130);
+        assert!(conn.resets.is_empty());
+
+        // A sparse ACK must leave the missing response recoverable.
+        conn.on_stream(131 * 4, 0, b"normal", true).unwrap();
+        let (lower, _) = send_data(&mut conn);
+        conn.on_stream(132 * 4, 0, b"normal", true).unwrap();
+        let (higher, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(higher, higher)]);
+        assert_eq!(conn.finished, 131);
+        conn.on_timeout(conn.timeout().unwrap());
+        assert_eq!(conn.ready, [131 * 4]);
+        let (retry, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(retry, retry), (lower, lower)]);
+        acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
+        assert_eq!(conn.finished, 132);
+        assert_eq!(conn.data_seen, 169);
+        assert_eq!(conn.streams.base(), 0);
+        let limit = conn.streams_credit.told;
+        conn.on_stream(limit * 4, 0, b"ungranted", true).unwrap();
+        assert_eq!(conn.data_seen, 169);
+        assert!(conn.ready.is_empty());
+
+        conn.on_stream(0, 4, b"tail", true).unwrap();
+        let (pn, plain) = send_data(&mut conn);
+        assert!(frame::Frames::new(&plain).any(|f| matches!(
+            f.unwrap(),
+            frame::Frame::Stream {
+                id: 0,
+                fin: true,
+                data: RESPONSE,
+                ..
+            }
+        )));
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 133);
+        assert_eq!(conn.streams.base(), 133);
+        assert_eq!(conn.data_seen, 173);
+        assert_eq!(conn.streams_limit(), 197);
+        assert!(conn.streams.is_empty());
+        assert!(conn.timeout().is_none());
+    }
+
+    #[test]
+    fn stream_table_storage_is_bounded_behind_unfinished_request() {
+        let mut conn = connection();
+        conn.on_stream(0, 0, b"held", false).unwrap();
+        let mut body = Vec::new();
+        for n in 1..=100_000 {
+            assert!(n < conn.streams_credit.told);
+            conn.on_stream(n * 4, 0, b"x", true).unwrap();
+            body.clear();
+            conn.write_data(&mut body, MAX_DATAGRAM, n);
+            assert_eq!(conn.unacked, [(n, n * 4)]);
+            assert!(conn.on_ack(n, 0, &[]));
+            if n == 10_000 || n == 100_000 {
+                eprintln!(
+                    "completed={n} retained_entry_capacity={}",
+                    conn.streams.retained_capacity()
+                );
+            }
+        }
+        assert_eq!(conn.finished, 100_000);
+        assert_eq!(conn.streams.base(), 0);
+        assert_eq!(conn.data_seen, 100_004);
+        let retained = conn.streams.retained_capacity();
+        conn.on_stream(0, 4, b"", true).unwrap();
+        body.clear();
+        conn.write_data(&mut body, MAX_DATAGRAM, 100_001);
+        assert!(conn.on_ack(100_001, 0, &[]));
+        assert_eq!(conn.finished, 100_001);
+        assert_eq!(conn.streams.base(), 100_001);
+        assert!(conn.streams.is_empty());
+        assert!(
+            retained <= 128,
+            "64-stream window retained {retained} entries"
+        );
+    }
+
+    #[test]
     fn successive_acks_only_retire_their_own_ranges() {
         let mut conn = connection();
         for id in [0, 4, 8] {
@@ -1991,7 +2056,11 @@ mod tests {
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 1);
-        assert_eq!(conn.base_stream, 0, "unseen lower streams are still open");
+        assert_eq!(
+            conn.streams.base(),
+            0,
+            "unseen lower streams are still open"
+        );
         for id in [4, 0] {
             conn.on_stream(id, 0, b"delayed", true).unwrap();
             let (pn, plain) = send_data(&mut conn);
@@ -2001,7 +2070,7 @@ mod tests {
             acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         }
         assert_eq!(conn.finished, 3);
-        assert_eq!(conn.base_stream, 3);
+        assert_eq!(conn.streams.base(), 3);
         assert!(conn.streams.is_empty());
     }
 
@@ -2095,7 +2164,8 @@ mod tests {
         conn.on_stream(256, 0, b"over limit", true).unwrap();
         assert_eq!(conn.ready, [252]);
         assert_eq!(conn.data_seen, 7);
-        assert_eq!(conn.streams.len(), 64);
+        assert!(conn.stream_mut(252).is_some());
+        assert!(conn.stream_mut(256).is_none());
     }
 
     #[test]
@@ -2108,7 +2178,7 @@ mod tests {
         assert_reset(&plain, 8, 0);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 1);
-        assert_eq!(conn.base_stream, 0);
+        assert_eq!(conn.streams.base(), 0);
         conn.on_stream(8, 0, b"cancelled", true).unwrap();
         assert!(conn.ready.is_empty());
         assert_eq!(conn.data_seen, 9);
@@ -2119,7 +2189,7 @@ mod tests {
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 3);
-        assert_eq!(conn.base_stream, 3);
+        assert_eq!(conn.streams.base(), 3);
         assert!(conn.streams.is_empty());
         receive_reset(&mut conn, 8, 9).unwrap();
         assert_eq!(conn.finished, 3);
@@ -2161,7 +2231,7 @@ mod tests {
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 3);
-        assert_eq!(conn.base_stream, 3);
+        assert_eq!(conn.streams.base(), 3);
     }
 
     #[test]
@@ -2178,7 +2248,7 @@ mod tests {
         let (retry, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
         assert_eq!(conn.finished, 2);
-        assert_eq!(conn.base_stream, 2);
+        assert_eq!(conn.streams.base(), 2);
         assert!(conn.timeout().is_none());
     }
 
@@ -2191,7 +2261,7 @@ mod tests {
         }
         acknowledge(&mut conn, Space::Data, &[(1, 1)]);
         assert_eq!(conn.finished, 1);
-        assert_eq!(conn.base_stream, 0);
+        assert_eq!(conn.streams.base(), 0);
         conn.on_timeout(conn.timeout().unwrap());
         assert_eq!(conn.ready, [8]);
         let (retry, _) = send_data(&mut conn);
@@ -2204,7 +2274,7 @@ mod tests {
             acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         }
         assert_eq!(conn.finished, 5);
-        assert_eq!(conn.base_stream, 5);
+        assert_eq!(conn.streams.base(), 5);
         assert_eq!(conn.data_seen, 35);
         assert!(conn.streams.is_empty());
     }
@@ -2280,7 +2350,7 @@ mod tests {
             }
             assert_eq!(conn.data_seen, 64);
             assert_eq!(conn.finished, 1);
-            assert_eq!(conn.base_stream, 0);
+            assert_eq!(conn.streams.base(), 0);
             assert!(conn.ready.is_empty());
             assert!(conn.resets.is_empty());
         }
@@ -2311,7 +2381,7 @@ mod tests {
         // A delayed ACK for the first copy also cancels the queued probe.
         acknowledge(&mut conn, Space::Data, &[(first, first)]);
         assert_eq!(conn.finished, 2);
-        assert_eq!(conn.base_stream, 0);
+        assert_eq!(conn.streams.base(), 0);
         assert!(conn.resets.is_empty());
         assert!(conn.timeout().is_none());
         assert!(!conn.wants_send());
@@ -2393,7 +2463,7 @@ mod tests {
             receive_reset(&mut conn, 8, 128).unwrap();
             assert_eq!(conn.data_seen, 128);
             assert!(conn.ready.is_empty());
-            assert_eq!(conn.base_stream, 0, "lower unseen streams stay open");
+            assert_eq!(conn.streams.base(), 0, "lower unseen streams stay open");
         }
     }
 
@@ -2404,7 +2474,7 @@ mod tests {
         conn.on_stream(8, 0, b"late", false).unwrap();
         assert_eq!(conn.data_seen, 128);
         assert!(conn.ready.is_empty());
-        assert_eq!(conn.base_stream, 0);
+        assert_eq!(conn.streams.base(), 0);
     }
 
     #[test]

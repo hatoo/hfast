@@ -13,6 +13,7 @@ pub mod conn;
 pub mod endpoint;
 pub mod frame;
 pub mod packet;
+mod stream_table;
 pub mod transport;
 mod udp;
 pub mod wire;

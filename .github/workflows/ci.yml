@@ -42,6 +42,10 @@ jobs:
         run: python benchmarks/stream-recovery-check.py target/release/hfast
       - name: QUIC request recovery with epoll
         run: python benchmarks/stream-recovery-check.py target/release/hfast --epoll
+      - name: QUIC delayed request across many stream windows
+        run: python benchmarks/stream-retention-check.py target/release/hfast --requests 4096
+      - name: QUIC delayed request across many stream windows with epoll
+        run: python benchmarks/stream-retention-check.py target/release/hfast --requests 4096 --epoll
       - name: QUIC credit recovery with repeated packet loss
         run: python benchmarks/credit-recovery-check.py target/release/hfast
       - name: QUIC credit recovery with epoll
