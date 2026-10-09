@@ -46,3 +46,7 @@ jobs:
         run: python benchmarks/credit-recovery-check.py target/release/hfast
       - name: QUIC credit recovery with epoll
         run: python benchmarks/credit-recovery-check.py target/release/hfast --epoll
+      - name: QUIC uni credit with gaps and retransmission
+        run: python benchmarks/uni-accounting-check.py target/release/hfast
+      - name: QUIC uni credit with epoll
+        run: python benchmarks/uni-accounting-check.py target/release/hfast --epoll

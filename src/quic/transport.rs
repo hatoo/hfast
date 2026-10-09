@@ -19,6 +19,10 @@ const MAX_ACK_DELAY: u64 = 0x0b;
 const DISABLE_ACTIVE_MIGRATION: u64 = 0x0c;
 const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
 
+/// Client uni streams: control, two QPACK streams, and room for extensions.
+/// No MAX_STREAMS_UNI updates are sent, so this also bounds receive state.
+pub const MAX_STREAMS_UNI: usize = 8;
+
 /// What the peer told us it will accept
 #[derive(Debug, Clone, Copy)]
 pub struct Peer {
@@ -117,7 +121,7 @@ pub fn encode(l: &Local) -> Vec<u8> {
         (INITIAL_MAX_STREAM_DATA_UNI, l.initial_max_stream_data),
         (INITIAL_MAX_STREAMS_BIDI, l.max_streams_bidi),
         // The client's control stream and its two QPACK streams
-        (INITIAL_MAX_STREAMS_UNI, 8),
+        (INITIAL_MAX_STREAMS_UNI, MAX_STREAMS_UNI as u64),
         (ACK_DELAY_EXPONENT, 3),
         (MAX_ACK_DELAY, 1),
     ] {
@@ -152,6 +156,7 @@ mod tests {
         };
         let p = decode(&encode(&local)).unwrap();
         assert_eq!(p.initial_max_streams_bidi, 1024);
+        assert_eq!(p.initial_max_streams_uni, MAX_STREAMS_UNI as u64);
         assert_eq!(p.initial_max_data, 1 << 30);
         assert_eq!(p.initial_max_stream_data_bidi_remote, 1 << 20);
         assert_eq!(p.max_udp_payload_size, super::super::MAX_DATAGRAM as u64);

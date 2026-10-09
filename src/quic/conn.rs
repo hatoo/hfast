@@ -295,6 +295,11 @@ pub struct Connection {
     /// searched for.
     streams: Vec<StreamSlot>,
     base_stream: u64,
+    /// Largest received offsets for the fixed allowance of client uni streams.
+    /// Retained after FIN too, so late duplicates cannot grant credit again.
+    uni_sizes: [u64; transport::MAX_STREAMS_UNI],
+    /// The advertised uni byte limit; no MAX_STREAM_DATA updates are sent.
+    uni_max_data: u64,
     /// Streams whose answer is written but not yet in a packet
     ready: Vec<u64>,
     /// `(packet number, stream)` for every answer sent and not yet
@@ -311,7 +316,7 @@ pub struct Connection {
     /// The latest stream/data credit and its delivery state
     streams_credit: Credit,
     data_credit: Credit,
-    /// Bytes the client has sent us across all streams
+    /// Sum of the largest received offsets across all streams
     data_seen: u64,
     max_streams_bidi: u64,
     initial_max_data: u64,
@@ -376,6 +381,8 @@ impl Connection {
             closed: false,
             streams: Vec::new(),
             base_stream: 0,
+            uni_sizes: [0; transport::MAX_STREAMS_UNI],
+            uni_max_data: initial_max_stream_data,
             ready: Vec::new(),
             unacked: Vec::new(),
             ack_ranges: Vec::new(),
@@ -620,7 +627,18 @@ impl Connection {
                 offset,
                 data,
                 fin,
-            } => self.on_stream(id, offset, data, fin),
+            } => {
+                // Check before offset-based accounting: an invalid sparse
+                // uni frame must not inflate credit or overflow the sum.
+                if id & 3 == 2
+                    && offset
+                        .checked_add(data.len() as u64)
+                        .is_none_or(|end| end > self.uni_max_data)
+                {
+                    return Err(Error);
+                }
+                self.on_stream(id, offset, data, fin);
+            }
             // A client that gives up on a stream is answered by forgetting it
             frame::Frame::StopSending { id } | frame::Frame::ResetStream { id } => {
                 if let Some(slot) = self.stream_slot_mut(id)
@@ -648,9 +666,15 @@ impl Connection {
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) {
         if id & 3 == 2 {
             // The client's control and QPACK streams. They have to be counted
-            // against the connection's flow control and read no further:
-            // neither side may insert into a table both said has no room.
-            self.data_seen += data.len() as u64;
+            // against flow control by highest offset, including gaps (RFC 9000
+            // Section 4.1). Replays, overlaps and retransmissions add no credit.
+            let n = id >> 2;
+            if n < self.uni_sizes.len() as u64 {
+                let size = &mut self.uni_sizes[n as usize];
+                let end = offset + data.len() as u64;
+                self.data_seen += end.saturating_sub(*size);
+                *size = (*size).max(end);
+            }
             return;
         }
         let end = offset + data.len() as u64;
@@ -1176,6 +1200,186 @@ mod tests {
             expected.push(frame::Frame::MaxData(limit));
         }
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn uni_accounting_duplicates_and_overlaps_grant_credit_once() {
+        let mut conn = credit_connection();
+        conn.on_stream(2, 0, &[0; 32], false);
+        conn.on_stream(2, 0, &[0; 32], false);
+        assert_eq!(conn.data_seen, 32);
+        assert!(!conn.wants_send());
+        conn.on_stream(2, 16, &[0; 32], false);
+        conn.on_stream(2, 0, &[0; 16], false);
+        assert_eq!(conn.data_seen, 48);
+        conn.on_stream(2, 63, &[0], false);
+        let (pn, plain) = send_data(&mut conn);
+        assert_credit(&plain, None, Some(192));
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        for _ in 0..4 {
+            conn.on_stream(2, 0, &[0; 64], true);
+        }
+        assert_eq!(conn.data_seen, 64);
+        assert!(!conn.wants_send());
+        assert_eq!(conn.finished, 0);
+        assert!(conn.ready.is_empty());
+        assert!(conn.streams.is_empty());
+    }
+
+    #[test]
+    fn uni_accounting_gaps_and_empty_fin_use_the_highest_offset() {
+        let mut conn = connection();
+        conn.on_stream(2, 128, &[], true);
+        assert_eq!(conn.data_seen, 128);
+        conn.on_stream(2, 64, &[0; 64], true);
+        conn.on_stream(2, 0, &[0; 64], false);
+        conn.on_stream(2, 128, &[], true);
+        assert_eq!(conn.data_seen, 128);
+        assert_eq!(conn.finished, 0);
+        assert!(conn.ready.is_empty());
+    }
+
+    #[test]
+    fn uni_accounting_each_advertised_stream_has_independent_credit() {
+        let mut conn = credit_connection();
+        // A higher uni id does not account for unseen lower streams.
+        for id in [30, 10, 6, 2] {
+            conn.on_stream(id, 8, &[0; 8], false);
+        }
+        assert_eq!(conn.data_seen, 64);
+        let (pn, plain) = send_data(&mut conn);
+        assert_credit(&plain, None, Some(192));
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        for id in [2, 6, 10, 30] {
+            conn.on_stream(id, 0, &[0; 16], true);
+        }
+        assert_eq!(conn.data_seen, 64);
+        assert!(!conn.wants_send());
+        assert_eq!(conn.finished, 0);
+    }
+
+    #[test]
+    fn uni_accounting_ungranted_ids_cannot_replenish_credit() {
+        let mut conn = connection();
+        // The server advertises eight client uni streams: ids 2 through 30.
+        for id in [34, 38, (1 << 62) - 2, 1, 3] {
+            conn.on_stream(id, 64, b"invalid", true);
+        }
+        assert_eq!(conn.data_seen, 0);
+        assert_eq!(conn.finished, 0);
+        assert!(conn.ready.is_empty());
+        assert!(conn.streams.is_empty());
+        conn.on_stream(30, 0, b"valid", false);
+        assert_eq!(conn.data_seen, 5);
+    }
+
+    #[test]
+    fn uni_accounting_rejects_offsets_beyond_advertised_byte_limit() {
+        let mut conn = connection();
+        let limit = conn.uni_max_data;
+        assert_eq!(limit, 1 << 24);
+        for (offset, data) in [
+            (limit, &b"x"[..]),
+            (limit + 1, &b""[..]),
+            ((1 << 62) - 1, &b"x"[..]),
+            (u64::MAX, &b"x"[..]),
+        ] {
+            let f = frame::Frame::Stream {
+                id: 2,
+                offset,
+                data,
+                fin: true,
+            };
+            assert_eq!(conn.on_frame(&f, Space::Data), Err(Error));
+            assert_eq!(conn.data_seen, 0);
+            assert_eq!(conn.uni_sizes, [0; transport::MAX_STREAMS_UNI]);
+        }
+        let f = frame::Frame::Stream {
+            id: 2,
+            offset: limit - 1,
+            data: b"x",
+            fin: true,
+        };
+        for _ in 0..2 {
+            conn.on_frame(&f, Space::Data).unwrap();
+            assert_eq!(conn.data_seen, limit);
+        }
+    }
+
+    #[test]
+    fn uni_accounting_encrypted_offset_violation_keeps_credit_unchanged() {
+        let mut conn = credit_connection();
+        let mut body = Vec::new();
+        frame::put_stream(&mut body, 2, conn.uni_max_data, false, b"x");
+        let mut packet = peer_data_packet(&conn, 10, &body);
+        assert_eq!(conn.recv(&mut packet), Err(Error));
+        assert_eq!(conn.data_seen, 0);
+        assert_eq!(conn.data_credit.told, 128);
+        assert!(!conn.wants_send());
+    }
+
+    #[test]
+    fn uni_accounting_survives_request_retirement() {
+        let mut conn = credit_connection();
+        conn.on_stream(2, 0, &[0; 32], true);
+        conn.on_stream(0, 0, &[0; 32], true);
+        let (pn, plain) = send_data(&mut conn);
+        assert!(frame::Frames::new(&plain).any(|f| f.unwrap() == frame::Frame::MaxData(192)));
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 1);
+        assert_eq!(conn.base_stream, 1);
+        assert!(conn.streams.is_empty());
+        for id in [0, 2] {
+            conn.on_stream(id, 0, &[0; 32], true);
+        }
+        assert_eq!(conn.data_seen, 64);
+        assert_eq!(conn.finished, 1);
+        assert!(!conn.wants_send());
+    }
+
+    /// Construct real peer ciphertext so replay and retransmission take the
+    /// full header-protection, decryption and frame-parsing path.
+    fn peer_data_packet(conn: &Connection, pn: u32, body: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x43]; // short header with a four-byte PN
+        packet.extend_from_slice(conn.local_cid.as_slice());
+        let pn_offset = packet.len();
+        packet.extend_from_slice(&pn.to_be_bytes());
+        let header_end = packet.len();
+        packet.extend_from_slice(body);
+        let keys = conn.remote_keys(Space::Data).unwrap();
+        let (header, payload) = packet.split_at_mut(header_end);
+        let tag = keys
+            .packet
+            .encrypt_in_place(pn as u64, header, payload)
+            .unwrap();
+        packet.extend_from_slice(tag.as_ref());
+        protect_header(keys.header.as_ref(), &mut packet, pn_offset, 4).unwrap();
+        packet
+    }
+
+    #[test]
+    fn uni_accounting_packet_replay_and_new_packet_retransmission() {
+        let mut conn = credit_connection();
+        let mut body = Vec::new();
+        frame::put_stream(&mut body, 2, 0, false, &[0; 64]);
+        let original = peer_data_packet(&conn, 10, &body);
+        conn.recv(&mut original.clone()).unwrap();
+        let (pn, plain) = send_data(&mut conn);
+        assert!(frame::Frames::new(&plain).any(|f| f.unwrap() == frame::Frame::MaxData(192)));
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        conn.recv(&mut original.clone()).unwrap();
+        let mut retransmit = peer_data_packet(&conn, 11, &body);
+        conn.recv(&mut retransmit).unwrap();
+        assert_eq!(conn.data_seen, 64);
+        assert_eq!(conn.data_credit.told, 192);
+        let (_, plain) = send_data(&mut conn);
+        assert!(
+            frame::Frames::new(&plain)
+                .all(|f| matches!(f.unwrap(), frame::Frame::Ack { .. } | frame::Frame::Padding))
+        );
+        assert_eq!(conn.spaces[Space::Data as usize].ack.ranges, [(10, 11)]);
+        assert_eq!(conn.finished, 0);
+        assert!(conn.ready.is_empty());
     }
 
     #[test]
