@@ -1,6 +1,7 @@
 //! Reusable datagram batches for the endpoint's IPv4 socket.
 
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
@@ -205,16 +206,19 @@ impl SendBatch {
         if count == 0 {
             return Ok(());
         }
-        let mut iovecs: [libc::iovec; SEND_BATCH] = unsafe { std::mem::zeroed() };
-        let mut messages: [libc::mmsghdr; SEND_BATCH] = unsafe { std::mem::zeroed() };
-        let mut controls: [SegmentControl; SEND_BATCH] = std::array::from_fn(|_| SegmentControl {
-            bytes: [0; SEGMENT_CONTROL_SIZE],
-        });
+        // Only the active datagrams and their GSO groups need descriptors. Keep
+        // this storage local: payload Vecs may reallocate and SendBatch may move
+        // between flushes, so none of these pointers can outlive this call.
+        let mut iovecs = [MaybeUninit::<libc::iovec>::uninit(); SEND_BATCH];
+        let mut messages = [MaybeUninit::<libc::mmsghdr>::uninit(); SEND_BATCH];
+        let mut controls = [const { MaybeUninit::<SegmentControl>::uninit() }; SEND_BATCH];
         for (iov, buf) in iovecs.iter_mut().zip(&mut self.buffers).take(count) {
-            iov.iov_base = buf.as_mut_ptr().cast();
-            iov.iov_len = buf.len();
+            iov.write(libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            });
         }
-        let iovec_ptr = iovecs.as_mut_ptr();
+        let iovec_ptr = iovecs.as_mut_ptr().cast::<libc::iovec>();
 
         let mut first = 0;
         while first < count {
@@ -225,16 +229,27 @@ impl SendBatch {
             while start < count {
                 let end = self.group_end(start, count);
                 starts[groups] = start;
-                let msg = &mut messages[groups].msg_hdr;
-                msg.msg_name = (&mut self.addresses[start] as *mut libc::sockaddr_in).cast();
-                msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
-                // Derive from the whole array: a group references end-start iovecs.
-                msg.msg_iov = unsafe { iovec_ptr.add(start) };
-                msg.msg_iovlen = end - start;
-                msg.msg_control = std::ptr::null_mut();
-                msg.msg_controllen = 0;
+                let msg = &mut messages[groups]
+                    .write(libc::mmsghdr {
+                        msg_hdr: libc::msghdr {
+                            msg_name: (&mut self.addresses[start] as *mut libc::sockaddr_in).cast(),
+                            msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as _,
+                            // Derive from the whole initialized iovec prefix:
+                            // this group references start..end, within count.
+                            msg_iov: unsafe { iovec_ptr.add(start) },
+                            msg_iovlen: end - start,
+                            msg_control: std::ptr::null_mut(),
+                            msg_controllen: 0,
+                            msg_flags: 0,
+                        },
+                        msg_len: 0,
+                    })
+                    .msg_hdr;
                 if end - start > 1 {
-                    msg.msg_control = (&mut controls[groups] as *mut SegmentControl).cast();
+                    let control = controls[groups].write(SegmentControl {
+                        bytes: [0; SEGMENT_CONTROL_SIZE],
+                    });
+                    msg.msg_control = (control as *mut SegmentControl).cast();
                     msg.msg_controllen = SEGMENT_CONTROL_SIZE;
                     // Storage has cmsghdr alignment and CMSG_SPACE(u16) bytes.
                     // Both the header and native-endian payload live through send.
@@ -252,6 +267,17 @@ impl SendBatch {
                 start = end;
             }
             starts[groups] = count;
+
+            // Each message in this prefix was fully initialized above. Its
+            // address, iovec range, optional padded control and payload buffers
+            // remain live until all synchronous sends finish. The unused suffix
+            // is never exposed, including when fallback rebuilds fewer groups.
+            let messages = unsafe {
+                std::slice::from_raw_parts_mut(
+                    messages.as_mut_ptr().cast::<libc::mmsghdr>(),
+                    groups,
+                )
+            };
 
             let mut sent = 0;
             while sent < groups {
@@ -285,6 +311,9 @@ impl SendBatch {
 }
 
 #[cfg(test)]
+mod send_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
@@ -297,7 +326,7 @@ mod tests {
         socket
     }
 
-    fn batch(spec: &[(usize, u16)]) -> SendBatch {
+    pub(super) fn batch(spec: &[(usize, u16)]) -> SendBatch {
         assert!(spec.len() <= SEND_BATCH);
         let mut tx = SendBatch::new();
         for (i, &(len, port)) in spec.iter().enumerate() {
@@ -317,7 +346,7 @@ mod tests {
 
     // Decode the actual scatter/gather descriptors like a UDP receiver would.
     // This checks control layout, datagram boundaries and every payload byte.
-    fn decode(messages: &[libc::mmsghdr]) -> Vec<(u16, Vec<u8>)> {
+    pub(super) fn decode(messages: &[libc::mmsghdr]) -> Vec<(u16, Vec<u8>)> {
         let mut out = Vec::new();
         for message in messages {
             let msg = &message.msg_hdr;
@@ -357,7 +386,8 @@ mod tests {
 
     #[test]
     fn segmentation_respects_lengths_peers_and_udp_limit() {
-        let cases: &[(&[(usize, u16)], &[usize])] = &[
+        type GroupCase<'a> = (&'a [(usize, u16)], &'a [usize]);
+        let cases: &[GroupCase<'_>] = &[
             (&[(3, 1), (3, 1), (2, 1), (1, 1)], &[3, 1]),
             (&[(2, 1), (3, 1), (3, 1), (1, 1)], &[1, 3]),
             (&[(3, 1), (0, 1), (3, 1), (2, 1)], &[1, 1, 2]),
