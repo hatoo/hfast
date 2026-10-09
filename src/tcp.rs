@@ -45,6 +45,30 @@ impl Conn {
         }
     }
 
+    /// Retire a send only after the batch's kernel buffer borrows have ended.
+    /// False closes the connection, just as a zero or fatal send result does.
+    fn complete_send(&mut self, result: i32) -> bool {
+        if result > 0 {
+            self.out_off += result as usize;
+        } else if result != -libc::EAGAIN && result != -libc::EINTR {
+            return false;
+        }
+        let pending = self.outbuf.len() - self.out_off;
+        if pending == 0 {
+            self.outbuf.clear();
+            self.out_off = 0;
+        } else if self.out_off >= 16 * 1024 && self.out_off >= pending {
+            // A busy connection may never fully drain. Keep its allocation
+            // tied to outstanding output instead of all historical responses.
+            // Copy no more bytes than were sent since the previous compaction,
+            // and leave small prefixes alone to avoid frequent tiny copies.
+            self.outbuf.copy_within(self.out_off.., 0);
+            self.outbuf.truncate(pending);
+            self.out_off = 0;
+        }
+        true
+    }
+
     /// Answer everything complete in `buf`, returning how much of it was used,
     /// or `None` if the connection is over.
     fn drive(&mut self, buf: &[u8]) -> Option<usize> {
@@ -242,19 +266,11 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
             wait_batch(&mut ring, writes, &mut ready, &mut completions);
             for &(fd, result) in &completions {
                 let conn = conns[fd].as_mut().unwrap();
-                if result > 0 {
-                    conn.out_off += result as usize;
-                } else if result != -libc::EAGAIN && result != -libc::EINTR {
+                if !conn.complete_send(result) {
                     unsafe {
                         libc::close(fd as _);
                     }
                     conns[fd] = None;
-                    continue;
-                }
-                let pending = conn.out_off < conn.outbuf.len();
-                if !pending {
-                    conn.outbuf.clear();
-                    conn.out_off = 0;
                 }
             }
         }
@@ -335,6 +351,9 @@ fn wait_batch(
         drain_completions(ring, ready, completions);
     }
 }
+
+#[cfg(test)]
+mod output_tests;
 
 #[cfg(test)]
 mod tests {
