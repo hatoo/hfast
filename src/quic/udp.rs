@@ -18,79 +18,140 @@ union SegmentControl {
 }
 
 pub(super) struct ReceiveBatch {
-    buffers: [Box<[u8]>; BATCH],
-    addresses: [libc::sockaddr_in; BATCH],
+    // Owns the allocation backing every pointer in `messages`. Access it only
+    // through those pointers until Drop; moving this owner cannot move storage.
+    storage: std::ptr::NonNull<ReceiveStorage>,
+    // Keep payload access direct, including the endpoint's single-receive path.
+    payloads: [*mut u8; BATCH],
+    messages: [libc::mmsghdr; BATCH],
     lengths: [usize; BATCH],
     limit: usize,
 }
 
+struct ReceiveStorage {
+    buffers: [Box<[u8]>; BATCH],
+    addresses: [libc::sockaddr_in; BATCH],
+    iovecs: [libc::iovec; BATCH],
+}
+
+impl Drop for ReceiveBatch {
+    fn drop(&mut self) {
+        // This is the unique owner of the allocation created by Box::into_raw.
+        // All synchronous receives and payload borrows have ended before Drop.
+        unsafe { drop(Box::from_raw(self.storage.as_ptr())) };
+    }
+}
+
 impl ReceiveBatch {
     pub fn new() -> Self {
-        Self {
+        let storage = Box::into_raw(Box::new(ReceiveStorage {
             buffers: std::array::from_fn(|_| vec![0; RECEIVE_SIZE].into_boxed_slice()),
-            // All-zero sockaddr_in is valid storage for an output address.
+            // Zeroed addresses and iovecs are valid before wiring the pointers.
             addresses: unsafe { std::mem::zeroed() },
+            iovecs: unsafe { std::mem::zeroed() },
+        }));
+        let mut payloads = [std::ptr::null_mut(); BATCH];
+        let mut messages: [libc::mmsghdr; BATCH] = unsafe { std::mem::zeroed() };
+        // Establish pointers only after the allocation reaches its final address.
+        // Never borrow the entire storage again while these pointers are in use.
+        // The payload boxes are neither moved nor resized before Drop.
+        unsafe {
+            let addresses = (&raw mut (*storage).addresses).cast::<libc::sockaddr_in>();
+            let iovecs = (&raw mut (*storage).iovecs).cast::<libc::iovec>();
+            for (i, message) in messages.iter_mut().enumerate() {
+                payloads[i] = (*storage).buffers[i].as_mut_ptr();
+                iovecs.add(i).write(libc::iovec {
+                    iov_base: payloads[i].cast(),
+                    iov_len: RECEIVE_SIZE,
+                });
+                message.msg_hdr.msg_name = addresses.add(i).cast();
+                message.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
+                message.msg_hdr.msg_iov = iovecs.add(i);
+                message.msg_hdr.msg_iovlen = 1;
+            }
+        }
+        Self {
+            storage: std::ptr::NonNull::new(storage).unwrap(),
+            payloads,
+            messages,
             lengths: [0; BATCH],
             limit: BATCH,
         }
     }
 
     pub fn single_buffer(&mut self) -> &mut [u8] {
-        &mut self.buffers[0]
+        // The descriptor points at a live RECEIVE_SIZE-byte allocation. A
+        // mutable borrow of self excludes receive/datagram access until it ends.
+        unsafe { std::slice::from_raw_parts_mut(self.payloads[0], RECEIVE_SIZE) }
     }
 
     pub fn receive(&mut self, socket: &UdpSocket) -> io::Result<usize> {
-        let mut iovecs: [libc::iovec; BATCH] = unsafe { std::mem::zeroed() };
-        let mut messages: [libc::mmsghdr; BATCH] = unsafe { std::mem::zeroed() };
-        for i in 0..self.limit {
-            iovecs[i].iov_base = self.buffers[i].as_mut_ptr().cast();
-            iovecs[i].iov_len = RECEIVE_SIZE;
-            messages[i].msg_hdr.msg_name =
-                (&mut self.addresses[i] as *mut libc::sockaddr_in).cast();
-            messages[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
-            messages[i].msg_hdr.msg_iov = &mut iovecs[i];
-            messages[i].msg_hdr.msg_iovlen = 1;
+        self.receive_with(|messages| {
+            // WAITFORONE blocks only for the first datagram (subject to SO_RCVTIMEO).
+            // After that it drains what is available without waiting to fill a batch.
+            // All pointed-to storage is live and exclusive until this call returns.
+            let count = unsafe {
+                libc::recvmmsg(
+                    socket.as_raw_fd(),
+                    messages.as_mut_ptr(),
+                    messages.len() as _,
+                    libc::MSG_WAITFORONE,
+                    std::ptr::null_mut(),
+                )
+            };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        })
+    }
+
+    fn receive_with(
+        &mut self,
+        receive: impl FnOnce(&mut [libc::mmsghdr]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        let messages = &mut self.messages[..self.limit];
+        for message in &mut *messages {
+            // Restore value-result fields even after a partial receive or error.
+            // Pointer fields and iovec lengths are not changed by recvmmsg.
+            message.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
+            message.msg_hdr.msg_controllen = 0;
+            message.msg_hdr.msg_flags = 0;
+            message.msg_len = 0;
         }
-        // WAITFORONE blocks only for the first datagram (subject to SO_RCVTIMEO).
-        // After that it drains what is available without waiting to fill a batch.
-        // All buffers, addresses and iovecs remain live and exclusive for this call.
-        let count = unsafe {
-            libc::recvmmsg(
-                socket.as_raw_fd(),
-                messages.as_mut_ptr(),
-                self.limit as _,
-                libc::MSG_WAITFORONE,
-                std::ptr::null_mut(),
-            )
-        };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for (i, msg) in messages[..count as usize].iter().enumerate() {
+        let count = receive(messages)?;
+        for (i, msg) in messages[..count].iter().enumerate() {
+            // The address pointer belongs to storage and was filled by receive.
+            let addr = unsafe { &*msg.msg_hdr.msg_name.cast::<libc::sockaddr_in>() };
             // The endpoint only binds IPv4 sockets. Discard unexpected or truncated
             // addresses/payloads rather than handing partial data to QUIC.
             self.lengths[i] = if msg.msg_hdr.msg_flags & libc::MSG_TRUNC == 0
                 && msg.msg_hdr.msg_namelen as usize == std::mem::size_of::<libc::sockaddr_in>()
-                && self.addresses[i].sin_family == libc::AF_INET as _
+                && addr.sin_family == libc::AF_INET as _
             {
                 msg.msg_len as usize
             } else {
                 0
             };
         }
-        // Grow quickly when there is a backlog, but prepare only a small
-        // prefix when the socket is keeping up with the clients.
-        self.limit = (count as usize * 2).clamp(2, BATCH);
-        Ok(count as usize)
+        // Grow quickly when there is a backlog, but reset only a small prefix
+        // when the socket is keeping up with the clients.
+        self.limit = (count * 2).clamp(2, BATCH);
+        Ok(count)
     }
 
     pub fn datagram(&mut self, index: usize) -> (&mut [u8], SocketAddr) {
-        let addr = self.addresses[index];
+        let msg = &self.messages[index].msg_hdr;
+        // These pointers remain valid for this owner's lifetime. Borrowing self
+        // mutably keeps the returned payload exclusive until its borrow ends.
+        let addr = unsafe { *msg.msg_name.cast::<libc::sockaddr_in>() };
+        let data = unsafe { std::slice::from_raw_parts_mut(self.payloads[index], RECEIVE_SIZE) };
         let from = SocketAddrV4::new(
             addr.sin_addr.s_addr.to_ne_bytes().into(),
             u16::from_be(addr.sin_port),
         );
-        (&mut self.buffers[index][..self.lengths[index]], from.into())
+        (&mut data[..self.lengths[index]], from.into())
     }
 }
 
@@ -283,6 +344,9 @@ impl SendBatch {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod receive_tests;
 
 #[cfg(test)]
 mod tests {
