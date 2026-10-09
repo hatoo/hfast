@@ -15,6 +15,7 @@ const HEADERS: u8 = 0x1;
 const SETTINGS: u8 = 0x4;
 const PING: u8 = 0x6;
 const GOAWAY: u8 = 0x7;
+const CONTINUATION: u8 = 0x9;
 
 /// ACK on a SETTINGS or a PING, END_STREAM on a DATA
 const FLAG_ACK_OR_END_STREAM: u8 = 0x1;
@@ -39,9 +40,9 @@ const SERVER_SETTINGS: &[u8] = &[
 const SETTINGS_ACK: &[u8] = &[0, 0, 0, SETTINGS, FLAG_ACK_OR_END_STREAM, 0, 0, 0, 0];
 
 pub struct Conn {
-    /// A HEADERS is answered on END_HEADERS, so a header block still arriving
-    /// in CONTINUATION frames must not be answered twice
-    _private: (),
+    /// Stream whose header block is waiting for END_HEADERS, or zero. Only
+    /// one block can be open on a connection; its payload need not be retained.
+    header_stream: u32,
 }
 
 impl Conn {
@@ -49,7 +50,7 @@ impl Conn {
     /// be the first thing it sends
     pub fn new(out: &mut Vec<u8>) -> Self {
         out.extend_from_slice(SERVER_SETTINGS);
-        Conn { _private: () }
+        Conn { header_stream: 0 }
     }
 
     /// Answer every whole frame in `buf`, returning how many bytes were used,
@@ -71,11 +72,30 @@ impl Conn {
             let stream = u32::from_be_bytes([h[5] & 0x7f, h[6], h[7], h[8]]);
             let payload = &h[FRAME_HEADER_LEN..end];
 
+            // RFC 9113 Section 6.10: a field block cannot be interleaved with
+            // any other frame, including a CONTINUATION for another stream.
+            if self.header_stream != 0 && (kind != CONTINUATION || stream != self.header_stream) {
+                return None;
+            }
             match kind {
                 // Every request is the same request; the only thing worth
                 // reading out of one is which stream to answer on.
                 HEADERS => {
+                    if stream == 0 {
+                        return None;
+                    }
                     if flags & FLAG_END_HEADERS != 0 {
+                        respond(out, stream);
+                    } else {
+                        self.header_stream = stream;
+                    }
+                }
+                CONTINUATION => {
+                    if self.header_stream == 0 {
+                        return None;
+                    }
+                    if flags & FLAG_END_HEADERS != 0 {
+                        self.header_stream = 0;
                         respond(out, stream);
                     }
                 }
@@ -91,7 +111,7 @@ impl Conn {
                     }
                 }
                 GOAWAY => return None,
-                // CONTINUATION, WINDOW_UPDATE, RST_STREAM, PRIORITY and the
+                // WINDOW_UPDATE, RST_STREAM, PRIORITY and the
                 // rest need no answer: this server's windows are never the
                 // thing running out, and it holds no per-stream state to reset.
                 _ => {}
@@ -133,6 +153,9 @@ fn respond(out: &mut Vec<u8>, stream_id: u32) {
     ]);
     out.extend_from_slice(BODY);
 }
+
+#[cfg(test)]
+mod continuation_tests;
 
 #[cfg(test)]
 mod tests {
