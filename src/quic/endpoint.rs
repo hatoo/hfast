@@ -19,6 +19,9 @@ use super::{
 };
 use crate::sys;
 
+mod timers;
+use timers::Timers;
+
 /// How much of a client's first packet has to be there before it is worth
 /// making a connection for (RFC 9000 Section 14.1)
 const MIN_INITIAL: usize = 1200;
@@ -33,12 +36,32 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Endpoint {
     socket: UdpSocket,
     config: Arc<rustls::ServerConfig>,
-    conns: HashMap<SocketAddr, (Connection, Instant, bool)>,
+    conns: HashMap<SocketAddr, Peer>,
+    timers: Timers,
+    due: Vec<SocketAddr>,
     /// Peers awaiting output; the boolean in `conns` prevents duplicate entries.
     ready: Vec<SocketAddr>,
     max_streams: u32,
     next_cid: u64,
     out: SendBatch,
+}
+
+struct Peer {
+    conn: Connection,
+    last: Instant,
+    queued: bool,
+    /// A queued check may precede the current deadline, but never follow it.
+    scheduled: Option<Instant>,
+}
+
+impl Peer {
+    fn schedule(&mut self, addr: SocketAddr, timers: &mut Timers) {
+        // Idle expiry is strictly after the advertised interval; recovery is
+        // due at its deadline. Instant/Duration have nanosecond precision.
+        let idle = self.last + IDLE_TIMEOUT + Duration::from_nanos(1);
+        let next = self.conn.timeout().map_or(idle, |t| t.min(idle));
+        timers.schedule(addr, &mut self.scheduled, next);
+    }
 }
 
 impl Endpoint {
@@ -47,6 +70,8 @@ impl Endpoint {
             socket,
             config,
             conns: HashMap::new(),
+            timers: Timers::default(),
+            due: Vec::new(),
             ready: Vec::new(),
             max_streams,
             next_cid: 1,
@@ -104,26 +129,30 @@ impl Endpoint {
     /// Give every connection that is waiting on something a chance to send it
     /// again, and forget the ones that have gone away
     fn tick(&mut self) {
-        let now = Instant::now();
-        let due: Vec<SocketAddr> = self
-            .conns
-            .iter()
-            .filter(|(_, (c, last, _))| {
-                now.duration_since(*last) > IDLE_TIMEOUT || c.timeout().is_some_and(|t| now >= t)
-            })
-            .map(|(a, _)| *a)
-            .collect();
-        for addr in due {
-            let Some((conn, last, _)) = self.conns.get_mut(&addr) else {
-                continue;
-            };
-            if now.duration_since(*last) > IDLE_TIMEOUT {
+        self.tick_at(Instant::now());
+    }
+
+    fn tick_at(&mut self, now: Instant) {
+        // Snapshot the due set before transmitting: even a newly armed timer
+        // already in the past must run at most once in this tick, as before.
+        self.timers.drain_due(now, &mut self.due);
+        for i in 0..self.due.len() {
+            let addr = self.due[i];
+            let peer = self.conns.get_mut(&addr).expect("timer has a peer");
+            peer.scheduled = None;
+            if now.duration_since(peer.last) > IDLE_TIMEOUT {
                 self.conns.remove(&addr);
                 continue;
             }
-            conn.on_timeout(now);
-            self.flush(addr);
+            if peer.conn.timeout().is_some_and(|t| now >= t) {
+                peer.conn.on_timeout(now);
+                self.flush(addr);
+            } else {
+                // A receive/ACK postponed or cancelled the original deadline.
+                peer.schedule(addr, &mut self.timers);
+            }
         }
+        self.due.clear();
     }
 
     fn flush_ready(&mut self) {
@@ -136,21 +165,24 @@ impl Endpoint {
     }
 
     fn datagram(&mut self, datagram: &mut [u8], from: SocketAddr) {
-        let Some((conn, last, queued)) = self.conns.get_mut(&from) else {
+        let Some(peer) = self.conns.get_mut(&from) else {
             if self.accept(datagram, from) {
                 self.datagram(datagram, from);
             }
             return;
         };
-        *last = Instant::now();
-        if conn.recv(datagram).is_err() || conn.closed {
+        peer.last = Instant::now();
+        if peer.conn.recv(datagram).is_err() || peer.conn.closed {
+            self.timers.remove(from, &mut peer.scheduled);
             self.conns.remove(&from);
             return;
         }
-        if !*queued {
-            *queued = true;
+        if !peer.queued {
+            peer.queued = true;
             self.ready.push(from);
         }
+        // Every receive batch is flushed before tick. Refresh the timer there
+        // once, after both receive and transmit have changed recovery state.
     }
 
     /// A datagram from an address with no connection: it has to be an Initial
@@ -182,17 +214,24 @@ impl Endpoint {
         ) else {
             return false;
         };
-        self.conns.insert(from, (conn, Instant::now(), false));
+        let mut peer = Peer {
+            conn,
+            last: Instant::now(),
+            queued: false,
+            scheduled: None,
+        };
+        peer.schedule(from, &mut self.timers);
+        self.conns.insert(from, peer);
         true
     }
 
     fn flush(&mut self, to: SocketAddr) {
-        let Some((conn, _, queued)) = self.conns.get_mut(&to) else {
+        let Some(peer) = self.conns.get_mut(&to) else {
             return;
         };
-        *queued = false;
-        while conn.wants_send() {
-            match conn.poll_transmit(self.out.buffer()) {
+        peer.queued = false;
+        while peer.conn.wants_send() {
+            match peer.conn.poll_transmit(self.out.buffer()) {
                 Ok(true) => {}
                 _ => break,
             }
@@ -200,6 +239,7 @@ impl Endpoint {
                 break;
             }
         }
+        peer.schedule(to, &mut self.timers);
     }
 }
 
@@ -240,6 +280,8 @@ mod tests {
     use super::super::{TAG_LEN, frame, wire};
     use super::*;
     use rustls::quic::{Keys, Version};
+
+    mod timer_tests;
 
     fn client_keys() -> Keys {
         let rustls::SupportedCipherSuite::Tls13(suite) =
