@@ -9,6 +9,7 @@ use super::wire::{Error, Reader, Result, put_varint, varint_len};
 pub const PADDING: u64 = 0x00;
 pub const PING: u64 = 0x01;
 pub const ACK: u64 = 0x02;
+pub const RESET_STREAM: u64 = 0x04;
 pub const CRYPTO: u64 = 0x06;
 pub const STREAM: u64 = 0x08;
 pub const MAX_DATA: u64 = 0x10;
@@ -52,9 +53,12 @@ pub enum Frame<'a> {
     },
     StopSending {
         id: u64,
+        error_code: u64,
     },
     ResetStream {
         id: u64,
+        error_code: u64,
+        final_size: u64,
     },
     PathChallenge([u8; 8]),
     Close,
@@ -122,16 +126,20 @@ fn read_frame<'a>(r: &mut Reader<'a>) -> Result<Frame<'a>> {
                 rest,
             }
         }
-        0x04 => {
+        RESET_STREAM => {
             let id = r.varint()?;
-            r.varint()?;
-            r.varint()?;
-            Frame::ResetStream { id }
+            let error_code = r.varint()?;
+            let final_size = r.varint()?;
+            Frame::ResetStream {
+                id,
+                error_code,
+                final_size,
+            }
         }
         0x05 => {
             let id = r.varint()?;
-            r.varint()?;
-            Frame::StopSending { id }
+            let error_code = r.varint()?;
+            Frame::StopSending { id, error_code }
         }
         CRYPTO => {
             let offset = r.varint()?;
@@ -368,6 +376,39 @@ mod tests {
     #[test]
     fn an_unknown_frame_type_is_an_error() {
         assert!(Frames::new(&[0x3f]).next().unwrap().is_err());
+    }
+
+    #[test]
+    fn reset_and_stop_preserve_fields_and_reject_truncation() {
+        let mut reset = vec![RESET_STREAM as u8];
+        for value in [1 << 30, 0x10c, (1 << 40) + 3] {
+            put_varint(&mut reset, value);
+        }
+        assert_eq!(
+            frames(&reset),
+            [Frame::ResetStream {
+                id: 1 << 30,
+                error_code: 0x10c,
+                final_size: (1 << 40) + 3,
+            }]
+        );
+        for n in 1..reset.len() {
+            assert!(Frames::new(&reset[..n]).next().unwrap().is_err());
+        }
+        let mut stop = vec![0x05];
+        for value in [8, 0x10c] {
+            put_varint(&mut stop, value);
+        }
+        assert_eq!(
+            frames(&stop),
+            [Frame::StopSending {
+                id: 8,
+                error_code: 0x10c
+            }]
+        );
+        for n in 1..stop.len() {
+            assert!(Frames::new(&stop[..n]).next().unwrap().is_err());
+        }
     }
 
     #[test]

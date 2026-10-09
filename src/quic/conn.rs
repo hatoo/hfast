@@ -41,6 +41,12 @@ struct Request {
     fin: bool,
     /// The answer has been queued
     answered: bool,
+    /// The sending direction was reset; receive accounting must continue.
+    stopped: bool,
+    /// The fixed response has been transmitted at least once.
+    sent: bool,
+    /// The peer acknowledged the response or our RESET_STREAM.
+    send_done: bool,
 }
 
 /// A higher stream opens the lower slots too, but their request data may still
@@ -125,6 +131,15 @@ struct CryptoFlight {
 struct ControlFlight {
     sent_in: Vec<u64>,
     pending: bool,
+}
+
+/// Cancellation is uncommon, so retain its recovery state separately instead
+/// of adding a packet-number vector to every request slot.
+struct ResetFlight {
+    id: u64,
+    error_code: u64,
+    final_size: u64,
+    flight: ControlFlight,
 }
 
 impl ControlFlight {
@@ -298,13 +313,16 @@ pub struct Connection {
     /// Largest received offsets for the fixed allowance of client uni streams.
     /// Retained after FIN too, so late duplicates cannot grant credit again.
     uni_sizes: [u64; transport::MAX_STREAMS_UNI],
-    /// The advertised uni byte limit; no MAX_STREAM_DATA updates are sent.
-    uni_max_data: u64,
+    /// One bit per uni stream whose final size is known (FIN or RESET_STREAM).
+    uni_final: u8,
+    /// The advertised byte limit per stream; no MAX_STREAM_DATA updates are sent.
+    stream_max_data: u64,
     /// Streams whose answer is written but not yet in a packet
     ready: Vec<u64>,
     /// `(packet number, stream)` for every answer sent and not yet
     /// acknowledged, so a lost one can be sent again
     unacked: Vec<(u64, u64)>,
+    resets: Vec<ResetFlight>,
     /// Scratch ranges reused as ACK frames arrive.
     ack_ranges: Vec<(u64, u64)>,
     /// Packet assembly storage, returned here after each transmit attempt.
@@ -382,9 +400,11 @@ impl Connection {
             streams: Vec::new(),
             base_stream: 0,
             uni_sizes: [0; transport::MAX_STREAMS_UNI],
-            uni_max_data: initial_max_stream_data,
+            uni_final: 0,
+            stream_max_data: initial_max_stream_data,
             ready: Vec::new(),
             unacked: Vec::new(),
+            resets: Vec::new(),
             ack_ranges: Vec::new(),
             packet_body: Vec::new(),
             control: ControlFlight::new(),
@@ -605,7 +625,7 @@ impl Connection {
                         .flight
                         .on_ack(largest, first_range, rest);
                     progress |= self.data_credit.flight.on_ack(largest, first_range, rest);
-                    if !self.unacked.is_empty() {
+                    if !self.unacked.is_empty() || !self.resets.is_empty() {
                         progress |= self.on_ack(largest, first_range, rest);
                     }
                 }
@@ -627,32 +647,14 @@ impl Connection {
                 offset,
                 data,
                 fin,
+            } => self.on_stream(id, offset, data, fin)?,
+            frame::Frame::StopSending { id, error_code } => self.stop_sending(id, error_code),
+            frame::Frame::ResetStream {
+                id,
+                error_code,
+                final_size,
             } => {
-                // Check before offset-based accounting: an invalid sparse
-                // uni frame must not inflate credit or overflow the sum.
-                if id & 3 == 2
-                    && offset
-                        .checked_add(data.len() as u64)
-                        .is_none_or(|end| end > self.uni_max_data)
-                {
-                    return Err(Error);
-                }
-                self.on_stream(id, offset, data, fin);
-            }
-            // A client that gives up on a stream is answered by forgetting it
-            frame::Frame::StopSending { id } | frame::Frame::ResetStream { id } => {
-                if let Some(slot) = self.stream_slot_mut(id)
-                    && !matches!(slot, StreamSlot::Complete)
-                {
-                    *slot = StreamSlot::Complete;
-                    self.finished += 1;
-                    self.ready.retain(|&stream| stream != id);
-                    self.unacked.retain(|&(_, stream)| stream != id);
-                    self.retire();
-                    if !self.in_flight(Space::Data) {
-                        self.spaces[Space::Data as usize].oldest_sent = None;
-                    }
-                }
+                self.on_reset(id, error_code, final_size)?;
             }
         }
         Ok(())
@@ -663,34 +665,133 @@ impl Connection {
     /// The bytes are not read. A request's stream id is what says which stream
     /// to answer on, and its end is what says to answer at all; nothing in it
     /// changes the answer, so nothing in it is put back together.
-    fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) {
-        if id & 3 == 2 {
-            // The client's control and QPACK streams. They have to be counted
-            // against flow control by highest offset, including gaps (RFC 9000
-            // Section 4.1). Replays, overlaps and retransmissions add no credit.
-            let n = id >> 2;
-            if n < self.uni_sizes.len() as u64 {
-                let size = &mut self.uni_sizes[n as usize];
-                let end = offset + data.len() as u64;
-                self.data_seen += end.saturating_sub(*size);
-                *size = (*size).max(end);
-            }
-            return;
+    fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
+        let end = offset.checked_add(data.len() as u64).ok_or(Error)?;
+        if end > self.stream_max_data {
+            return Err(Error);
         }
-        let end = offset + data.len() as u64;
+        if id & 3 == 2 {
+            return self.receive_uni(id, end, fin);
+        }
+        let available = self.data_credit.told.saturating_sub(self.data_seen);
         let Some(req) = self.stream_mut(id) else {
             // Completed requests, invalid stream types and ungranted ids do
             // not reopen a request or replenish its connection credit.
-            return;
+            return Ok(());
         };
-        let fresh = end.saturating_sub(req.size);
+        let fresh = Self::received_bytes(req.size, req.fin, end, fin, available)?;
         req.size = req.size.max(end);
         req.fin |= fin;
-        let answer = req.fin && !req.answered;
+        let answer = req.fin && !req.answered && !req.stopped;
         req.answered |= answer;
+        let complete = req.fin && req.send_done;
         self.data_seen += fresh;
         if answer {
             self.ready.push(id);
+        }
+        if complete {
+            self.complete_stream(id);
+        }
+        Ok(())
+    }
+
+    /// Check final-size consistency and credit before changing any accounting.
+    fn received_bytes(
+        size: u64,
+        final_known: bool,
+        end: u64,
+        fin: bool,
+        available: u64,
+    ) -> Result<u64> {
+        if (final_known && (end > size || (fin && end != size))) || (fin && end < size) {
+            return Err(Error);
+        }
+        let fresh = end.saturating_sub(size);
+        if fresh > available {
+            return Err(Error);
+        }
+        Ok(fresh)
+    }
+
+    fn receive_uni(&mut self, id: u64, end: u64, fin: bool) -> Result<()> {
+        let n = id >> 2;
+        if n >= self.uni_sizes.len() as u64 {
+            return Ok(());
+        }
+        let size = &mut self.uni_sizes[n as usize];
+        let fresh = Self::received_bytes(
+            *size,
+            self.uni_final & (1 << n) != 0,
+            end,
+            fin,
+            self.data_credit.told.saturating_sub(self.data_seen),
+        )?;
+        *size = (*size).max(end);
+        if fin {
+            self.uni_final |= 1 << n;
+        }
+        self.data_seen += fresh;
+        Ok(())
+    }
+
+    fn on_reset(&mut self, id: u64, error_code: u64, final_size: u64) -> Result<()> {
+        if final_size > self.stream_max_data {
+            return Err(Error);
+        }
+        if id & 3 == 2 {
+            return self.receive_uni(id, final_size, true);
+        }
+        let available = self.data_credit.told.saturating_sub(self.data_seen);
+        let Some(req) = self.stream_mut(id) else {
+            return Ok(());
+        };
+        let fresh = Self::received_bytes(req.size, req.fin, final_size, true, available)?;
+        req.size = final_size;
+        req.fin = true;
+        // Receiving a reset does not cancel an already queued/sent response.
+        // If no request was completed, this application abandons its response
+        // with its own reliable reset, not an HTTP success for a cancelled call.
+        let cancel = !req.answered;
+        let complete = req.send_done;
+        self.data_seen += fresh;
+        if cancel {
+            self.stop_sending(id, error_code);
+        }
+        if complete {
+            self.complete_stream(id);
+        }
+        Ok(())
+    }
+
+    fn stop_sending(&mut self, id: u64, error_code: u64) {
+        let Some(req) = self.stream_mut(id) else {
+            return;
+        };
+        if req.stopped || req.send_done {
+            return;
+        }
+        req.stopped = true;
+        let final_size = if req.sent { RESPONSE.len() as u64 } else { 0 };
+        self.resets.push(ResetFlight {
+            id,
+            error_code,
+            final_size,
+            flight: ControlFlight::new(),
+        });
+        self.ready.retain(|&stream| stream != id);
+        self.unacked.retain(|&(_, stream)| stream != id);
+        if !self.in_flight(Space::Data) {
+            self.spaces[Space::Data as usize].oldest_sent = None;
+        }
+    }
+
+    fn complete_stream(&mut self, id: u64) {
+        if let Some(slot) = self.stream_slot_mut(id)
+            && matches!(slot, StreamSlot::Active(req) if req.fin && req.send_done)
+        {
+            *slot = StreamSlot::Complete;
+            self.finished += 1;
+            self.retire();
         }
     }
 
@@ -714,6 +815,20 @@ impl Connection {
         let streams = &mut self.streams;
         let base = self.base_stream;
         let mut finished = self.finished;
+        let mut finish_send = |id: u64| {
+            if let Some(i) = (id >> 2)
+                .checked_sub(base)
+                .and_then(|n| usize::try_from(n).ok())
+                && let Some(StreamSlot::Active(req)) = streams.get_mut(i)
+            {
+                req.send_done = true;
+                if req.fin {
+                    streams[i] = StreamSlot::Complete;
+                    finished += 1;
+                    retired = true;
+                }
+            }
+        };
         self.unacked.retain(|&(pn, id)| {
             if !ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi) {
                 if pn < lost_before {
@@ -723,17 +838,16 @@ impl Connection {
                 return true;
             }
             acknowledged = true;
-            if let Some(i) = (id >> 2)
-                .checked_sub(base)
-                .and_then(|n| usize::try_from(n).ok())
-                && i < streams.len()
-                && matches!(streams[i], StreamSlot::Active(_))
-            {
-                streams[i] = StreamSlot::Complete;
-                finished += 1;
-                retired = true;
-            }
+            finish_send(id);
             false
+        });
+        self.resets.retain_mut(|reset| {
+            if reset.flight.on_ack(largest, first_range, rest) {
+                acknowledged = true;
+                finish_send(reset.id);
+                return false;
+            }
+            true
         });
         self.finished = finished;
         if retired {
@@ -778,6 +892,7 @@ impl Connection {
     /// Whether anything is waiting to go out
     pub fn wants_send(&self) -> bool {
         !self.ready.is_empty()
+            || self.resets.iter().any(|reset| reset.flight.pending)
             || self.path_response.is_some()
             || (!self.tls.is_handshaking() && self.handshake_done.pending)
             || (self.connected && self.control.pending)
@@ -846,6 +961,23 @@ impl Connection {
             self.data_credit
                 .write(body, body_room, pn, frame::MAX_DATA, self.data_limit());
         }
+        for reset in &mut self.resets {
+            if !reset.flight.pending {
+                continue;
+            }
+            let need = 1
+                + varint_len(reset.id)
+                + varint_len(reset.error_code)
+                + varint_len(reset.final_size);
+            if body.len() + need > body_room {
+                break;
+            }
+            put_varint(body, frame::RESET_STREAM);
+            put_varint(body, reset.id);
+            put_varint(body, reset.error_code);
+            put_varint(body, reset.final_size);
+            reset.flight.sent(pn);
+        }
         // Answers, as many as the packet holds. They go out newest first,
         // which costs nothing: every one of them is the same answer.
         while let Some(&id) = self.ready.last() {
@@ -854,6 +986,9 @@ impl Connection {
                 break;
             }
             self.ready.pop();
+            if let Some(req) = self.stream_mut(id) {
+                req.sent = true;
+            }
             frame::put_stream(body, id, 0, true, RESPONSE);
             self.unacked.push((pn, id));
         }
@@ -1036,6 +1171,9 @@ impl Connection {
         self.handshake_done.on_timeout();
         self.streams_credit.flight.on_timeout();
         self.data_credit.flight.on_timeout();
+        for reset in &mut self.resets {
+            reset.flight.on_timeout();
+        }
     }
 
     /// Forget a space: its keys are gone, so nothing in it can be sent or
@@ -1061,6 +1199,11 @@ impl Connection {
                     || !self.handshake_done.sent_in.is_empty()
                     || !self.streams_credit.flight.sent_in.is_empty()
                     || !self.data_credit.flight.sent_in.is_empty()))
+            || (space == Space::Data
+                && self
+                    .resets
+                    .iter()
+                    .any(|reset| !reset.flight.sent_in.is_empty()))
     }
 
     /// An acknowledgement arrived: the timer either has nothing left to wait
@@ -1205,19 +1348,19 @@ mod tests {
     #[test]
     fn uni_accounting_duplicates_and_overlaps_grant_credit_once() {
         let mut conn = credit_connection();
-        conn.on_stream(2, 0, &[0; 32], false);
-        conn.on_stream(2, 0, &[0; 32], false);
+        conn.on_stream(2, 0, &[0; 32], false).unwrap();
+        conn.on_stream(2, 0, &[0; 32], false).unwrap();
         assert_eq!(conn.data_seen, 32);
         assert!(!conn.wants_send());
-        conn.on_stream(2, 16, &[0; 32], false);
-        conn.on_stream(2, 0, &[0; 16], false);
+        conn.on_stream(2, 16, &[0; 32], false).unwrap();
+        conn.on_stream(2, 0, &[0; 16], false).unwrap();
         assert_eq!(conn.data_seen, 48);
-        conn.on_stream(2, 63, &[0], false);
+        conn.on_stream(2, 63, &[0], false).unwrap();
         let (pn, plain) = send_data(&mut conn);
         assert_credit(&plain, None, Some(192));
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         for _ in 0..4 {
-            conn.on_stream(2, 0, &[0; 64], true);
+            conn.on_stream(2, 0, &[0; 64], true).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         assert!(!conn.wants_send());
@@ -1229,11 +1372,11 @@ mod tests {
     #[test]
     fn uni_accounting_gaps_and_empty_fin_use_the_highest_offset() {
         let mut conn = connection();
-        conn.on_stream(2, 128, &[], true);
+        conn.on_stream(2, 128, &[], true).unwrap();
         assert_eq!(conn.data_seen, 128);
-        conn.on_stream(2, 64, &[0; 64], true);
-        conn.on_stream(2, 0, &[0; 64], false);
-        conn.on_stream(2, 128, &[], true);
+        conn.on_stream(2, 64, &[0; 64], true).unwrap();
+        conn.on_stream(2, 0, &[0; 64], false).unwrap();
+        conn.on_stream(2, 128, &[], true).unwrap();
         assert_eq!(conn.data_seen, 128);
         assert_eq!(conn.finished, 0);
         assert!(conn.ready.is_empty());
@@ -1244,14 +1387,14 @@ mod tests {
         let mut conn = credit_connection();
         // A higher uni id does not account for unseen lower streams.
         for id in [30, 10, 6, 2] {
-            conn.on_stream(id, 8, &[0; 8], false);
+            conn.on_stream(id, 8, &[0; 8], false).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         let (pn, plain) = send_data(&mut conn);
         assert_credit(&plain, None, Some(192));
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         for id in [2, 6, 10, 30] {
-            conn.on_stream(id, 0, &[0; 16], true);
+            conn.on_stream(id, 0, &[0; 16], true).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         assert!(!conn.wants_send());
@@ -1263,20 +1406,20 @@ mod tests {
         let mut conn = connection();
         // The server advertises eight client uni streams: ids 2 through 30.
         for id in [34, 38, (1 << 62) - 2, 1, 3] {
-            conn.on_stream(id, 64, b"invalid", true);
+            conn.on_stream(id, 64, b"invalid", true).unwrap();
         }
         assert_eq!(conn.data_seen, 0);
         assert_eq!(conn.finished, 0);
         assert!(conn.ready.is_empty());
         assert!(conn.streams.is_empty());
-        conn.on_stream(30, 0, b"valid", false);
+        conn.on_stream(30, 0, b"valid", false).unwrap();
         assert_eq!(conn.data_seen, 5);
     }
 
     #[test]
     fn uni_accounting_rejects_offsets_beyond_advertised_byte_limit() {
         let mut conn = connection();
-        let limit = conn.uni_max_data;
+        let limit = conn.stream_max_data;
         assert_eq!(limit, 1 << 24);
         for (offset, data) in [
             (limit, &b"x"[..]),
@@ -1310,7 +1453,7 @@ mod tests {
     fn uni_accounting_encrypted_offset_violation_keeps_credit_unchanged() {
         let mut conn = credit_connection();
         let mut body = Vec::new();
-        frame::put_stream(&mut body, 2, conn.uni_max_data, false, b"x");
+        frame::put_stream(&mut body, 2, conn.stream_max_data, false, b"x");
         let mut packet = peer_data_packet(&conn, 10, &body);
         assert_eq!(conn.recv(&mut packet), Err(Error));
         assert_eq!(conn.data_seen, 0);
@@ -1321,8 +1464,8 @@ mod tests {
     #[test]
     fn uni_accounting_survives_request_retirement() {
         let mut conn = credit_connection();
-        conn.on_stream(2, 0, &[0; 32], true);
-        conn.on_stream(0, 0, &[0; 32], true);
+        conn.on_stream(2, 0, &[0; 32], true).unwrap();
+        conn.on_stream(0, 0, &[0; 32], true).unwrap();
         let (pn, plain) = send_data(&mut conn);
         assert!(frame::Frames::new(&plain).any(|f| f.unwrap() == frame::Frame::MaxData(192)));
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
@@ -1330,7 +1473,7 @@ mod tests {
         assert_eq!(conn.base_stream, 1);
         assert!(conn.streams.is_empty());
         for id in [0, 2] {
-            conn.on_stream(id, 0, &[0; 32], true);
+            conn.on_stream(id, 0, &[0; 32], true).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         assert_eq!(conn.finished, 1);
@@ -1550,7 +1693,7 @@ mod tests {
         let request = [0; 64];
         for n in 0..12 {
             let id = n * 4;
-            conn.on_stream(id, 0, &request, true);
+            conn.on_stream(id, 0, &request, true).unwrap();
             let (original, _) = send_data(&mut conn);
             conn.on_timeout(conn.timeout().unwrap());
             let (retry, plain) = send_data(&mut conn);
@@ -1566,7 +1709,7 @@ mod tests {
             }));
             acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
             acknowledge(&mut conn, Space::Data, &[(original, retry)]);
-            conn.on_stream(id, 0, &request, true);
+            conn.on_stream(id, 0, &request, true).unwrap();
             assert_eq!(conn.finished, n + 1);
             assert_eq!(conn.data_seen, (n + 1) * 64);
             assert!(conn.ready.is_empty());
@@ -1621,7 +1764,7 @@ mod tests {
     fn control_recovery_sparse_response_ack_keeps_timer() {
         let mut conn = data_connection();
         send_data(&mut conn); // Lose SETTINGS and HANDSHAKE_DONE.
-        conn.on_stream(0, 0, b"request", true);
+        conn.on_stream(0, 0, b"request", true).unwrap();
         let (response, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(response, response)]);
         assert_eq!(conn.finished, 1);
@@ -1652,7 +1795,7 @@ mod tests {
         let mut conn = data_connection();
         let (original, _) = send_data(&mut conn);
         for id in [0, 4, 8] {
-            conn.on_stream(id, 0, b"request", true);
+            conn.on_stream(id, 0, b"request", true).unwrap();
             let (pn, _) = send_data(&mut conn);
             // Sparse ACKs exclude the missing control packet.
             acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
@@ -1671,7 +1814,7 @@ mod tests {
     fn control_recovery_duplicate_ack_keeps_backoff_and_deadline() {
         let mut conn = data_connection();
         send_data(&mut conn);
-        conn.on_stream(0, 0, b"request", true);
+        conn.on_stream(0, 0, b"request", true).unwrap();
         let (response, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(response, response)]);
         conn.on_timeout(conn.timeout().unwrap());
@@ -1825,7 +1968,7 @@ mod tests {
     fn successive_acks_only_retire_their_own_ranges() {
         let mut conn = connection();
         for id in [0, 4, 8] {
-            conn.on_stream(id, 0, b"request", true);
+            conn.on_stream(id, 0, b"request", true).unwrap();
         }
         conn.ready.clear();
         conn.unacked = vec![(10, 0), (11, 4), (12, 8)];
@@ -1844,13 +1987,13 @@ mod tests {
     #[test]
     fn stream_lifecycle_delayed_lower_request_survives_higher_ack() {
         let mut conn = data_connection();
-        conn.on_stream(8, 0, b"higher", true);
+        conn.on_stream(8, 0, b"higher", true).unwrap();
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 1);
         assert_eq!(conn.base_stream, 0, "unseen lower streams are still open");
         for id in [4, 0] {
-            conn.on_stream(id, 0, b"delayed", true);
+            conn.on_stream(id, 0, b"delayed", true).unwrap();
             let (pn, plain) = send_data(&mut conn);
             assert!(frame::Frames::new(&plain).any(|f| matches!(
                 f.unwrap(), frame::Frame::Stream { id: got, fin: true, data: RESPONSE, .. } if got == id
@@ -1865,12 +2008,12 @@ mod tests {
     #[test]
     fn stream_lifecycle_completed_slot_cannot_reopen() {
         let mut conn = data_connection();
-        conn.on_stream(0, 0, b"unfinished", false);
-        conn.on_stream(4, 0, b"complete", true);
+        conn.on_stream(0, 0, b"unfinished", false).unwrap();
+        conn.on_stream(4, 0, b"complete", true).unwrap();
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         let seen = conn.data_seen;
-        conn.on_stream(4, 0, b"complete", true);
+        conn.on_stream(4, 0, b"complete", true).unwrap();
         assert!(
             conn.ready.is_empty(),
             "duplicate must not queue another response"
@@ -1882,11 +2025,11 @@ mod tests {
     #[test]
     fn stream_lifecycle_retired_duplicate_does_not_grant_data_credit() {
         let mut conn = data_connection();
-        conn.on_stream(0, 0, b"complete", true);
+        conn.on_stream(0, 0, b"complete", true).unwrap();
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         let seen = conn.data_seen;
-        conn.on_stream(0, 0, b"complete", true);
+        conn.on_stream(0, 0, b"complete", true).unwrap();
         assert_eq!(conn.data_seen, seen);
         assert_eq!(conn.finished, 1);
         assert!(conn.ready.is_empty());
@@ -1894,35 +2037,53 @@ mod tests {
 
     #[test]
     fn stream_lifecycle_cancellation_is_idempotent_and_clears_queued_response() {
-        let mut conn = connection();
-        conn.on_stream(0, 0, b"unfinished", false);
-        conn.on_stream(4, 0, b"cancel", true);
-        for f in [
-            frame::Frame::StopSending { id: 4 },
-            frame::Frame::ResetStream { id: 4 },
-            frame::Frame::StopSending { id: 4 },
-        ] {
-            conn.on_frame(&f, Space::Data).unwrap();
-            assert_eq!(conn.finished, 1);
-            assert!(conn.ready.is_empty());
-        }
-        conn.on_stream(4, 0, b"cancel", true);
+        let mut conn = data_connection();
+        conn.on_stream(0, 0, b"unfinished", false).unwrap();
+        conn.on_stream(4, 0, b"cancel", true).unwrap();
+        receive_stop(&mut conn, 4).unwrap();
+        receive_reset(&mut conn, 4, 6).unwrap();
+        receive_stop(&mut conn, 4).unwrap();
+        assert_eq!(conn.finished, 0, "our reset still needs an ACK");
         assert!(conn.ready.is_empty());
+        assert_eq!(conn.resets.len(), 1);
+        let (pn, plain) = send_data(&mut conn);
+        assert_reset(&plain, 4, 0);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 1);
+        conn.on_stream(4, 0, b"cancel", true).unwrap();
+        receive_stop(&mut conn, 4).unwrap();
+        receive_reset(&mut conn, 4, 6).unwrap();
+        assert!(conn.ready.is_empty());
+        assert!(conn.resets.is_empty());
         assert_eq!(conn.data_seen, 16);
+        assert_eq!(conn.finished, 1);
     }
 
     #[test]
     fn stream_lifecycle_other_stream_types_cannot_cancel_requests() {
         let mut conn = connection();
-        conn.on_stream(0, 0, b"unfinished", false);
+        conn.on_stream(0, 0, b"unfinished", false).unwrap();
         for id in [1, 2, 3] {
-            conn.on_frame(&frame::Frame::StopSending { id }, Space::Data)
-                .unwrap();
-            conn.on_frame(&frame::Frame::ResetStream { id }, Space::Data)
-                .unwrap();
+            conn.on_frame(
+                &frame::Frame::StopSending {
+                    id,
+                    error_code: 0x10c,
+                },
+                Space::Data,
+            )
+            .unwrap();
+            conn.on_frame(
+                &frame::Frame::ResetStream {
+                    id,
+                    error_code: 0x10c,
+                    final_size: 0,
+                },
+                Space::Data,
+            )
+            .unwrap();
         }
         assert_eq!(conn.finished, 0);
-        conn.on_stream(0, 10, b"end", true);
+        conn.on_stream(0, 10, b"end", true).unwrap();
         assert_eq!(conn.ready, [0]);
         assert_eq!(conn.data_seen, 13);
     }
@@ -1930,8 +2091,8 @@ mod tests {
     #[test]
     fn stream_lifecycle_uses_advertised_absolute_stream_limit() {
         let mut conn = connection();
-        conn.on_stream(252, 0, b"allowed", true);
-        conn.on_stream(256, 0, b"over limit", true);
+        conn.on_stream(252, 0, b"allowed", true).unwrap();
+        conn.on_stream(256, 0, b"over limit", true).unwrap();
         assert_eq!(conn.ready, [252]);
         assert_eq!(conn.data_seen, 7);
         assert_eq!(conn.streams.len(), 64);
@@ -1939,53 +2100,64 @@ mod tests {
 
     #[test]
     fn stream_lifecycle_cancel_before_request_keeps_lower_slots_open() {
-        let mut conn = connection();
-        for f in [
-            frame::Frame::ResetStream { id: 8 },
-            frame::Frame::StopSending { id: 8 },
-        ] {
-            conn.on_frame(&f, Space::Data).unwrap();
-            assert_eq!(conn.finished, 1);
-            assert_eq!(conn.base_stream, 0);
-        }
-        conn.on_stream(8, 0, b"cancelled", true);
+        let mut conn = data_connection();
+        receive_reset(&mut conn, 8, 9).unwrap();
+        receive_stop(&mut conn, 8).unwrap();
+        assert_eq!(conn.finished, 0);
+        let (pn, plain) = send_data(&mut conn);
+        assert_reset(&plain, 8, 0);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 1);
+        assert_eq!(conn.base_stream, 0);
+        conn.on_stream(8, 0, b"cancelled", true).unwrap();
         assert!(conn.ready.is_empty());
-        assert_eq!(conn.data_seen, 0);
+        assert_eq!(conn.data_seen, 9);
         for id in [4, 0] {
-            conn.on_frame(&frame::Frame::ResetStream { id }, Space::Data)
-                .unwrap();
+            receive_reset(&mut conn, id, 0).unwrap();
         }
+        assert_eq!(conn.finished, 1);
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 3);
         assert_eq!(conn.base_stream, 3);
         assert!(conn.streams.is_empty());
-        conn.on_frame(&frame::Frame::ResetStream { id: 8 }, Space::Data)
-            .unwrap();
+        receive_reset(&mut conn, 8, 9).unwrap();
         assert_eq!(conn.finished, 3);
     }
 
     #[test]
     fn stream_lifecycle_cancel_in_flight_ignores_late_ack_and_pto() {
         let mut conn = data_connection();
-        conn.on_stream(0, 0, b"unfinished", false);
-        conn.on_stream(4, 0, b"cancel", true);
+        conn.on_stream(0, 0, b"unfinished", false).unwrap();
+        conn.on_stream(4, 0, b"cancel", true).unwrap();
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         // Keep controls acknowledged, then send a separate cancellable reply.
-        conn.on_stream(8, 0, b"cancel", true);
+        conn.on_stream(8, 0, b"cancel", true).unwrap();
         let (pn, _) = send_data(&mut conn);
         let timeout = conn.timeout().unwrap();
-        conn.on_frame(&frame::Frame::StopSending { id: 8 }, Space::Data)
-            .unwrap();
-        assert_eq!(conn.finished, 2);
+        conn.on_frame(
+            &frame::Frame::StopSending {
+                id: 8,
+                error_code: 0x10c,
+            },
+            Space::Data,
+        )
+        .unwrap();
+        assert_eq!(conn.finished, 1);
         assert!(conn.unacked.is_empty());
         assert!(conn.timeout().is_none());
         conn.on_timeout(timeout);
         assert!(conn.ready.is_empty());
         for _ in 0..2 {
             acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
-            assert_eq!(conn.finished, 2);
+            assert_eq!(conn.finished, 1);
         }
-        conn.on_stream(0, 10, b"end", true);
+        let (reset_pn, plain) = send_data(&mut conn);
+        assert_reset(&plain, 8, RESPONSE.len() as u64);
+        acknowledge(&mut conn, Space::Data, &[(reset_pn, reset_pn)]);
+        assert_eq!(conn.finished, 2);
+        conn.on_stream(0, 10, b"end", true).unwrap();
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.finished, 3);
@@ -1995,12 +2167,11 @@ mod tests {
     #[test]
     fn stream_lifecycle_cancel_preserves_other_response_recovery() {
         let mut conn = data_connection();
-        conn.on_stream(0, 0, b"keep", true);
+        conn.on_stream(0, 0, b"keep", true).unwrap();
         let (first, _) = send_data(&mut conn);
-        conn.on_stream(4, 0, b"cancel", true);
+        conn.on_stream(4, 0, b"cancel", true).unwrap();
         send_data(&mut conn);
-        conn.on_frame(&frame::Frame::ResetStream { id: 4 }, Space::Data)
-            .unwrap();
+        receive_stop(&mut conn, 4).unwrap();
         assert_eq!(conn.unacked, [(first, 0)]);
         conn.on_timeout(conn.timeout().unwrap());
         assert_eq!(conn.ready, [0]);
@@ -2015,7 +2186,7 @@ mod tests {
     fn stream_lifecycle_sparse_ack_and_retransmission_keep_unseen_gap() {
         let mut conn = data_connection();
         for id in [8, 16] {
-            conn.on_stream(id, 0, b"request", true);
+            conn.on_stream(id, 0, b"request", true).unwrap();
             send_data(&mut conn);
         }
         acknowledge(&mut conn, Space::Data, &[(1, 1)]);
@@ -2028,7 +2199,7 @@ mod tests {
         acknowledge(&mut conn, Space::Data, &[(retry, retry), (0, 0)]);
         assert_eq!(conn.finished, 2);
         for id in [12, 0, 4] {
-            conn.on_stream(id, 0, b"delayed", true);
+            conn.on_stream(id, 0, b"delayed", true).unwrap();
             let (pn, _) = send_data(&mut conn);
             acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         }
@@ -2042,13 +2213,13 @@ mod tests {
     fn stream_lifecycle_new_ids_wait_for_advertised_credit() {
         let mut conn = data_connection();
         for id in (0..32).map(|n| n * 4) {
-            conn.on_stream(id, 0, b"request", true);
+            conn.on_stream(id, 0, b"request", true).unwrap();
         }
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.streams_limit(), 96);
         assert_eq!(conn.streams_credit.told, 64);
-        conn.on_stream(256, 0, b"over limit", true);
+        conn.on_stream(256, 0, b"over limit", true).unwrap();
         assert!(conn.ready.is_empty());
         let (_, plain) = send_data(&mut conn);
         assert!(frame::Frames::new(&plain).any(|f| matches!(
@@ -2058,9 +2229,249 @@ mod tests {
                 limit: 96
             }
         )));
-        conn.on_stream(256, 0, b"allowed", true);
+        conn.on_stream(256, 0, b"allowed", true).unwrap();
         assert_eq!(conn.ready, [256]);
         assert_eq!(conn.data_seen, 32 * 7 + 7);
+    }
+
+    fn receive_reset(conn: &mut Connection, id: u64, final_size: u64) -> Result<()> {
+        let mut bytes = vec![0x04];
+        put_varint(&mut bytes, id);
+        put_varint(&mut bytes, 0x10c);
+        put_varint(&mut bytes, final_size);
+        conn.on_frame(&frame::Frames::new(&bytes).next().unwrap()?, Space::Data)
+    }
+
+    fn receive_stop(conn: &mut Connection, id: u64) -> Result<()> {
+        let mut bytes = vec![0x05];
+        put_varint(&mut bytes, id);
+        put_varint(&mut bytes, 0x10c);
+        conn.on_frame(&frame::Frames::new(&bytes).next().unwrap()?, Space::Data)
+    }
+
+    fn assert_reset(plain: &[u8], id: u64, final_size: u64) {
+        assert!(frame::Frames::new(plain).any(|f| f.unwrap()
+            == frame::Frame::ResetStream {
+                id,
+                error_code: 0x10c,
+                final_size,
+            }));
+        assert!(!frame::Frames::new(plain).any(|f| matches!(f.unwrap(),
+            frame::Frame::Stream { id: stream, .. } if stream == id)));
+    }
+
+    #[test]
+    fn reset_recovery_ack_before_receive_final_size_keeps_accounting() {
+        for peer_reset in [false, true] {
+            let mut conn = data_connection();
+            receive_stop(&mut conn, 8).unwrap();
+            let (pn, plain) = send_data(&mut conn);
+            assert_reset(&plain, 8, 0);
+            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+            assert_eq!(conn.finished, 0);
+            assert!(conn.resets.is_empty());
+            assert!(conn.timeout().is_none());
+            conn.on_stream(8, 32, b"received", false).unwrap();
+            assert_eq!(conn.data_seen, 40);
+            if peer_reset {
+                receive_reset(&mut conn, 8, 64).unwrap();
+            } else {
+                conn.on_stream(8, 64, b"", true).unwrap();
+            }
+            assert_eq!(conn.data_seen, 64);
+            assert_eq!(conn.finished, 1);
+            assert_eq!(conn.base_stream, 0);
+            assert!(conn.ready.is_empty());
+            assert!(conn.resets.is_empty());
+        }
+    }
+
+    #[test]
+    fn reset_recovery_sparse_ack_pto_and_late_original_ack() {
+        let mut conn = data_connection();
+        receive_reset(&mut conn, 8, 128).unwrap();
+        let (first, plain) = send_data(&mut conn);
+        assert_reset(&plain, 8, 0);
+        assert_eq!(conn.finished, 0);
+        // A real higher packet ACK leaves the original reset missing.
+        conn.on_stream(12, 0, b"request", true).unwrap();
+        conn.spaces[Space::Data as usize].next_pn = first + 3;
+        let (later, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(later, later)]);
+        assert_eq!(conn.finished, 1);
+        assert!(conn.resets[0].flight.pending);
+        let (retry, plain) = send_data(&mut conn);
+        assert!(retry > later);
+        assert_reset(&plain, 8, 0);
+        conn.on_timeout(conn.timeout().unwrap());
+        let (_, plain) = send_data(&mut conn);
+        assert_reset(&plain, 8, 0);
+        conn.on_timeout(conn.timeout().unwrap());
+        assert!(conn.resets[0].flight.pending);
+        // A delayed ACK for the first copy also cancels the queued probe.
+        acknowledge(&mut conn, Space::Data, &[(first, first)]);
+        assert_eq!(conn.finished, 2);
+        assert_eq!(conn.base_stream, 0);
+        assert!(conn.resets.is_empty());
+        assert!(conn.timeout().is_none());
+        assert!(!conn.wants_send());
+        acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
+        assert_eq!(conn.finished, 2);
+    }
+
+    #[test]
+    fn reset_recovery_respects_packet_room_and_original_error() {
+        let mut conn = credit_connection();
+        receive_stop(&mut conn, 8).unwrap();
+        conn.stop_sending(8, 0x1234);
+        let mut body = vec![frame::PING as u8];
+        conn.write_data(&mut body, 5, 10);
+        assert_eq!(body, [frame::PING as u8]);
+        assert!(conn.resets[0].flight.pending);
+        assert!(conn.resets[0].flight.sent_in.is_empty());
+        conn.write_data(&mut body, 6, 11);
+        assert_eq!(body.len(), 6);
+        assert_reset(&body, 8, 0);
+        assert_eq!(conn.resets[0].flight.sent_in, [11]);
+    }
+
+    #[test]
+    fn reset_accounting_fin_reset_order_and_late_data() {
+        for id in [8, 2] {
+            for reset_first in [false, true] {
+                let mut conn = connection();
+                conn.on_stream(id, 0, b"prefix", false).unwrap();
+                if reset_first {
+                    receive_reset(&mut conn, id, 64).unwrap();
+                }
+                conn.on_stream(id, 64, b"", true).unwrap();
+                receive_reset(&mut conn, id, 64).unwrap();
+                conn.on_stream(id, 32, b"late", false).unwrap();
+                assert_eq!(conn.data_seen, 64);
+                assert!(receive_reset(&mut conn, id, 63).is_err());
+                assert!(receive_reset(&mut conn, id, 65).is_err());
+                assert!(conn.on_stream(id, 64, b"beyond", false).is_err());
+                assert!(conn.on_stream(id, 32, b"", true).is_err());
+                assert_eq!(conn.data_seen, 64);
+                if reset_first || id == 2 {
+                    assert!(conn.ready.is_empty());
+                } else {
+                    assert_eq!(conn.ready, [8], "FIN queued an independent response");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reset_accounting_encrypted_replay_and_exact_credit() {
+        let mut conn = credit_connection();
+        let mut body = vec![0x04];
+        for value in [8, 0x10c, 64] {
+            put_varint(&mut body, value);
+        }
+        for pn in [10, 10, 11] {
+            conn.recv(&mut peer_data_packet(&conn, pn, &body)).unwrap();
+            assert_eq!(conn.data_seen, 64);
+            assert_eq!(conn.resets.len(), 1);
+            assert_eq!(conn.finished, 0);
+        }
+        let (pn, plain) = send_data(&mut conn);
+        assert_reset(&plain, 8, 0);
+        assert!(frame::Frames::new(&plain).any(|f| f.unwrap() == frame::Frame::MaxData(192)));
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 1);
+        conn.recv(&mut peer_data_packet(&conn, 12, &body)).unwrap();
+        assert_eq!(conn.data_seen, 64);
+        assert!(conn.resets.is_empty());
+    }
+
+    #[test]
+    fn reset_accounting_charges_missing_tail_once() {
+        let mut conn = connection();
+        conn.on_stream(8, 24, b"received", false).unwrap();
+        for _ in 0..3 {
+            receive_reset(&mut conn, 8, 128).unwrap();
+            assert_eq!(conn.data_seen, 128);
+            assert!(conn.ready.is_empty());
+            assert_eq!(conn.base_stream, 0, "lower unseen streams stay open");
+        }
+    }
+
+    #[test]
+    fn reset_accounting_before_any_data() {
+        let mut conn = connection();
+        receive_reset(&mut conn, 8, 128).unwrap();
+        conn.on_stream(8, 0, b"late", false).unwrap();
+        assert_eq!(conn.data_seen, 128);
+        assert!(conn.ready.is_empty());
+        assert_eq!(conn.base_stream, 0);
+    }
+
+    #[test]
+    fn reset_accounting_uni_final_size_and_duplicates() {
+        let mut conn = connection();
+        conn.on_stream(2, 24, b"received", false).unwrap();
+        for id in [2, 6, 2, 6] {
+            receive_reset(&mut conn, id, 128).unwrap();
+        }
+        conn.on_stream(2, 0, b"late", false).unwrap();
+        assert_eq!(conn.data_seen, 256);
+        assert_eq!(conn.finished, 0);
+        assert!(conn.ready.is_empty());
+    }
+
+    #[test]
+    fn reset_accounting_stop_retains_receive_direction() {
+        let mut conn = connection();
+        conn.on_stream(8, 0, b"received", false).unwrap();
+        receive_stop(&mut conn, 8).unwrap();
+        assert_eq!(conn.finished, 0, "receive side has no final size yet");
+        conn.on_stream(8, 56, b"received", false).unwrap();
+        assert_eq!(conn.data_seen, 64);
+        receive_reset(&mut conn, 8, 128).unwrap();
+        assert_eq!(conn.data_seen, 128);
+        assert!(conn.ready.is_empty());
+    }
+
+    #[test]
+    fn reset_accounting_preserves_independent_queued_response() {
+        let mut conn = connection();
+        conn.on_stream(8, 0, b"complete", true).unwrap();
+        receive_reset(&mut conn, 8, 8).unwrap();
+        assert_eq!(conn.ready, [8]);
+        assert_eq!(conn.finished, 0);
+    }
+
+    #[test]
+    fn reset_accounting_rejects_changed_or_smaller_final_size() {
+        for fin in [false, true] {
+            let mut conn = connection();
+            conn.on_stream(8, 56, b"received", fin).unwrap();
+            assert!(receive_reset(&mut conn, 8, 63).is_err());
+            if fin {
+                assert!(receive_reset(&mut conn, 8, 65).is_err());
+            }
+            assert_eq!(conn.data_seen, 64);
+        }
+    }
+
+    #[test]
+    fn reset_accounting_rejects_stream_byte_limit() {
+        for id in [0, 2] {
+            let mut conn = connection();
+            assert!(receive_reset(&mut conn, id, (1 << 24) + 1).is_err());
+            assert_eq!(conn.data_seen, 0);
+            assert_eq!(conn.finished, 0);
+        }
+    }
+
+    #[test]
+    fn reset_accounting_rejects_unadvertised_connection_bytes() {
+        let mut conn = connection();
+        conn.data_credit.told = 64;
+        receive_reset(&mut conn, 0, 32).unwrap();
+        assert!(receive_reset(&mut conn, 4, 33).is_err());
+        assert_eq!(conn.data_seen, 32);
     }
 
     fn acknowledge(conn: &mut Connection, space: Space, ranges: &[(u64, u64)]) {
@@ -2258,7 +2669,7 @@ mod tests {
     fn duplicate_data_ack_does_not_postpone_recovery() {
         let mut conn = connection();
         for id in [0, 4, 8] {
-            conn.on_stream(id, 0, b"request", true);
+            conn.on_stream(id, 0, b"request", true).unwrap();
         }
         conn.ready.clear();
         conn.unacked = vec![(10, 0), (11, 4), (12, 8)];
