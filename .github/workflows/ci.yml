@@ -50,3 +50,7 @@ jobs:
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC uni credit with epoll
         run: python benchmarks/uni-accounting-check.py target/release/hfast --epoll
+      - name: QUIC cancellation credit and reset recovery
+        run: python benchmarks/reset-accounting-check.py target/release/hfast
+      - name: QUIC cancellation credit with epoll
+        run: python benchmarks/reset-accounting-check.py target/release/hfast --epoll
