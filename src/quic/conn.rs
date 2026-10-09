@@ -165,6 +165,46 @@ impl ControlFlight {
     }
 }
 
+/// A monotonic credit limit. Only transmissions of the latest advertised
+/// value matter: acknowledging an obsolete value cannot deliver a newer one.
+struct Credit {
+    told: u64,
+    flight: ControlFlight,
+}
+
+impl Credit {
+    fn new(initial: u64) -> Self {
+        Self {
+            told: initial,
+            // The initial limit is delivered by the TLS transport parameters.
+            flight: ControlFlight {
+                sent_in: Vec::new(),
+                pending: false,
+            },
+        }
+    }
+
+    fn owed(&self, limit: u64, window: u64) -> bool {
+        self.flight.pending || limit.saturating_sub(self.told) >= (window / 2).max(1)
+    }
+
+    fn write(&mut self, body: &mut Vec<u8>, body_room: usize, pn: u64, kind: u64, limit: u64) {
+        let need = varint_len(kind) + varint_len(limit);
+        if body.len() + need > body_room {
+            return;
+        }
+        if limit > self.told {
+            // A probe carries the latest available credit, even if it has
+            // grown by less than half a window. Old ACKs no longer cover it.
+            self.told = limit;
+            self.flight.sent_in.clear();
+        }
+        put_varint(body, kind);
+        put_varint(body, self.told);
+        self.flight.sent(pn);
+    }
+}
+
 /// One packet number space: what has been sent in it and what has arrived
 #[derive(Default)]
 struct SpaceState {
@@ -268,9 +308,9 @@ pub struct Connection {
     control: ControlFlight,
     /// Requests finished, which is the credit the client gets back
     finished: u64,
-    /// The largest stream count and data limit told to the client
-    streams_told: u64,
-    data_told: u64,
+    /// The latest stream/data credit and its delivery state
+    streams_credit: Credit,
+    data_credit: Credit,
     /// Bytes the client has sent us across all streams
     data_seen: u64,
     max_streams_bidi: u64,
@@ -342,8 +382,8 @@ impl Connection {
             packet_body: Vec::new(),
             control: ControlFlight::new(),
             finished: 0,
-            streams_told: max_streams_bidi,
-            data_told: initial_max_data,
+            streams_credit: Credit::new(max_streams_bidi),
+            data_credit: Credit::new(initial_max_data),
             data_seen: 0,
             max_streams_bidi,
             initial_max_data,
@@ -366,7 +406,7 @@ impl Connection {
         let n = id >> 2;
         // The limit is an absolute stream count, independent of gaps and the
         // current table length. Only credit actually sent permits new ids.
-        if n >= self.streams_told {
+        if n >= self.streams_credit.told {
             return None;
         }
         let i = usize::try_from(n.checked_sub(self.base_stream)?).ok()?;
@@ -553,6 +593,11 @@ impl Connection {
                 if space == Space::Data {
                     progress |= self.control.on_ack(largest, first_range, rest);
                     progress |= self.handshake_done.on_ack(largest, first_range, rest);
+                    progress |= self
+                        .streams_credit
+                        .flight
+                        .on_ack(largest, first_range, rest);
+                    progress |= self.data_credit.flight.on_ack(largest, first_range, rest);
                     if !self.unacked.is_empty() {
                         progress |= self.on_ack(largest, first_range, rest);
                     }
@@ -743,8 +788,11 @@ impl Connection {
     /// a time keeps the client from ever waiting without saying so on every
     /// request.
     fn credit_owed(&self) -> bool {
-        self.streams_limit() >= self.streams_told + self.max_streams_bidi / 2
-            || self.data_limit() >= self.data_told + self.initial_max_data / 2
+        self.streams_credit
+            .owed(self.streams_limit(), self.max_streams_bidi)
+            || self
+                .data_credit
+                .owed(self.data_limit(), self.initial_max_data)
     }
 
     /// The 1-RTT payload: the control stream, credit, and answers
@@ -755,15 +803,24 @@ impl Connection {
             frame::put_stream(body, CONTROL_STREAM, 0, false, CONTROL_PRELUDE);
             self.control.sent(pn);
         }
-        if self.streams_limit() >= self.streams_told + self.max_streams_bidi / 2 {
-            self.streams_told = self.streams_limit();
-            put_varint(body, frame::MAX_STREAMS_BIDI);
-            put_varint(body, self.streams_told);
+        if self
+            .streams_credit
+            .owed(self.streams_limit(), self.max_streams_bidi)
+        {
+            self.streams_credit.write(
+                body,
+                body_room,
+                pn,
+                frame::MAX_STREAMS_BIDI,
+                self.streams_limit(),
+            );
         }
-        if self.data_limit() >= self.data_told + self.initial_max_data / 2 {
-            self.data_told = self.data_limit();
-            put_varint(body, frame::MAX_DATA);
-            put_varint(body, self.data_told);
+        if self
+            .data_credit
+            .owed(self.data_limit(), self.initial_max_data)
+        {
+            self.data_credit
+                .write(body, body_room, pn, frame::MAX_DATA, self.data_limit());
         }
         // Answers, as many as the packet holds. They go out newest first,
         // which costs nothing: every one of them is the same answer.
@@ -953,6 +1010,8 @@ impl Connection {
         }
         self.control.on_timeout();
         self.handshake_done.on_timeout();
+        self.streams_credit.flight.on_timeout();
+        self.data_credit.flight.on_timeout();
     }
 
     /// Forget a space: its keys are gone, so nothing in it can be sent or
@@ -975,7 +1034,9 @@ impl Connection {
             || (space == Space::Data
                 && (!self.unacked.is_empty()
                     || !self.control.sent_in.is_empty()
-                    || !self.handshake_done.sent_in.is_empty()))
+                    || !self.handshake_done.sent_in.is_empty()
+                    || !self.streams_credit.flight.sent_in.is_empty()
+                    || !self.data_credit.flight.sent_in.is_empty()))
     }
 
     /// An acknowledgement arrived: the timer either has nothing left to wait
@@ -1087,6 +1148,237 @@ mod tests {
         let (header, body) = packet.split_at_mut(pn_offset + pn_len);
         let plain = keys.packet.decrypt_in_place(pn, header, body).unwrap();
         (pn, plain.to_vec())
+    }
+
+    fn credit_connection() -> Connection {
+        let mut conn = data_connection();
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        conn.max_streams_bidi = 4;
+        conn.streams_credit.told = 4;
+        conn.initial_max_data = 128;
+        conn.data_credit.told = 128;
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+        conn
+    }
+
+    fn assert_credit(plain: &[u8], streams: Option<u64>, data: Option<u64>) {
+        let actual: Vec<_> = frame::Frames::new(plain)
+            .map(|f| f.unwrap())
+            .filter(|f| !matches!(f, frame::Frame::Padding))
+            .collect();
+        let mut expected = Vec::new();
+        if let Some(limit) = streams {
+            expected.push(frame::Frame::MaxStreams { bidi: true, limit });
+        }
+        if let Some(limit) = data {
+            expected.push(frame::Frame::MaxData(limit));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn credit_recovery_pto_repeats_until_acknowledged() {
+        let mut conn = credit_connection();
+        conn.finished = 2;
+        conn.data_seen = 64;
+        let (original, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(6), Some(192));
+        for attempt in 1..=3 {
+            conn.on_timeout(conn.timeout().unwrap());
+            assert_eq!(conn.pto_count, attempt);
+            assert!(conn.wants_send(), "lost credit must arm a probe");
+            let (_, plain) = send_data(&mut conn);
+            assert_credit(&plain, Some(6), Some(192));
+            assert_eq!((conn.finished, conn.data_seen), (2, 64));
+        }
+        // Even the original transmission's late ACK retires all its copies.
+        acknowledge(&mut conn, Space::Data, &[(original, original)]);
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+    }
+
+    #[test]
+    fn credit_recovery_sparse_ack_queues_loss_and_late_ack_cancels_probe() {
+        let mut conn = credit_connection();
+        conn.finished = 2;
+        conn.data_seen = 64;
+        let (original, _) = send_data(&mut conn);
+        let mut later = original;
+        for _ in 0..Connection::LOSS_THRESHOLD {
+            conn.path_response = Some([0; 8]);
+            later = send_data(&mut conn).0;
+        }
+        acknowledge(&mut conn, Space::Data, &[(later, later)]);
+        assert!(conn.wants_send(), "the gap is lost, not acknowledged");
+        assert!(conn.timeout().is_some());
+        acknowledge(&mut conn, Space::Data, &[(original, original)]);
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+    }
+
+    #[test]
+    fn credit_recovery_old_ack_cannot_retire_larger_limits() {
+        let mut conn = credit_connection();
+        conn.finished = 2;
+        conn.data_seen = 64;
+        let (old, _) = send_data(&mut conn);
+        conn.finished = 4;
+        conn.data_seen = 128;
+        let (new, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(8), Some(256));
+        acknowledge(&mut conn, Space::Data, &[(old, old)]);
+        assert!(conn.timeout().is_some(), "new limits still need delivery");
+        conn.on_timeout(conn.timeout().unwrap());
+        let deadline = conn.timeout();
+        acknowledge(&mut conn, Space::Data, &[(old, old)]);
+        assert_eq!(conn.pto_count, 1, "duplicate ACK is not progress");
+        assert_eq!(conn.timeout(), deadline);
+        let (_, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(8), Some(256));
+        acknowledge(&mut conn, Space::Data, &[(old, new)]);
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+        assert_eq!((conn.finished, conn.data_seen), (4, 128));
+    }
+
+    #[test]
+    fn credit_recovery_data_ack_keeps_stream_credit_in_flight() {
+        let mut conn = credit_connection();
+        conn.finished = 2;
+        let (streams, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(6), None);
+        conn.data_seen = 64;
+        let (data, plain) = send_data(&mut conn);
+        assert_credit(&plain, None, Some(192));
+        acknowledge(&mut conn, Space::Data, &[(data, data)]);
+        assert!(conn.timeout().is_some());
+        conn.on_timeout(conn.timeout().unwrap());
+        let (_, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(6), None);
+        acknowledge(&mut conn, Space::Data, &[(streams, streams)]);
+        assert!(conn.timeout().is_none());
+        assert!(!conn.wants_send());
+    }
+
+    #[test]
+    fn credit_recovery_waits_for_packet_room() {
+        let mut conn = credit_connection();
+        conn.finished = 2;
+        conn.data_seen = 64;
+        let mut body = Vec::new();
+        conn.write_data(&mut body, 1, 1);
+        assert!(body.is_empty());
+        assert_eq!((conn.streams_credit.told, conn.data_credit.told), (4, 128));
+        conn.write_data(&mut body, 2, 1);
+        assert_credit(&body, Some(6), None);
+        assert_eq!(conn.data_credit.told, 128);
+        body.clear();
+        conn.write_data(&mut body, 3, 2);
+        assert_credit(&body, None, Some(192));
+        assert!(!conn.credit_owed());
+    }
+
+    #[test]
+    fn credit_recovery_zero_and_one_windows_do_not_send_unchanged_limits() {
+        for window in [0, 1] {
+            let mut conn = credit_connection();
+            conn.max_streams_bidi = window;
+            conn.streams_credit.told = window;
+            conn.initial_max_data = window;
+            conn.data_credit.told = window;
+            assert!(!conn.wants_send(), "no new credit exists");
+            let mut out = Vec::new();
+            assert!(!conn.poll_transmit(&mut out).unwrap());
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn credit_recovery_probe_refreshes_limits_below_update_threshold() {
+        let mut conn = credit_connection();
+        conn.finished = 2;
+        conn.data_seen = 64;
+        let (old, _) = send_data(&mut conn);
+        conn.finished += 1;
+        conn.data_seen += 1;
+        assert!(!conn.wants_send());
+        conn.on_timeout(conn.timeout().unwrap());
+        let (new, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(7), Some(193));
+        acknowledge(&mut conn, Space::Data, &[(old, old)]);
+        assert!(conn.timeout().is_some());
+        conn.on_timeout(conn.timeout().unwrap());
+        let (_, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(7), Some(193));
+        acknowledge(&mut conn, Space::Data, &[(new, new)]);
+        assert!(conn.timeout().is_none());
+        assert!(!conn.wants_send());
+    }
+
+    #[test]
+    fn credit_recovery_old_ack_keeps_unsent_increase_owed() {
+        let mut conn = credit_connection();
+        conn.finished = 2;
+        conn.data_seen = 64;
+        let (old, _) = send_data(&mut conn);
+        conn.finished = 4;
+        conn.data_seen = 128;
+        // A full packet cannot advertise or supersede the old limits.
+        let mut body = vec![0; 10];
+        conn.write_data(&mut body, 10, old + 1);
+        assert_eq!(body, [0; 10]);
+        assert_eq!((conn.streams_credit.told, conn.data_credit.told), (6, 192));
+        acknowledge(&mut conn, Space::Data, &[(old, old)]);
+        assert!(conn.timeout().is_none());
+        assert!(conn.wants_send());
+        let (new, plain) = send_data(&mut conn);
+        assert_credit(&plain, Some(8), Some(256));
+        acknowledge(&mut conn, Space::Data, &[(new, new)]);
+        assert!(!conn.wants_send());
+        assert!(conn.timeout().is_none());
+    }
+
+    #[test]
+    fn credit_recovery_requests_progress_without_duplicate_credit() {
+        let mut conn = credit_connection();
+        let request = [0; 64];
+        for n in 0..12 {
+            let id = n * 4;
+            conn.on_stream(id, 0, &request, true);
+            let (original, _) = send_data(&mut conn);
+            conn.on_timeout(conn.timeout().unwrap());
+            let (retry, plain) = send_data(&mut conn);
+            let frames = frame::Frames::new(&plain)
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert!(frames.contains(&frame::Frame::MaxData(128 + (n + 1) * 64)));
+            assert!(frames.contains(&frame::Frame::Stream {
+                id,
+                offset: 0,
+                data: RESPONSE,
+                fin: true,
+            }));
+            acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
+            acknowledge(&mut conn, Space::Data, &[(original, retry)]);
+            conn.on_stream(id, 0, &request, true);
+            assert_eq!(conn.finished, n + 1);
+            assert_eq!(conn.data_seen, (n + 1) * 64);
+            assert!(conn.ready.is_empty());
+            if (n + 1) % 2 == 0 {
+                let (pn, plain) = send_data(&mut conn);
+                assert_credit(&plain, Some(4 + n + 1), None);
+                conn.on_timeout(conn.timeout().unwrap());
+                let (_, plain) = send_data(&mut conn);
+                assert_credit(&plain, Some(4 + n + 1), None);
+                acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+            }
+            assert!(!conn.wants_send());
+            assert!(conn.timeout().is_none());
+        }
+        assert_eq!(conn.base_stream, 12);
+        assert_eq!(conn.data_seen, 768);
     }
 
     fn assert_control(plain: &[u8]) {
@@ -1551,7 +1843,7 @@ mod tests {
         let (pn, _) = send_data(&mut conn);
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         assert_eq!(conn.streams_limit(), 96);
-        assert_eq!(conn.streams_told, 64);
+        assert_eq!(conn.streams_credit.told, 64);
         conn.on_stream(256, 0, b"over limit", true);
         assert!(conn.ready.is_empty());
         let (_, plain) = send_data(&mut conn);

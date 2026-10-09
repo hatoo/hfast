@@ -42,3 +42,7 @@ jobs:
         run: python benchmarks/stream-recovery-check.py target/release/hfast
       - name: QUIC request recovery with epoll
         run: python benchmarks/stream-recovery-check.py target/release/hfast --epoll
+      - name: QUIC credit recovery with repeated packet loss
+        run: python benchmarks/credit-recovery-check.py target/release/hfast
+      - name: QUIC credit recovery with epoll
+        run: python benchmarks/credit-recovery-check.py target/release/hfast --epoll
