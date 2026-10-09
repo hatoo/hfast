@@ -8,7 +8,7 @@
 /// tells this server it is not talking HTTP/1.1
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-const FRAME_HEADER_LEN: usize = 9;
+pub(crate) const FRAME_HEADER_LEN: usize = 9;
 
 const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;

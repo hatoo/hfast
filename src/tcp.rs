@@ -125,24 +125,62 @@ fn accept_batch(ring: &mut io_uring::IoUring, lfd: RawFd, conns: &mut Vec<Option
     }
 }
 
-fn consume(conn: &mut Conn, data: &[u8]) -> bool {
-    if conn.inbuf.is_empty() {
-        let Some(used) = conn.drive(data) else {
-            return false;
-        };
-        if used < data.len() {
-            conn.inbuf.extend_from_slice(&data[used..]);
+fn consume(conn: &mut Conn, mut data: &[u8]) -> bool {
+    if !conn.inbuf.is_empty() {
+        if matches!(conn.proto, Proto::H2(_)) {
+            // Only the first frame needs assembly. Complete its header before
+            // deciding how much payload to copy; later frames can use `data`
+            // directly, without growing or shifting the carry buffer.
+            if conn.inbuf.len() < h2::FRAME_HEADER_LEN {
+                let n = (h2::FRAME_HEADER_LEN - conn.inbuf.len()).min(data.len());
+                conn.inbuf.extend_from_slice(&data[..n]);
+                data = &data[n..];
+                if conn.inbuf.len() < h2::FRAME_HEADER_LEN {
+                    return true;
+                }
+            }
+            let end = h2::FRAME_HEADER_LEN
+                + u32::from_be_bytes([0, conn.inbuf[0], conn.inbuf[1], conn.inbuf[2]]) as usize;
+            let n = (end - conn.inbuf.len()).min(data.len());
+            conn.inbuf.extend_from_slice(&data[..n]);
+            data = &data[n..];
+            if conn.inbuf.len() < end {
+                return true;
+            }
+            let buf = std::mem::take(&mut conn.inbuf);
+            let used = conn.drive(&buf);
+            conn.inbuf = buf;
+            if used.is_none() {
+                return false;
+            }
+            conn.inbuf.clear();
+            if data.is_empty() {
+                return true;
+            }
+        } else {
+            // Protocol detection and HTTP/1 requests still need their entire
+            // undecided prefix, rather than a known HTTP/2 frame boundary.
+            return consume_buffered(conn, data);
         }
-    } else {
-        let mut buf = std::mem::take(&mut conn.inbuf);
-        buf.extend_from_slice(data);
-        let used = conn.drive(&buf);
-        conn.inbuf = buf;
-        match used {
-            Some(used) => conn.inbuf.drain(..used),
-            None => return false,
-        };
     }
+    let Some(used) = conn.drive(data) else {
+        return false;
+    };
+    if used < data.len() {
+        conn.inbuf.extend_from_slice(&data[used..]);
+    }
+    true
+}
+
+fn consume_buffered(conn: &mut Conn, data: &[u8]) -> bool {
+    let mut buf = std::mem::take(&mut conn.inbuf);
+    buf.extend_from_slice(data);
+    let used = conn.drive(&buf);
+    conn.inbuf = buf;
+    match used {
+        Some(used) => conn.inbuf.drain(..used),
+        None => return false,
+    };
     true
 }
 
@@ -338,6 +376,9 @@ fn wait_batch(
 
 #[cfg(test)]
 mod h2_continuation_tests;
+
+#[cfg(test)]
+mod h2_carry_tests;
 
 #[cfg(test)]
 mod tests {

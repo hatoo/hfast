@@ -99,11 +99,11 @@ class Peer:
             wire += self.client.data_to_send()
         return stream, wire
 
-    def exchange(self, wire, expected):
+    def exchange(self, wire, expected, trailing=b""):
         self.barrier += 1
         token = self.barrier.to_bytes(8, "big")
         self.client.ping(token)
-        send(self.sock, wire + self.client.data_to_send(), self.fragmented)
+        send(self.sock, wire + self.client.data_to_send() + trailing, self.fragmented)
         bodies = {stream: bytearray() for stream in expected}
         responses, ended = [], []
         ack = False
@@ -187,6 +187,34 @@ def abandoned_connection(port):
         replacement.close()
 
 
+def carried_batches(port, fragmented):
+    # Leave a partial large request after the processing barrier, then finish
+    # it in a receive containing many ordinary requests. The next PING proves
+    # the full batch was processed; native tests exhaust actual receive splits.
+    peer = Peer(port, fragmented)
+    pending = b""
+    pending_stream = None
+    try:
+        # Finish the SETTINGS exchange before leaving partial request bytes on
+        # the wire, so its ACK cannot be inserted inside a carried frame.
+        peer.exchange(b"", [])
+        for split in [1, 8, 9, 53, 16384]:
+            requests = [peer.request(False, False) for _ in range(256)]
+            expected = ([pending_stream] if pending_stream is not None else [])
+            expected += [stream for stream, _ in requests]
+            wire = pending + b"".join(data for _, data in requests)
+            stream, large = peer.request(False, True, empty_fragments=True)
+            assert split < len(large)
+            peer.exchange(wire, expected, trailing=large[:split])
+            pending_stream, pending = stream, large[split:]
+        peer.exchange(pending, [pending_stream])
+        peer.exchange(b"", [])
+        return {"carried_batches": True, "fragmented": fragmented,
+                "responses": peer.responses, "continuations": peer.continuations}
+    finally:
+        peer.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -211,6 +239,8 @@ def main():
             results = [check(port, post, fragmented)
                        for fragmented in [False, True] for post in [False, True]]
             results.extend(abandoned_connection(port) for _ in range(4))
+            results.extend(carried_batches(port, fragmented)
+                           for fragmented in [False, True])
             print(json.dumps(results, indent=2))
         finally:
             server.terminate()
