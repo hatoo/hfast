@@ -43,6 +43,16 @@ struct Request {
     answered: bool,
 }
 
+/// A higher stream opens the lower slots too, but their request data may still
+/// be in flight. Only a completed slot can be retired or ignore duplicates.
+#[derive(Default)]
+enum StreamSlot {
+    #[default]
+    Unseen,
+    Active(Request),
+    Complete,
+}
+
 /// Room a packet's header and tag need before any payload fits
 const PACKET_OVERHEAD: usize = 1 + 4 + 1 + ConnectionId::MAX + 1 + ConnectionId::MAX + 1 + 4 + 4;
 
@@ -243,7 +253,7 @@ pub struct Connection {
     /// Client bidirectional streams, which requests are, indexed by number
     /// from `base_stream`. A stream id says where its stream is, so nothing is
     /// searched for.
-    streams: Vec<Option<Request>>,
+    streams: Vec<StreamSlot>,
     base_stream: u64,
     /// Streams whose answer is written but not yet in a packet
     ready: Vec<u64>,
@@ -349,20 +359,32 @@ impl Connection {
     ///
     /// Client bidirectional streams are 0, 4, 8 (RFC 9000 Section 2.1), so the
     /// id says which slot without anything being searched for.
-    fn stream_mut(&mut self, id: u64) -> Option<&mut Request> {
+    fn stream_slot_mut(&mut self, id: u64) -> Option<&mut StreamSlot> {
         if id & 3 != 0 {
             return None;
         }
         let n = id >> 2;
-        let i = usize::try_from(n.checked_sub(self.base_stream)?).ok()?;
-        // A client that opens more than it was allowed is not answered
-        if i >= self.max_streams_bidi as usize + self.streams.len() {
+        // The limit is an absolute stream count, independent of gaps and the
+        // current table length. Only credit actually sent permits new ids.
+        if n >= self.streams_told {
             return None;
         }
+        let i = usize::try_from(n.checked_sub(self.base_stream)?).ok()?;
         if i >= self.streams.len() {
-            self.streams.resize_with(i + 1, || None);
+            self.streams.resize_with(i + 1, StreamSlot::default);
         }
-        Some(self.streams[i].get_or_insert_with(Request::default))
+        Some(&mut self.streams[i])
+    }
+
+    fn stream_mut(&mut self, id: u64) -> Option<&mut Request> {
+        let slot = self.stream_slot_mut(id)?;
+        if matches!(slot, StreamSlot::Unseen) {
+            *slot = StreamSlot::Active(Request::default());
+        }
+        match slot {
+            StreamSlot::Active(req) => Some(req),
+            _ => None,
+        }
     }
 
     /// Forget the streams at the front that have been answered and
@@ -371,7 +393,7 @@ impl Connection {
         let n = self
             .streams
             .iter()
-            .position(|s| s.is_some())
+            .position(|s| !matches!(s, StreamSlot::Complete))
             .unwrap_or(self.streams.len());
         if n > 0 {
             // Counted first and shifted once: taking them off the front one at
@@ -556,14 +578,17 @@ impl Connection {
             } => self.on_stream(id, offset, data, fin),
             // A client that gives up on a stream is answered by forgetting it
             frame::Frame::StopSending { id } | frame::Frame::ResetStream { id } => {
-                if let Some(i) = (id >> 2)
-                    .checked_sub(self.base_stream)
-                    .and_then(|n| usize::try_from(n).ok())
-                    && i < self.streams.len()
+                if let Some(slot) = self.stream_slot_mut(id)
+                    && !matches!(slot, StreamSlot::Complete)
                 {
-                    self.streams[i] = None;
+                    *slot = StreamSlot::Complete;
                     self.finished += 1;
+                    self.ready.retain(|&stream| stream != id);
+                    self.unacked.retain(|&(_, stream)| stream != id);
                     self.retire();
+                    if !self.in_flight(Space::Data) {
+                        self.spaces[Space::Data as usize].oldest_sent = None;
+                    }
                 }
             }
         }
@@ -576,12 +601,17 @@ impl Connection {
     /// to answer on, and its end is what says to answer at all; nothing in it
     /// changes the answer, so nothing in it is put back together.
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) {
-        let end = offset + data.len() as u64;
-        let Some(req) = self.stream_mut(id) else {
+        if id & 3 == 2 {
             // The client's control and QPACK streams. They have to be counted
             // against the connection's flow control and read no further:
             // neither side may insert into a table both said has no room.
             self.data_seen += data.len() as u64;
+            return;
+        }
+        let end = offset + data.len() as u64;
+        let Some(req) = self.stream_mut(id) else {
+            // Completed requests, invalid stream types and ungranted ids do
+            // not reopen a request or replenish its connection credit.
             return;
         };
         let fresh = end.saturating_sub(req.size);
@@ -628,8 +658,9 @@ impl Connection {
                 .checked_sub(base)
                 .and_then(|n| usize::try_from(n).ok())
                 && i < streams.len()
+                && matches!(streams[i], StreamSlot::Active(_))
             {
-                streams[i] = None;
+                streams[i] = StreamSlot::Complete;
                 finished += 1;
                 retired = true;
             }
@@ -1312,6 +1343,228 @@ mod tests {
         assert!(conn.unacked.is_empty());
         assert!(conn.streams.is_empty());
         assert_eq!(conn.finished, 3);
+    }
+
+    #[test]
+    fn stream_lifecycle_delayed_lower_request_survives_higher_ack() {
+        let mut conn = data_connection();
+        conn.on_stream(8, 0, b"higher", true);
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 1);
+        assert_eq!(conn.base_stream, 0, "unseen lower streams are still open");
+        for id in [4, 0] {
+            conn.on_stream(id, 0, b"delayed", true);
+            let (pn, plain) = send_data(&mut conn);
+            assert!(frame::Frames::new(&plain).any(|f| matches!(
+                f.unwrap(), frame::Frame::Stream { id: got, fin: true, data: RESPONSE, .. } if got == id
+            )));
+            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        }
+        assert_eq!(conn.finished, 3);
+        assert_eq!(conn.base_stream, 3);
+        assert!(conn.streams.is_empty());
+    }
+
+    #[test]
+    fn stream_lifecycle_completed_slot_cannot_reopen() {
+        let mut conn = data_connection();
+        conn.on_stream(0, 0, b"unfinished", false);
+        conn.on_stream(4, 0, b"complete", true);
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        let seen = conn.data_seen;
+        conn.on_stream(4, 0, b"complete", true);
+        assert!(
+            conn.ready.is_empty(),
+            "duplicate must not queue another response"
+        );
+        assert_eq!(conn.data_seen, seen);
+        assert_eq!(conn.finished, 1);
+    }
+
+    #[test]
+    fn stream_lifecycle_retired_duplicate_does_not_grant_data_credit() {
+        let mut conn = data_connection();
+        conn.on_stream(0, 0, b"complete", true);
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        let seen = conn.data_seen;
+        conn.on_stream(0, 0, b"complete", true);
+        assert_eq!(conn.data_seen, seen);
+        assert_eq!(conn.finished, 1);
+        assert!(conn.ready.is_empty());
+    }
+
+    #[test]
+    fn stream_lifecycle_cancellation_is_idempotent_and_clears_queued_response() {
+        let mut conn = connection();
+        conn.on_stream(0, 0, b"unfinished", false);
+        conn.on_stream(4, 0, b"cancel", true);
+        for f in [
+            frame::Frame::StopSending { id: 4 },
+            frame::Frame::ResetStream { id: 4 },
+            frame::Frame::StopSending { id: 4 },
+        ] {
+            conn.on_frame(&f, Space::Data).unwrap();
+            assert_eq!(conn.finished, 1);
+            assert!(conn.ready.is_empty());
+        }
+        conn.on_stream(4, 0, b"cancel", true);
+        assert!(conn.ready.is_empty());
+        assert_eq!(conn.data_seen, 16);
+    }
+
+    #[test]
+    fn stream_lifecycle_other_stream_types_cannot_cancel_requests() {
+        let mut conn = connection();
+        conn.on_stream(0, 0, b"unfinished", false);
+        for id in [1, 2, 3] {
+            conn.on_frame(&frame::Frame::StopSending { id }, Space::Data)
+                .unwrap();
+            conn.on_frame(&frame::Frame::ResetStream { id }, Space::Data)
+                .unwrap();
+        }
+        assert_eq!(conn.finished, 0);
+        conn.on_stream(0, 10, b"end", true);
+        assert_eq!(conn.ready, [0]);
+        assert_eq!(conn.data_seen, 13);
+    }
+
+    #[test]
+    fn stream_lifecycle_uses_advertised_absolute_stream_limit() {
+        let mut conn = connection();
+        conn.on_stream(252, 0, b"allowed", true);
+        conn.on_stream(256, 0, b"over limit", true);
+        assert_eq!(conn.ready, [252]);
+        assert_eq!(conn.data_seen, 7);
+        assert_eq!(conn.streams.len(), 64);
+    }
+
+    #[test]
+    fn stream_lifecycle_cancel_before_request_keeps_lower_slots_open() {
+        let mut conn = connection();
+        for f in [
+            frame::Frame::ResetStream { id: 8 },
+            frame::Frame::StopSending { id: 8 },
+        ] {
+            conn.on_frame(&f, Space::Data).unwrap();
+            assert_eq!(conn.finished, 1);
+            assert_eq!(conn.base_stream, 0);
+        }
+        conn.on_stream(8, 0, b"cancelled", true);
+        assert!(conn.ready.is_empty());
+        assert_eq!(conn.data_seen, 0);
+        for id in [4, 0] {
+            conn.on_frame(&frame::Frame::ResetStream { id }, Space::Data)
+                .unwrap();
+        }
+        assert_eq!(conn.finished, 3);
+        assert_eq!(conn.base_stream, 3);
+        assert!(conn.streams.is_empty());
+        conn.on_frame(&frame::Frame::ResetStream { id: 8 }, Space::Data)
+            .unwrap();
+        assert_eq!(conn.finished, 3);
+    }
+
+    #[test]
+    fn stream_lifecycle_cancel_in_flight_ignores_late_ack_and_pto() {
+        let mut conn = data_connection();
+        conn.on_stream(0, 0, b"unfinished", false);
+        conn.on_stream(4, 0, b"cancel", true);
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        // Keep controls acknowledged, then send a separate cancellable reply.
+        conn.on_stream(8, 0, b"cancel", true);
+        let (pn, _) = send_data(&mut conn);
+        let timeout = conn.timeout().unwrap();
+        conn.on_frame(&frame::Frame::StopSending { id: 8 }, Space::Data)
+            .unwrap();
+        assert_eq!(conn.finished, 2);
+        assert!(conn.unacked.is_empty());
+        assert!(conn.timeout().is_none());
+        conn.on_timeout(timeout);
+        assert!(conn.ready.is_empty());
+        for _ in 0..2 {
+            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+            assert_eq!(conn.finished, 2);
+        }
+        conn.on_stream(0, 10, b"end", true);
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 3);
+        assert_eq!(conn.base_stream, 3);
+    }
+
+    #[test]
+    fn stream_lifecycle_cancel_preserves_other_response_recovery() {
+        let mut conn = data_connection();
+        conn.on_stream(0, 0, b"keep", true);
+        let (first, _) = send_data(&mut conn);
+        conn.on_stream(4, 0, b"cancel", true);
+        send_data(&mut conn);
+        conn.on_frame(&frame::Frame::ResetStream { id: 4 }, Space::Data)
+            .unwrap();
+        assert_eq!(conn.unacked, [(first, 0)]);
+        conn.on_timeout(conn.timeout().unwrap());
+        assert_eq!(conn.ready, [0]);
+        let (retry, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(retry, retry)]);
+        assert_eq!(conn.finished, 2);
+        assert_eq!(conn.base_stream, 2);
+        assert!(conn.timeout().is_none());
+    }
+
+    #[test]
+    fn stream_lifecycle_sparse_ack_and_retransmission_keep_unseen_gap() {
+        let mut conn = data_connection();
+        for id in [8, 16] {
+            conn.on_stream(id, 0, b"request", true);
+            send_data(&mut conn);
+        }
+        acknowledge(&mut conn, Space::Data, &[(1, 1)]);
+        assert_eq!(conn.finished, 1);
+        assert_eq!(conn.base_stream, 0);
+        conn.on_timeout(conn.timeout().unwrap());
+        assert_eq!(conn.ready, [8]);
+        let (retry, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(retry, retry), (0, 0)]);
+        acknowledge(&mut conn, Space::Data, &[(retry, retry), (0, 0)]);
+        assert_eq!(conn.finished, 2);
+        for id in [12, 0, 4] {
+            conn.on_stream(id, 0, b"delayed", true);
+            let (pn, _) = send_data(&mut conn);
+            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        }
+        assert_eq!(conn.finished, 5);
+        assert_eq!(conn.base_stream, 5);
+        assert_eq!(conn.data_seen, 35);
+        assert!(conn.streams.is_empty());
+    }
+
+    #[test]
+    fn stream_lifecycle_new_ids_wait_for_advertised_credit() {
+        let mut conn = data_connection();
+        for id in (0..32).map(|n| n * 4) {
+            conn.on_stream(id, 0, b"request", true);
+        }
+        let (pn, _) = send_data(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.streams_limit(), 96);
+        assert_eq!(conn.streams_told, 64);
+        conn.on_stream(256, 0, b"over limit", true);
+        assert!(conn.ready.is_empty());
+        let (_, plain) = send_data(&mut conn);
+        assert!(frame::Frames::new(&plain).any(|f| matches!(
+            f.unwrap(),
+            frame::Frame::MaxStreams {
+                bidi: true,
+                limit: 96
+            }
+        )));
+        conn.on_stream(256, 0, b"allowed", true);
+        assert_eq!(conn.ready, [256]);
+        assert_eq!(conn.data_seen, 32 * 7 + 7);
     }
 
     fn acknowledge(conn: &mut Connection, space: Space, ranges: &[(u64, u64)]) {
