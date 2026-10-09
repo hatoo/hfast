@@ -31,3 +31,5 @@ jobs:
         run: python benchmarks/interoperability.py target/release/hfast
       - name: Protocol interoperability with epoll
         run: python benchmarks/interoperability.py target/release/hfast --epoll
+      - name: QUIC handshake recovery with sparse ACKs
+        run: python benchmarks/crypto-recovery-check.py target/release/hfast
