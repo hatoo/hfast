@@ -16,15 +16,7 @@ use super::wire::{
 };
 use super::{MAX_DATAGRAM, TAG_LEN, assemble::Assembler, frame, transport};
 
-/// Stream type 0 (control) and an empty SETTINGS frame, which RFC 9114
-/// Sections 6.2 and 7.2.4 require to be the first thing a server says. It has
-/// nothing to say in it.
-const CONTROL_PRELUDE: &[u8] = b"\x00\x04\x00";
-
-/// The one answer this server gives, framed for HTTP/3: a HEADERS frame
-/// carrying a QPACK field section against the static table only, then a DATA
-/// frame carrying the body. See `h3.rs` for what each byte is.
-const RESPONSE: &[u8] = b"\x01\x08\x00\x00\xd9\xf5\x54\x02\x31\x33\x00\x0dHello, World!";
+use crate::h3::{CONTROL_PRELUDE, RESPONSE};
 
 /// The uni stream this server opens for its control stream. Server-initiated
 /// unidirectional streams are 3, 7, 11 (RFC 9000 Section 2.1) and this opens
