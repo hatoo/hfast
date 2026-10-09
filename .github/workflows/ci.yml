@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test with overflow checks
+        run: cargo test --locked
+      - name: Test optimized code
+        run: cargo test --release --locked
+      - name: Build server
+        run: cargo build --release --locked
+      - name: Install independent protocol clients
+        run: python -m pip install -r benchmarks/interop-requirements.txt
+      - name: Protocol interoperability
+        run: python benchmarks/interoperability.py target/release/hfast
+      - name: Protocol interoperability with epoll
+        run: python benchmarks/interoperability.py target/release/hfast --epoll

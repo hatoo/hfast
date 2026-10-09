@@ -125,6 +125,11 @@ The receive batch size follows the number of datagrams available on the previous
 receive. With at most one connection, receiving also uses the single-datagram path.
 Receive storage is 2 MiB per QUIC worker so large incoming datagrams still fit.
 
+Adjacent outgoing datagrams for one peer share a `UDP_SEGMENT` message when
+their lengths permit it. Scatter/gather preserves each payload, including a
+shorter final datagram, without padding or waiting. Unsupported paths retry
+only the unsent datagrams normally. See the [segmentation measurements](benchmarks/udp-segmentation.md).
+
 Within each receive batch, all datagrams are processed before building response
 packets, once per connection. This combines their ACKs and packs more answers
 into each encrypted packet, including when peers interleave their datagrams.
