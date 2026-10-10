@@ -54,7 +54,14 @@ impl Peer {
 }
 
 fn pair(finish: bool) -> (Connection, Peer, Vec<u8>) {
-    let (mut conn, mut client) = connection_and_client();
+    pair_with_suite(finish, None)
+}
+
+fn pair_with_suite(
+    finish: bool,
+    suite: Option<rustls::SupportedCipherSuite>,
+) -> (Connection, Peer, Vec<u8>) {
+    let (mut conn, mut client) = connection_and_client_with_suite(suite);
     let mut bytes = Vec::new();
     assert!(client.write_hs(&mut bytes).is_none());
     conn.tls.read_hs(&bytes).unwrap();
@@ -338,4 +345,101 @@ fn authentication_failure_limit_survives_key_updates() {
     conn.recv(&mut bad.clone()).unwrap();
     assert!(conn.recv(&mut bad).is_err());
     assert_eq!(conn.key_updates.as_ref().unwrap().failed_decryptions, limit);
+}
+
+fn cipher_suites() -> [rustls::SupportedCipherSuite; 3] {
+    use rustls::crypto::ring::cipher_suite::*;
+    [
+        TLS13_AES_128_GCM_SHA256,
+        TLS13_AES_256_GCM_SHA384,
+        TLS13_CHACHA20_POLY1305_SHA256,
+    ]
+}
+
+fn ciphertext(key: &dyn PacketKey, pn: u64) -> Vec<u8> {
+    let mut payload = b"generation equivalence".to_vec();
+    let tag = key.encrypt_in_place(pn, b"header", &mut payload).unwrap();
+    payload.extend_from_slice(tag.as_ref());
+    payload
+}
+
+#[test]
+fn deferred_send_keys_match_eager_ciphertext_for_every_generation_and_cipher() {
+    for suite in cipher_suites() {
+        let (conn, _, _) = pair_with_suite(true, Some(suite));
+        assert_eq!(conn.tls.negotiated_cipher_suite().unwrap(), suite);
+        let mut reference = conn.key_updates.as_ref().unwrap().secrets.clone();
+        let mut updates = KeyUpdates::new(reference.clone());
+        for generation in 1..=16 {
+            let expected = reference.next_packet_keys();
+            assert_eq!(
+                ciphertext(updates.next_remote.as_ref(), generation),
+                ciphertext(expected.remote.as_ref(), generation)
+            );
+            let prepared = std::ptr::from_ref(updates.next_remote.as_ref());
+            let actual = updates.advance();
+            assert!(std::ptr::addr_eq(prepared, actual.remote.as_ref()));
+            assert_eq!(
+                ciphertext(actual.local.as_ref(), generation),
+                ciphertext(expected.local.as_ref(), generation)
+            );
+            assert_eq!(
+                ciphertext(actual.remote.as_ref(), generation),
+                ciphertext(expected.remote.as_ref(), generation)
+            );
+        }
+    }
+}
+
+#[test]
+fn forgeries_allocate_nothing_and_authenticated_updates_retain_bounded_keys() {
+    use crate::test_alloc::{Counts, measure};
+    for suite in cipher_suites() {
+        let (mut conn, mut peer, _) = pair_with_suite(true, Some(suite));
+        // Establish the ACK range outside allocation measurement.
+        conn.recv(&mut peer.packet(&conn, 1, &[1])).unwrap();
+        let key_size = std::mem::size_of_val(peer.keys.local.packet.as_ref()) as isize;
+        for generation in 1..=12 {
+            peer.update();
+            let pn = generation + 1;
+            let valid = peer.packet(&conn, pn, &[1]);
+            let mut forged = valid.clone();
+            *forged.last_mut().unwrap() ^= 1;
+            let expected = snapshot(&conn);
+            let prepared =
+                std::ptr::from_ref(conn.key_updates.as_ref().unwrap().next_remote.as_ref());
+            let (_, counts) = measure(|| conn.recv(&mut forged).unwrap());
+            assert_eq!(counts, Counts::default());
+            assert_eq!(snapshot(&conn), expected);
+            assert!(std::ptr::addr_eq(
+                prepared,
+                conn.key_updates.as_ref().unwrap().next_remote.as_ref()
+            ));
+            let mut valid = valid;
+            let (_, counts) = measure(|| conn.recv(&mut valid).unwrap());
+            // Only the first update adds a retained previous key. Subsequent
+            // updates replace it, regardless of how often the phase bit wraps.
+            assert_eq!(counts.live, if generation == 1 { key_size } else { 0 });
+            assert!(std::ptr::addr_eq(
+                prepared,
+                conn.one_rtt_remote.as_ref().unwrap().packet.as_ref()
+            ));
+            assert_eq!(conn.spaces[2].ack.ranges, [(1, u64::from(pn))]);
+            let mut wrong_phase = peer.packet(&conn, pn + 1, &[1]);
+            wrong_phase[0] ^= 4;
+            let expected = snapshot(&conn);
+            let (_, counts) = measure(|| conn.recv(&mut wrong_phase).unwrap());
+            assert_eq!(counts, Counts::default());
+            assert_eq!(snapshot(&conn), expected);
+        }
+        // Even an authenticated transition must pass generation ordering
+        // before deriving or replacing any keys.
+        peer.update();
+        let mut backwards = peer.packet(&conn, 13, &[1]);
+        let expected = snapshot(&conn);
+        let (result, counts) = measure(|| conn.recv(&mut backwards));
+        assert!(result.is_err());
+        assert_eq!(counts, Counts::default());
+        assert_eq!(snapshot(&conn), expected);
+    }
 }

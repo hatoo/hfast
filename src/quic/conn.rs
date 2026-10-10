@@ -281,8 +281,10 @@ impl SpaceState {
 /// Packet keys rotate together; header protection keys never change (RFC 9001
 /// Section 6). Retained secrets and extra keys live outside the inline stream state.
 struct KeyUpdates {
+    /// Secrets for the same generation as next_remote. Advance only after
+    /// that generation authenticates; a clone prepares the receive key.
     secrets: Secrets,
-    next: PacketKeySet,
+    next_remote: Box<dyn PacketKey>,
     previous: Option<(Box<dyn PacketKey>, Instant)>,
     phase: bool,
     /// Lowest authenticated packet number in the current generation.
@@ -293,18 +295,32 @@ struct KeyUpdates {
 }
 
 impl KeyUpdates {
-    fn new(mut secrets: Secrets) -> Self {
-        // Preparing these here avoids deriving keys in response to forgery.
-        let next = secrets.next_packet_keys();
+    fn new(secrets: Secrets) -> Self {
+        // rustls derives both directions together. Retain only the receive
+        // key: the send key is unused until a peer update authenticates.
+        // Preparing this here avoids deriving keys in response to forgery.
+        let next_remote = secrets.clone().next_packet_keys().remote;
         Self {
             secrets,
-            next,
+            next_remote,
             previous: None,
             phase: false,
             first: None,
             previous_largest: None,
             failed_decryptions: 0,
         }
+    }
+
+    /// Called only after authenticating next_remote and checking packet order.
+    fn advance(&mut self) -> PacketKeySet {
+        // The rustls API derives both directions, so this trades an extra
+        // derivation on a genuine update for one fewer retained packet key.
+        let local = self.secrets.next_packet_keys().local;
+        let remote = std::mem::replace(
+            &mut self.next_remote,
+            self.secrets.clone().next_packet_keys().remote,
+        );
+        PacketKeySet { local, remote }
     }
 }
 
@@ -643,7 +659,7 @@ impl Connection {
         } else {
             // Expired/missing old keys still perform one AEAD attempt with a
             // prepared key, avoiding a cheap oracle for the protected phase.
-            retained.map_or(updates.next.remote.as_ref(), |(key, _)| key.as_ref())
+            retained.map_or(updates.next_remote.as_ref(), |(key, _)| key.as_ref())
         };
         let plain_len = match key.decrypt_in_place(pn, header, payload) {
             Ok(plain) => plain.len(),
@@ -666,7 +682,7 @@ impl Connection {
             if updates.first.is_some() && pn <= largest {
                 return Err(Error);
             }
-            let next = std::mem::replace(&mut updates.next, updates.secrets.next_packet_keys());
+            let next = updates.advance();
             let old = std::mem::replace(&mut current.packet, next.remote);
             self.one_rtt_local.as_mut().ok_or(Error)?.packet = next.local;
             let pto = self.srtt
@@ -1376,25 +1392,31 @@ mod tests {
     }
 
     fn connection_and_client() -> (Connection, rustls::quic::ClientConnection) {
+        connection_and_client_with_suite(None)
+    }
+
+    fn connection_and_client_with_suite(
+        suite: Option<rustls::SupportedCipherSuite>,
+    ) -> (Connection, rustls::quic::ClientConnection) {
+        let mut provider = rustls::crypto::ring::default_provider();
+        if let Some(suite) = suite {
+            provider.cipher_suites = vec![suite];
+        }
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.cert.der().clone()], key)
-        .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider.clone()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         let client = rustls::quic::ClientConnection::new(
             Arc::new(client_config),
             Version::V1,

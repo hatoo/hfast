@@ -10,6 +10,8 @@ mod h3;
 mod quic;
 mod sys;
 mod tcp;
+#[cfg(test)]
+mod test_alloc;
 
 const DEFAULT_TCP: u16 = 8083;
 const DEFAULT_QUIC: u16 = 8443;
