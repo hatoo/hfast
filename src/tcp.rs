@@ -18,12 +18,14 @@ const IO: u64 = 1 << 63;
 enum Proto {
     /// Too few bytes to tell yet
     Unknown,
-    H1,
+    H1 {
+        remaining_body: usize,
+    },
     H2(h2::Conn),
 }
 
 struct Conn {
-    /// Bytes read but not yet consumed as whole requests or frames
+    /// Incomplete headers or frames. HTTP/1 body bytes are consumed directly.
     inbuf: Vec<u8>,
     /// Responses waiting to go out, written once per wakeup
     outbuf: Vec<u8>,
@@ -52,7 +54,7 @@ impl Conn {
         if let Proto::Unknown = self.proto {
             match settle(buf) {
                 Which::Undecided => return Some(0), // wait for more bytes
-                Which::H1 => self.proto = Proto::H1,
+                Which::H1 => self.proto = Proto::H1 { remaining_body: 0 },
                 Which::H2 => {
                     at = h2::PREFACE.len();
                     self.proto = Proto::H2(h2::Conn::new(&mut self.outbuf));
@@ -60,16 +62,31 @@ impl Conn {
             }
         }
         match &mut self.proto {
-            Proto::H1 => loop {
-                match h1::parse(&buf[at..]) {
-                    h1::Request::Whole(n) => {
-                        h1::respond(&mut self.outbuf);
-                        at += n;
+            Proto::H1 { remaining_body } => {
+                if *remaining_body > 0 {
+                    let used = (*remaining_body).min(buf.len());
+                    *remaining_body -= used;
+                    at = used;
+                    if *remaining_body > 0 {
+                        return Some(at);
                     }
-                    h1::Request::Partial => break,
-                    h1::Request::Bad => return None,
+                    h1::respond(&mut self.outbuf);
                 }
-            },
+                loop {
+                    match h1::parse(&buf[at..]) {
+                        h1::Request::Whole(n) => {
+                            h1::respond(&mut self.outbuf);
+                            at += n;
+                        }
+                        h1::Request::Body(n) => {
+                            *remaining_body = n;
+                            return Some(buf.len());
+                        }
+                        h1::Request::Partial => break,
+                        h1::Request::Bad => return None,
+                    }
+                }
+            }
             Proto::H2(c) => at += c.drive(&buf[at..], &mut self.outbuf)?,
             Proto::Unknown => unreachable!("settled above"),
         }
@@ -338,6 +355,9 @@ fn wait_batch(
 
 #[cfg(test)]
 mod h2_continuation_tests;
+
+#[cfg(test)]
+mod h1_body_tests;
 
 #[cfg(test)]
 mod tests {

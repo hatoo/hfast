@@ -13,8 +13,11 @@ const RESPONSE: &[u8] =
 pub enum Request {
     /// A whole request, this many bytes long
     Whole(usize),
-    /// Nothing complete yet; wait for more bytes
+    /// The headers are incomplete; wait for more bytes
     Partial,
+    /// The headers are complete. Consume all of `buf`, then wait for this many
+    /// more body bytes before responding. The body itself need not be retained.
+    Body(usize),
     /// Not something this will answer
     Bad,
 }
@@ -26,17 +29,20 @@ pub fn parse(buf: &[u8]) -> Request {
     };
     // A GET or a HEAD carries no body, and that is every request a load
     // generator sends at this. Anything else has to be asked how long it is.
-    let body = if buf.starts_with(b"GET ") || buf.starts_with(b"HEAD ") {
-        0
-    } else {
-        match content_length(&buf[..end]) {
-            Some(n) => n,
-            None => return Request::Bad,
-        }
+    if buf.starts_with(b"GET ") || buf.starts_with(b"HEAD ") {
+        return Request::Whole(end);
+    }
+    let Some(body) = content_length(&buf[..end]) else {
+        return Request::Bad;
     };
-    match buf.len() >= end + body {
-        true => Request::Whole(end + body),
-        false => Request::Partial,
+    let available = buf.len() - end;
+    if body <= available {
+        // The complete request fits in buf, so this addition cannot overflow.
+        Request::Whole(end + body)
+    } else if end.checked_add(body).is_some() {
+        Request::Body(body - available)
+    } else {
+        Request::Bad
     }
 }
 
@@ -121,7 +127,7 @@ mod tests {
         ));
         assert!(matches!(
             parse(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab"),
-            Request::Partial
+            Request::Body(3)
         ));
     }
 
@@ -138,5 +144,28 @@ mod tests {
     fn a_post_without_a_length_has_no_body() {
         let r = b"POST / HTTP/1.1\r\nHost: x\r\n\r\n";
         assert_eq!(whole(r), Some(r.len()));
+    }
+
+    #[test]
+    fn overflowing_lengths_are_rejected_before_body_consumption() {
+        for length in [usize::MAX.to_string(), format!("{}0", usize::MAX)] {
+            let request = format!("POST / HTTP/1.1\r\nContent-Length: {length}\r\n\r\n");
+            assert!(matches!(parse(request.as_bytes()), Request::Bad));
+        }
+        let request = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            usize::MAX - 100
+        );
+        assert!(matches!(parse(request.as_bytes()), Request::Body(n) if n == usize::MAX - 100));
+        let header_len = request.len();
+        let last_valid = usize::MAX - header_len;
+        let request = format!("POST / HTTP/1.1\r\nContent-Length: {last_valid}\r\n\r\n");
+        assert_eq!(request.len(), header_len);
+        assert!(matches!(parse(request.as_bytes()), Request::Body(n) if n == last_valid));
+        let request = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            last_valid + 1
+        );
+        assert!(matches!(parse(request.as_bytes()), Request::Bad));
     }
 }
