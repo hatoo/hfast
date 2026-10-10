@@ -230,7 +230,7 @@ struct SpaceState {
 }
 
 impl SpaceState {
-    fn write_crypto(&mut self, body: &mut Vec<u8>, body_room: usize, pn: u64) {
+    fn write_crypto(&mut self, body: &mut Vec<u8>, body_end: usize, body_start: usize, pn: u64) {
         let retry = self.crypto_flight.iter().position(|f| f.pending);
         if retry.is_none() && self.crypto_out.is_empty() {
             return;
@@ -238,8 +238,9 @@ impl SpaceState {
         let offset = retry.map_or(self.crypto_offset, |i| self.crypto_flight[i].offset);
         // Use the available room's length encoding as an upper bound, so even
         // a large CRYPTO offset cannot make the frame exceed the packet.
-        let room = body_room
-            .saturating_sub(body.len() + 1 + varint_len(offset) + varint_len(body_room as u64));
+        let room = body_end.saturating_sub(
+            body.len() + 1 + varint_len(offset) + varint_len((body_end - body_start) as u64),
+        );
         if room == 0 {
             return;
         }
@@ -317,8 +318,6 @@ pub struct Connection {
     resets: Vec<ResetFlight>,
     /// Scratch ranges reused as ACK frames arrive.
     ack_ranges: Vec<(u64, u64)>,
-    /// Packet assembly storage, returned here after each transmit attempt.
-    packet_body: Vec<u8>,
     /// The fixed SETTINGS prelude at control-stream offset zero
     control: ControlFlight,
     /// Requests finished, which is the credit the client gets back
@@ -398,7 +397,6 @@ impl Connection {
             unacked: Vec::new(),
             resets: Vec::new(),
             ack_ranges: Vec::new(),
-            packet_body: Vec::new(),
             control: ControlFlight::new(),
             finished: 0,
             streams_credit: Credit::new(max_streams_bidi),
@@ -992,79 +990,21 @@ impl Connection {
         space: Space,
         datagram_start: usize,
     ) -> Result<()> {
-        // Take the scratch storage out so write_data can still mutate the
-        // connection. Restore it on errors and empty packets as well.
-        let mut body = std::mem::take(&mut self.packet_body);
-        body.clear();
-        let result = self.write_packet_into(out, space, datagram_start, &mut body);
-        self.packet_body = body;
-        result
-    }
-
-    fn write_packet_into(
-        &mut self,
-        out: &mut Vec<u8>,
-        space: Space,
-        datagram_start: usize,
-        body: &mut Vec<u8>,
-    ) -> Result<()> {
         let room = MAX_DATAGRAM.saturating_sub(out.len() - datagram_start);
         if room < PACKET_OVERHEAD + 4 {
             return Ok(());
         }
-        let body_room = room - PACKET_OVERHEAD;
+        let payload_room = room - PACKET_OVERHEAD;
 
         // The packet number is needed while the body is built, because an
         // answer written into it has to be remembered against the packet it
         // went in. It is only spent if the packet turns out to have something
         // in it.
         let pn = self.spaces[space as usize].next_pn;
-
-        body.reserve(body_room.min(MAX_DATAGRAM));
-        let st = &mut self.spaces[space as usize];
-        if st.ack.owed && !st.ack.ranges.is_empty() {
-            frame::put_ack(body, &st.ack.ranges, 0);
-            st.ack.owed = false;
-        }
-        let ack_only_len = body.len();
-        st.write_crypto(body, body_room, pn);
-        if space == Space::Data {
-            if let Some(data) = self.path_response.take() {
-                put_varint(body, frame::PATH_RESPONSE);
-                body.extend_from_slice(&data);
-            }
-            // RFC 9001 Section 4.1.2: this says the handshake is confirmed,
-            // which it is not until the client's Finished has arrived. Sending
-            // it as soon as rustls hands over 1-RTT keys tells the client it is
-            // done before it is, so it throws away its handshake keys and never
-            // sends the Finished at all - and then nothing ever confirms.
-            if !self.tls.is_handshaking() && self.handshake_done.pending && body.len() < body_room {
-                put_varint(body, frame::HANDSHAKE_DONE);
-                self.handshake_done.sent(pn);
-            }
-            self.write_data(body, body_room, pn);
-        }
-        if body.is_empty() {
-            return Ok(());
-        }
-        let ack_eliciting = body.len() > ack_only_len;
-        // Header protection samples 16 bytes starting four past where the
-        // packet number begins, so a packet has to carry that much whatever it
-        // has to say (RFC 9001 Section 5.4.2). A HANDSHAKE_DONE on its own
-        // does not, and padding is what makes up the difference.
-        // Reckoned against the shortest a packet number can be, since padding
-        // a little more than needed costs nothing and guessing high loses the
-        // packet.
-        const SAMPLED: usize = 4 + 16;
-        if 1 + body.len() + TAG_LEN < SAMPLED {
-            body.resize(SAMPLED - TAG_LEN - 1, 0);
-        }
-
-        let st = &mut self.spaces[space as usize];
-        st.next_pn += 1;
-        let (truncated, pn_len) = encode_packet_number(pn, st.largest_acked);
-
+        let (truncated, pn_len) =
+            encode_packet_number(pn, self.spaces[space as usize].largest_acked);
         let packet_start = out.len();
+        out.reserve(room);
         let length_at = match space {
             Space::Data => {
                 out.push(0x40 | (pn_len as u8 - 1));
@@ -1082,17 +1022,60 @@ impl Connection {
                     &self.peer_cid,
                     &self.local_cid,
                     pn_len,
-                    body.len(),
+                    payload_room,
                 )
             }
         };
         let pn_offset = out.len();
         out.extend_from_slice(&truncated.to_be_bytes()[8 - pn_len..]);
         let header_end = out.len();
-        out.extend_from_slice(body);
+        // Frame writers use an absolute end offset, so any earlier packets
+        // and this header take no room away from the plaintext allowance.
+        let body_room = header_end + payload_room;
+        let st = &mut self.spaces[space as usize];
+        if st.ack.owed && !st.ack.ranges.is_empty() {
+            frame::put_ack(out, &st.ack.ranges, 0);
+            st.ack.owed = false;
+        }
+        let ack_only_len = out.len();
+        st.write_crypto(out, body_room, header_end, pn);
+        if space == Space::Data {
+            if let Some(data) = self.path_response.take() {
+                put_varint(out, frame::PATH_RESPONSE);
+                out.extend_from_slice(&data);
+            }
+            // RFC 9001 Section 4.1.2: this says the handshake is confirmed,
+            // which it is not until the client's Finished has arrived. Sending
+            // it as soon as rustls hands over 1-RTT keys tells the client it is
+            // done before it is, so it throws away its handshake keys and never
+            // sends the Finished at all - and then nothing ever confirms.
+            if !self.tls.is_handshaking() && self.handshake_done.pending && out.len() < body_room {
+                put_varint(out, frame::HANDSHAKE_DONE);
+                self.handshake_done.sent(pn);
+            }
+            self.write_data(out, body_room, pn);
+        }
+        if out.len() == header_end {
+            out.truncate(packet_start);
+            return Ok(());
+        }
+        let ack_eliciting = out.len() > ack_only_len;
+        // Header protection samples 16 bytes starting four past where the
+        // packet number begins, so a packet has to carry that much whatever it
+        // has to say (RFC 9001 Section 5.4.2). A HANDSHAKE_DONE on its own
+        // does not, and padding is what makes up the difference.
+        // Reckoned against the shortest a packet number can be, since padding
+        // a little more than needed costs nothing and guessing high loses the
+        // packet.
+        const SAMPLED: usize = 4 + 16;
+        if 1 + out.len() - header_end + TAG_LEN < SAMPLED {
+            out.resize(header_end + SAMPLED - TAG_LEN - 1, 0);
+        }
+        self.spaces[space as usize].next_pn += 1;
 
         if length_at != usize::MAX {
-            packet::patch_length(out, length_at, (pn_len + body.len() + TAG_LEN) as u64)?;
+            let length = pn_len + out.len() - header_end + TAG_LEN;
+            packet::patch_length(out, length_at, length as u64)?;
         }
 
         let keys = self.local_keys(space).ok_or(Error)?;
@@ -1214,10 +1197,14 @@ impl Connection {
 }
 
 #[cfg(test)]
+#[path = "conn/transmit_tests.rs"]
+mod transmit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn connection() -> Connection {
+    pub(super) fn connection() -> Connection {
         connection_and_client().0
     }
 
@@ -1261,7 +1248,7 @@ mod tests {
         (conn, client)
     }
 
-    fn data_connection() -> Connection {
+    pub(super) fn data_connection() -> Connection {
         let (mut conn, finished) = data_connection_before_finished();
         finish_handshake(&mut conn, &finished);
         conn
@@ -2466,7 +2453,7 @@ mod tests {
         assert_eq!(conn.data_seen, 32);
     }
 
-    fn acknowledge(conn: &mut Connection, space: Space, ranges: &[(u64, u64)]) {
+    pub(super) fn acknowledge(conn: &mut Connection, space: Space, ranges: &[(u64, u64)]) {
         let mut bytes = Vec::new();
         frame::put_ack(&mut bytes, ranges, 0);
         let ack = frame::Frames::new(&bytes).next().unwrap().unwrap();
