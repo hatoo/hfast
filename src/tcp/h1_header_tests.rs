@@ -164,6 +164,27 @@ fn compare(wire: &[u8], parts: impl IntoIterator<Item = usize>) {
 }
 
 #[test]
+fn delimiter_search_threshold_preserves_fragmented_pipelines_and_errors() {
+    for padding in [0, 15, 31, 47, 63, 64, 65, 127] {
+        for length in ["3".to_owned(), "invalid".to_owned(), usize::MAX.to_string()] {
+            let wire = format!(
+                "GET / HTTP/1.1\r\nX: {}\r\n\r\nPOST / HTTP/1.1\r\nContent-Length: {length}\r\n\r\nabcGET / HTTP/1.1\r\n\r\n",
+                "x".repeat(padding)
+            );
+            for split in 0..=wire.len() {
+                compare(wire.as_bytes(), [split, 0, wire.len() - split]);
+            }
+            for chunk in [1, 3, 4, 15, 16, 31, 32, 63, 64, 65, 127, 128] {
+                compare(
+                    wire.as_bytes(),
+                    std::iter::repeat_n(chunk, wire.len().div_ceil(chunk)),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn three_part_splits_match_frozen_parser_and_error_timing() {
     let mut cases = vec![
         b"GET / HTTP/1.1\r\n\r\n".to_vec(),
