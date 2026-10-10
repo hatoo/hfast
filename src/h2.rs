@@ -281,9 +281,25 @@ impl Conn {
     }
 
     fn resume(&mut self, out: &mut Vec<u8>) {
+        // When connection credit can finish every body, retain_mut below can
+        // retire them all in one pass without repeated front bookkeeping.
+        if (self.send_window as usize) / BODY.len() < self.pending.len() {
+            // Smaller grants often release only a prefix. Stop at exhausted
+            // credit without scanning or compacting the untouched suffix.
+            while self.send_window != 0 {
+                let Some(response) = self.pending.front_mut() else {
+                    return;
+                };
+                if !send_body(out, &mut self.send_window, response) {
+                    break;
+                }
+                self.pending.pop_front();
+            }
+        }
         if self.send_window != 0 {
-            // FIFO among eligible responses; a stream without credit cannot
-            // block later streams. Each body is bounded to thirteen bytes.
+            // A partially sent or blocked head must not hold up later streams
+            // with credit. Compact those completions in one ordered pass;
+            // removing them individually could repeatedly shift the queue.
             self.pending
                 .retain_mut(|response| !send_body(out, &mut self.send_window, response));
         }
