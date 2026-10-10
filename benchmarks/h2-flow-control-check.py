@@ -406,6 +406,75 @@ def connection_trickle(port, fragmented):
         peer.close()
 
 
+def sparse_readiness(port, fragmented):
+    peer = Peer(port, fragmented=fragmented)
+    try:
+        streams = []
+        for start in range(0, 5042, 128):
+            streams.extend(peer.request() for _ in range(min(128, 5042 - start)))
+            peer.exchange()
+        for stream in streams[:-1]:
+            peer.expect(stream, 13, True)
+        head = streams[-1]
+        peer.expect(head, 2)
+        assert peer.client.inbound_flow_control_window == 0
+        peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0})
+        peer.exchange()
+        replies, cancelled = 5041, 0
+        for cycle, prefix in enumerate([1, 16, 128, 16]):
+            blocked = [peer.request() for _ in range(prefix)]
+            active = [peer.request() for _ in range(256)]
+            peer.exchange()
+            for stream in active:
+                peer.grant(13, stream)
+            peer.exchange()
+            for start in range(0, len(active), 16):
+                for _ in range(16):
+                    peer.grant(13)
+                peer.exchange()
+                for index, stream in enumerate(active):
+                    done = index < start + 16
+                    peer.expect(stream, 13 if done else 0, done)
+                for stream in blocked:
+                    peer.expect(stream, 0)
+                peer.expect(head, 2)
+                assert peer.client.inbound_flow_control_window == 0
+                # Retired slots may still exist internally; late credit and
+                # resets must not revive them or change connection accounting.
+                extra = b"".join(frame(8, stream, bytes(4))
+                                 + frame(3, stream, bytes(4))
+                                 for stream in active[start:start + 16])
+                peer.exchange(extra=extra)
+            replies += len(active)
+            survivors = []
+            for index, stream in enumerate(blocked):
+                if index % 5 == 0:
+                    peer.client.reset_stream(stream)
+                    cancelled += 1
+                else:
+                    survivors.append(stream)
+            for stream in reversed(survivors):
+                peer.grant(13, stream)
+            final = cycle == 3
+            if final:
+                peer.grant(15, head)  # -2 + 15; eleven unsent bytes remain.
+            peer.exchange()
+            amount = len(survivors) * 13 + (11 if final else 0)
+            if amount:
+                peer.grant(amount)
+            peer.exchange()
+            for stream in survivors:
+                peer.expect(stream, 13, True)
+            peer.expect(head, 13 if final else 2, final)
+            replies += len(survivors) + int(final)
+            assert peer.client.inbound_flow_control_window == 0
+        return {"case": "sparse-readiness", "fragmented": fragmented,
+                "replies": replies, "cancelled": cancelled,
+                "blocked_prefixes": [1, 16, 128, 16]}
+    finally:
+        peer.close()
+
+
 def backpressure(port, fragmented):
     # Complete valid responses exceed the TCP send and receive buffers; queued
     # DATA and GOAWAY must survive partial socket writes. For this large batch,
@@ -498,7 +567,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--case", choices=["stream-zero", "connection", "settings",
-                                          "invalid", "pending-queue", "connection-trickle", "backpressure",
+                                          "invalid", "pending-queue", "connection-trickle", "sparse-readiness", "backpressure",
                                           "all"], default="all")
     args = parser.parse_args()
     with socket.socket() as listener:
@@ -522,6 +591,7 @@ def main():
                       "settings": settings_and_resets, "invalid": invalid_updates,
                       "pending-queue": pending_queue,
                       "connection-trickle": connection_trickle,
+                      "sparse-readiness": sparse_readiness,
                       "backpressure": backpressure}
             results = [check(port, fragmented) for name, check in checks.items()
                        if args.case in [name, "all"]

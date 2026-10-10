@@ -59,16 +59,19 @@ pub struct Conn {
     send_window: u32,
     initial_window: u32,
     /// Only unfinished response bodies need stream credit and an offset.
-    /// Completed responses leave no entry; ordinary requests never allocate.
-    /// Stream IDs stay sorted for lookup, with constant-time front removal
-    /// when a peer unblocks responses in request order.
+    /// Ordinary requests never allocate. Stream IDs stay sorted for lookup;
+    /// finished interior slots are reclaimed once at least half are retired.
     pending: VecDeque<Pending>,
+    /// Everything before this cursor is retired or has no stream credit.
+    resume_at: usize,
+    retired: usize,
 }
 
 struct Pending {
     stream: u32,
     /// SETTINGS can reduce this below zero after some DATA has been sent.
     window: i32,
+    /// BODY.len() also marks a cancelled or completed interior slot.
     sent: u8,
 }
 
@@ -85,6 +88,8 @@ impl Conn {
             send_window: INITIAL_WINDOW,
             initial_window: INITIAL_WINDOW,
             pending: VecDeque::new(),
+            resume_at: 0,
+            retired: 0,
         }
     }
 
@@ -171,6 +176,9 @@ impl Conn {
                                     }
                                     let delta = value as i32 - self.initial_window as i32;
                                     for response in &mut self.pending {
+                                        if response.sent as usize == BODY.len() {
+                                            continue;
+                                        }
                                         let Some(window) = response.window.checked_add(delta)
                                         else {
                                             return self.fail(out, buf.len(), FLOW_CONTROL_ERROR);
@@ -178,6 +186,9 @@ impl Conn {
                                         response.window = window;
                                     }
                                     self.initial_window = value;
+                                    if delta > 0 {
+                                        self.resume_at = 0;
+                                    }
                                 }
                                 2 if value > 1 => {
                                     return self.fail(out, buf.len(), PROTOCOL_ERROR);
@@ -210,18 +221,19 @@ impl Conn {
                         if stream > self.last_stream || stream & 1 == 0 {
                             return self.fail(out, buf.len(), PROTOCOL_ERROR);
                         }
-                        if let Ok(index) = self.pending.binary_search_by_key(&stream, |p| p.stream)
-                        {
+                        if let Some(index) = self.pending_index(stream) {
                             let response = &mut self.pending[index];
                             match response.window.checked_add(increment as i32) {
                                 Some(window) if increment != 0 => {
                                     response.window = window;
                                     if send_body(out, &mut self.send_window, response) {
-                                        self.pending.remove(index);
+                                        self.retire(index);
+                                    } else if response.window > 0 {
+                                        self.resume_at = self.resume_at.min(index);
                                     }
                                 }
                                 _ => {
-                                    self.pending.remove(index);
+                                    self.retire(index);
                                     reset(
                                         out,
                                         stream,
@@ -244,8 +256,8 @@ impl Conn {
                     if stream == 0 || stream > self.last_stream || stream & 1 == 0 {
                         return self.fail(out, buf.len(), PROTOCOL_ERROR);
                     }
-                    if let Ok(index) = self.pending.binary_search_by_key(&stream, |p| p.stream) {
-                        self.pending.remove(index);
+                    if let Some(index) = self.pending_index(stream) {
+                        self.retire(index);
                     }
                 }
                 PING => {
@@ -280,12 +292,90 @@ impl Conn {
         }
     }
 
+    fn pending_index(&self, stream: u32) -> Option<usize> {
+        self.pending
+            .binary_search_by_key(&stream, |p| p.stream)
+            .ok()
+            .filter(|&index| self.pending[index].sent as usize != BODY.len())
+    }
+
+    fn retire(&mut self, index: usize) {
+        if index == 0 {
+            self.pending.pop_front();
+            self.resume_at = self.resume_at.saturating_sub(1);
+        } else if index + 1 == self.pending.len() {
+            self.pending.pop_back();
+            self.resume_at = self.resume_at.min(self.pending.len());
+        } else {
+            self.pending[index].sent = BODY.len() as u8;
+            self.retired += 1;
+        }
+        if self.retired != 0 {
+            self.reclaim();
+        }
+    }
+
+    fn reclaim(&mut self) {
+        // In-order and reverse-order completion stay constant-time. Interior
+        // holes never shift a suffix on each grant and retain less than twice
+        // the live entries between compactions.
+        while self
+            .pending
+            .front()
+            .is_some_and(|p| p.sent as usize == BODY.len())
+        {
+            self.pending.pop_front();
+            self.retired -= 1;
+            self.resume_at = self.resume_at.saturating_sub(1);
+        }
+        while self
+            .pending
+            .back()
+            .is_some_and(|p| p.sent as usize == BODY.len())
+        {
+            self.pending.pop_back();
+            self.retired -= 1;
+        }
+        self.resume_at = self.resume_at.min(self.pending.len());
+        if self.retired != 0 && self.retired >= self.pending.len() - self.retired {
+            let mut before = 0;
+            let mut index = 0;
+            self.pending.retain(|p| {
+                let live = p.sent as usize != BODY.len();
+                if !live && index < self.resume_at {
+                    before += 1;
+                }
+                index += 1;
+                live
+            });
+            self.resume_at -= before;
+            self.retired = 0;
+        }
+    }
+
     fn resume(&mut self, out: &mut Vec<u8>) {
-        // When connection credit can finish every body, retain_mut below can
-        // retire them all in one pass without repeated front bookkeeping.
-        if (self.send_window as usize) / BODY.len() < self.pending.len() {
-            // Smaller grants often release only a prefix. Stop at exhausted
-            // credit without scanning or compacting the untouched suffix.
+        if self.send_window == 0 || self.resume_at == self.pending.len() {
+            return;
+        }
+        // A grant covering every remaining body can retire them in one pass.
+        // Every survivor then has exhausted its stream credit.
+        if (self.send_window as usize) / BODY.len() >= self.pending.len() {
+            if self.retired == 0 {
+                self.pending
+                    .retain_mut(|response| !send_body(out, &mut self.send_window, response));
+            } else {
+                self.pending.retain_mut(|response| {
+                    response.sent as usize != BODY.len()
+                        && !send_body(out, &mut self.send_window, response)
+                });
+            }
+            self.retired = 0;
+            self.resume_at = self.pending.len();
+            return;
+        }
+        // Ready queues keep the direct front drain. Cursor and tombstone
+        // bookkeeping is needed only once a blocked response is encountered.
+        if self.resume_at == 0 && self.retired == 0 {
             while self.send_window != 0 {
                 let Some(response) = self.pending.front_mut() else {
                     return;
@@ -295,14 +385,22 @@ impl Conn {
                 }
                 self.pending.pop_front();
             }
+            if self.send_window == 0 {
+                return;
+            }
         }
-        if self.send_window != 0 {
-            // A partially sent or blocked head must not hold up later streams
-            // with credit. Compact those completions in one ordered pass;
-            // removing them individually could repeatedly shift the queue.
-            self.pending
-                .retain_mut(|response| !send_body(out, &mut self.send_window, response));
+        while self.send_window != 0 && self.resume_at < self.pending.len() {
+            let response = &mut self.pending[self.resume_at];
+            if response.sent as usize == BODY.len() || response.window <= 0 {
+                self.resume_at += 1;
+            } else if send_body(out, &mut self.send_window, response) {
+                self.retired += 1;
+                self.resume_at += 1;
+            } else if response.window <= 0 {
+                self.resume_at += 1;
+            }
         }
+        self.reclaim();
     }
 
     fn fail(&mut self, out: &mut Vec<u8>, used: usize, error: u32) -> Option<usize> {
@@ -310,6 +408,8 @@ impl Conn {
         out.extend_from_slice(&self.last_stream.to_be_bytes());
         out.extend_from_slice(&error.to_be_bytes());
         self.pending.clear();
+        self.resume_at = 0;
+        self.retired = 0;
         self.closing = true;
         Some(used)
     }

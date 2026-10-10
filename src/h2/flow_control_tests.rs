@@ -23,7 +23,31 @@ fn credit(stream: u32, n: u32) -> Vec<u8> {
 fn deliver(conn: &mut Conn, wire: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     assert_eq!(conn.drive(wire, &mut out), Some(wire.len()));
+    assert_pending_invariants(conn);
     out
+}
+
+fn assert_pending_invariants(conn: &Conn) {
+    let retired = conn
+        .pending
+        .iter()
+        .filter(|p| p.sent as usize == BODY.len())
+        .count();
+    assert_eq!(conn.retired, retired);
+    assert!(conn.resume_at <= conn.pending.len());
+    assert!(
+        conn.pending
+            .iter()
+            .take(conn.resume_at)
+            .all(|p| { p.sent as usize == BODY.len() || p.window <= 0 })
+    );
+    assert!(conn.pending.is_empty() || retired < conn.pending.len() - retired);
+    assert!(
+        conn.pending
+            .iter()
+            .zip(conn.pending.iter().skip(1))
+            .all(|(a, b)| a.stream < b.stream)
+    );
 }
 
 fn fresh(window: u32) -> Conn {
@@ -340,7 +364,7 @@ fn blocked_responses_complete_in_order_reverse_and_permuted_with_cancellations()
             // Neither a late update nor a duplicate reset may revive a stream.
             assert!(deliver(&mut conn, &credit(stream, 13)).is_empty());
             assert!(deliver(&mut conn, &frame(3, 0, stream, &[0; 4])).is_empty());
-            assert_eq!(conn.pending.len(), (count - i - 1) as usize);
+            assert_eq!(conn.pending.len() - conn.retired, (count - i - 1) as usize);
         }
         assert!(conn.pending.is_empty());
         assert_eq!(conn.send_window, INITIAL_WINDOW - 13 * completed);
@@ -615,10 +639,224 @@ fn wrapped_pending_queue_matches_credit_model_through_mixed_events() {
         assert_eq!(
             conn.pending
                 .iter()
+                .filter(|p| p.sent as usize != BODY.len())
                 .map(|p| (p.stream, (i64::from(p.window), usize::from(p.sent))))
                 .collect::<BTreeMap<_, _>>(),
             model,
             "step {step}"
         );
     }
+}
+
+#[test]
+fn sparse_connection_grants_skip_blocked_prefixes_and_later_wake_them_in_order() {
+    for blocked in [1, 16, 128, 2048] {
+        let mut conn = fresh(0);
+        conn.send_window = 0;
+        let count = 4096_u32;
+        let requests = (1..2 * count)
+            .step_by(2)
+            .flat_map(request)
+            .collect::<Vec<_>>();
+        deliver(&mut conn, &requests);
+        let ready = (2 * blocked + 1..2 * count)
+            .step_by(2)
+            .flat_map(|stream| credit(stream, 13))
+            .collect::<Vec<_>>();
+        assert!(deliver(&mut conn, &ready).is_empty());
+        for stream in (2 * blocked + 1..2 * count).step_by(2) {
+            assert_eq!(
+                deliver(&mut conn, &credit(0, 13)),
+                frame(DATA, 1, stream, BODY)
+            );
+            assert_eq!(conn.send_window, 0);
+        }
+        assert_eq!(conn.pending.len(), blocked as usize);
+        assert_eq!(conn.retired, 0);
+        // A connection grant alone must not revive the blocked prefix.
+        assert!(deliver(&mut conn, &credit(0, blocked * 13)).is_empty());
+        assert_eq!(conn.resume_at, conn.pending.len());
+        let expected = std::iter::once(frame(SETTINGS, 1, 0, b""))
+            .chain((1..2 * blocked).step_by(2).map(|s| frame(DATA, 1, s, BODY)))
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(deliver(&mut conn, &setting(13)), expected);
+        assert!(conn.pending.is_empty());
+        assert_eq!(conn.send_window, 0);
+    }
+}
+
+#[test]
+fn retired_slots_ignore_late_updates_resets_and_settings_overflow() {
+    let mut conn = fresh(0);
+    for stream in (1..20).step_by(2) {
+        deliver(&mut conn, &request(stream));
+    }
+    assert_eq!(
+        deliver(&mut conn, &credit(3, MAX_WINDOW)),
+        frame(DATA, 1, 3, BODY)
+    );
+    assert!(deliver(&mut conn, &frame(RST_STREAM, 0, 7, &[0; 4])).is_empty());
+    assert_eq!(conn.retired, 2);
+    for stream in [3, 7] {
+        for amount in [0, 1, MAX_WINDOW] {
+            assert!(deliver(&mut conn, &credit(stream, amount)).is_empty());
+        }
+        assert!(deliver(&mut conn, &frame(RST_STREAM, 0, stream, &[0; 4])).is_empty());
+    }
+    conn.send_window = 0;
+    // The completed slot retains MAX_WINDOW - 13 in its old credit field.
+    // Applying this delta to a retired slot would incorrectly send GOAWAY.
+    assert_eq!(
+        deliver(&mut conn, &setting(MAX_WINDOW)),
+        frame(SETTINGS, 1, 0, b"")
+    );
+    assert!(!conn.is_closing());
+    let expected = (1..20)
+        .step_by(2)
+        .filter(|s| ![3, 7].contains(s))
+        .flat_map(|s| frame(DATA, 1, s, BODY))
+        .collect::<Vec<_>>();
+    assert_eq!(deliver(&mut conn, &credit(0, 8 * 13)), expected);
+    assert!(conn.pending.is_empty());
+}
+
+#[test]
+fn negative_prefix_stream_grant_rewinds_cursor_before_later_ready_streams() {
+    let mut conn = fresh(5);
+    deliver(&mut conn, &request(1));
+    deliver(&mut conn, &setting(0));
+    for stream in (3..20).step_by(2) {
+        deliver(&mut conn, &request(stream));
+    }
+    conn.send_window = 0;
+    deliver(&mut conn, &credit(11, 13));
+    assert_eq!(deliver(&mut conn, &credit(0, 13)), frame(DATA, 1, 11, BODY));
+    assert!(conn.resume_at > 0);
+    assert_eq!(conn.pending[0].window, -5);
+    assert!(deliver(&mut conn, &credit(1, 5)).is_empty());
+    assert!(deliver(&mut conn, &credit(1, 8)).is_empty());
+    assert_eq!(conn.resume_at, 0);
+    deliver(&mut conn, &credit(19, 13));
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 10)),
+        [frame(DATA, 1, 1, b", World!"), frame(DATA, 0, 19, b"He")].concat()
+    );
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 11)),
+        frame(DATA, 1, 19, b"llo, World!")
+    );
+    assert_eq!(conn.send_window, 0);
+}
+
+#[test]
+fn sparse_retirement_and_wrapped_refill_bound_storage_by_peak_live_responses() {
+    let mut conn = fresh(0);
+    conn.send_window = 0;
+    let mut next = 1;
+    for _ in 0..128 {
+        deliver(&mut conn, &request(next));
+        next += 2;
+    }
+    // Wrap the queue while keeping a fixed blocked prefix alive.
+    for stream in (1..129).step_by(2) {
+        deliver(&mut conn, &frame(RST_STREAM, 0, stream, &[0; 4]));
+        deliver(&mut conn, &request(next));
+        next += 2;
+    }
+    assert!(!conn.pending.as_slices().1.is_empty());
+    let capacity = conn.pending.capacity();
+    let prefix = conn
+        .pending
+        .iter()
+        .take(16)
+        .map(|p| p.stream)
+        .collect::<Vec<_>>();
+    for cycle in 0..64 {
+        let ready = conn
+            .pending
+            .iter()
+            .filter(|p| !prefix.contains(&p.stream))
+            .map(|p| p.stream)
+            .collect::<Vec<_>>();
+        for stream in &ready {
+            deliver(&mut conn, &credit(*stream, 13));
+        }
+        for (i, stream) in ready.iter().enumerate() {
+            if (i + cycle) % 5 == 0 {
+                assert!(deliver(&mut conn, &frame(RST_STREAM, 0, *stream, &[0; 4])).is_empty());
+            } else {
+                assert_eq!(
+                    deliver(&mut conn, &credit(0, 13)),
+                    frame(DATA, 1, *stream, BODY)
+                );
+            }
+            assert!(deliver(&mut conn, &credit(*stream, 0)).is_empty());
+        }
+        assert_eq!(
+            conn.pending.iter().map(|p| p.stream).collect::<Vec<_>>(),
+            prefix
+        );
+        for _ in 0..112 {
+            deliver(&mut conn, &request(next));
+            next += 2;
+        }
+        assert_eq!(conn.pending.len() - conn.retired, 128);
+        assert!(conn.pending.capacity() <= 2 * capacity);
+    }
+    // Connection errors clear cursor and tombstones as well as live entries.
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 0)),
+        goaway(next - 2, PROTOCOL_ERROR)
+    );
+    assert!(conn.pending.is_empty());
+    assert_eq!(conn.resume_at, 0);
+    assert_eq!(conn.retired, 0);
+}
+
+#[test]
+fn rolling_sparse_refill_does_not_retain_completed_history() {
+    let mut conn = fresh(0);
+    conn.send_window = 0;
+    let mut next = 1;
+    for _ in 0..128 {
+        deliver(&mut conn, &request(next));
+        next += 2;
+    }
+    let initial_capacity = conn.pending.capacity();
+    for _ in 0..64 {
+        let ready = conn
+            .pending
+            .iter()
+            .filter(|p| p.sent as usize != BODY.len() && p.stream > 31)
+            .map(|p| p.stream)
+            .collect::<Vec<_>>();
+        assert_eq!(ready.len(), 112);
+        for stream in ready {
+            assert!(deliver(&mut conn, &credit(stream, 13)).is_empty());
+            assert_eq!(
+                deliver(&mut conn, &credit(0, 13)),
+                frame(DATA, 1, stream, BODY)
+            );
+            assert_eq!(deliver(&mut conn, &request(next)), response_headers(next));
+            next += 2;
+            assert_eq!(conn.pending.len() - conn.retired, 128);
+            assert!(conn.pending.len() < 256);
+            assert!(conn.pending.capacity() <= 2 * initial_capacity);
+        }
+    }
+    // Remove every live stream, including the long-lived prefix; no slots or
+    // readiness state may survive the final reset.
+    let live = conn
+        .pending
+        .iter()
+        .filter(|p| p.sent as usize != BODY.len())
+        .map(|p| p.stream)
+        .collect::<Vec<_>>();
+    for stream in live {
+        deliver(&mut conn, &frame(RST_STREAM, 0, stream, &[0; 4]));
+    }
+    assert!(conn.pending.is_empty());
+    assert_eq!(conn.resume_at, 0);
+    assert_eq!(conn.retired, 0);
 }
