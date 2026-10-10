@@ -38,6 +38,8 @@ jobs:
         run: python benchmarks/h1-response-check.py target/release/hfast
       - name: HTTP/2 request header continuations
         run: python benchmarks/h2-continuation-check.py target/release/hfast
+      - name: HTTP/2 response credit and backpressure
+        run: python benchmarks/h2-flow-control-check.py target/release/hfast
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
       - name: QUIC control recovery with repeated packet loss

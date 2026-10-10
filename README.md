@@ -43,9 +43,6 @@ client that sends `SETTINGS_HEADER_TABLE_SIZE = 0`, or offers a zero-capacity
 QPACK table, forbids the server's encoder from indexing anyway, so a
 static-table blob is all it would be allowed to send.
 
-**Flow-control accounting.** Windows are advertised large enough that a 13-byte
-response can never be blocked by one.
-
 **The `Date` header.** Every other server here sends it because TechEmpower
 requires it. Nothing pointed at this reads it, and the point of this server is
 to be a floor.
@@ -55,6 +52,13 @@ its ACK, PING/PONG, GOAWAY, the HTTP/3 control stream and its SETTINGS, correct
 framing in every direction, HTTP/1.1 request pipelining, and request bodies -
 a `Content-Length` is read so that a body is never mistaken for the request
 behind it.
+
+HTTP/2 responses honor the client's connection and stream receive windows,
+including zero windows, partial grants and changes to the initial stream window.
+Only unfinished response bodies retain stream state; a response with sufficient
+credit needs no stream allocation. Request trailers do not trigger another
+response. HTTP/2 and HTTP/3 advertise large stream receive windows for request
+bodies; those windows do not determine how much response data the client permits.
 
 ## How it is built
 
