@@ -140,11 +140,16 @@ introduced. Connection lookup on the established path uses one hash-table lookup
 per received datagram. See [the batching measurements](benchmarks/http3-batching.md)
 for the before/after comparison and reproduction commands.
 
+Peer-initiated QUIC key updates are supported. The server authenticates each
+transition before changing its receive and send packet keys, keeps the previous
+receive key for up to three probe timeouts for reordered packets, and preserves
+header protection keys. Retransmissions use the current packet keys.
+
 What it leaves out, all of which a load generator does without: address
 validation and Retry, connection migration (connections are found by the
-address they came from), 0-RTT, key update, and congestion control - it sends
-what flow control allows, which for 25-byte answers on a benchmark path is
-what a controller would allow anyway.
+address they came from), 0-RTT, locally initiated key updates, and congestion
+control - it sends what flow control allows, which for 25-byte answers on a
+benchmark path is what a controller would allow anyway.
 
 ## What a stream limit costs
 

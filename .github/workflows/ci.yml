@@ -50,3 +50,5 @@ jobs:
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
         run: python benchmarks/reset-accounting-check.py target/release/hfast
+      - name: QUIC peer key updates, reordering and forgery
+        run: python benchmarks/key-update-check.py target/release/hfast
