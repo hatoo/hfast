@@ -4,6 +4,8 @@
 //! is the same bytes every time, so neither direction needs an HPACK codec:
 //! see the README for why that is allowed rather than merely convenient.
 
+use std::collections::VecDeque;
+
 /// The client's connection preface (RFC 9113 Section 3.4), which is also what
 /// tells this server it is not talking HTTP/1.1
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -58,7 +60,9 @@ pub struct Conn {
     initial_window: u32,
     /// Only unfinished response bodies need stream credit and an offset.
     /// Completed responses leave no entry; ordinary requests never allocate.
-    pending: Vec<Pending>,
+    /// Stream IDs stay sorted for lookup, with constant-time front removal
+    /// when a peer unblocks responses in request order.
+    pending: VecDeque<Pending>,
 }
 
 struct Pending {
@@ -80,7 +84,7 @@ impl Conn {
             last_stream: 0,
             send_window: INITIAL_WINDOW,
             initial_window: INITIAL_WINDOW,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -271,7 +275,7 @@ impl Conn {
                 sent: 0,
             };
             if !send_body(out, &mut self.send_window, &mut response) {
-                self.pending.push(response);
+                self.pending.push_back(response);
             }
         }
     }

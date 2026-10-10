@@ -308,3 +308,213 @@ fn every_receive_split_preserves_credit_headers_continuations_and_body() {
         assert!(conn.pending.is_empty());
     }
 }
+
+#[test]
+fn blocked_responses_complete_in_order_reverse_and_permuted_with_cancellations() {
+    for order in 0..3 {
+        let mut conn = fresh(0);
+        let count = 4096_u32;
+        for stream in (1..2 * count).step_by(2) {
+            assert_eq!(
+                deliver(&mut conn, &request(stream)),
+                response_headers(stream)
+            );
+        }
+        let mut completed = 0;
+        for i in 0..count {
+            let index = match order {
+                0 => i,
+                1 => count - 1 - i,
+                _ => (i * 4051 + 17) % count,
+            };
+            let stream = 2 * index + 1;
+            if i % 4 == 0 {
+                assert!(deliver(&mut conn, &frame(3, 0, stream, &[0; 4])).is_empty());
+            } else {
+                assert_eq!(
+                    deliver(&mut conn, &credit(stream, 13)),
+                    frame(0, 1, stream, BODY)
+                );
+                completed += 1;
+            }
+            // Neither a late update nor a duplicate reset may revive a stream.
+            assert!(deliver(&mut conn, &credit(stream, 13)).is_empty());
+            assert!(deliver(&mut conn, &frame(3, 0, stream, &[0; 4])).is_empty());
+            assert_eq!(conn.pending.len(), (count - i - 1) as usize);
+        }
+        assert!(conn.pending.is_empty());
+        assert_eq!(conn.send_window, INITIAL_WINDOW - 13 * completed);
+    }
+}
+
+#[test]
+fn repeated_retire_and_refill_reuses_bounded_capacity_and_survives_wrapped_growth() {
+    let mut conn = fresh(0);
+    let mut next = 1;
+    for _ in 0..128 {
+        deliver(&mut conn, &request(next));
+        next += 2;
+    }
+    let capacity = conn.pending.capacity();
+    let mut first = 1;
+    for _ in 0..32 {
+        for _ in 0..96 {
+            assert_eq!(
+                deliver(&mut conn, &credit(first, 13)),
+                frame(0, 1, first, BODY)
+            );
+            first += 2;
+        }
+        for _ in 0..96 {
+            assert_eq!(deliver(&mut conn, &request(next)), response_headers(next));
+            next += 2;
+        }
+        assert_eq!(conn.pending.len(), 128);
+        assert_eq!(conn.pending.capacity(), capacity);
+        assert_eq!(
+            conn.pending.iter().map(|p| p.stream).collect::<Vec<_>>(),
+            (first..next).step_by(2).collect::<Vec<_>>()
+        );
+    }
+    // Force a wrapped full queue, then grow it without losing logical order.
+    assert_eq!(
+        deliver(&mut conn, &credit(first, 13)),
+        frame(0, 1, first, BODY)
+    );
+    first += 2;
+    deliver(&mut conn, &request(next));
+    next += 2;
+    assert!(!conn.pending.as_slices().1.is_empty());
+    for _ in 0..capacity {
+        deliver(&mut conn, &request(next));
+        next += 2;
+    }
+    let expected = std::iter::once(frame(4, 1, 0, b""))
+        .chain(
+            (first..next)
+                .step_by(2)
+                .map(|stream| frame(0, 1, stream, BODY)),
+        )
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(deliver(&mut conn, &setting(13)), expected);
+    assert!(conn.pending.is_empty());
+    assert_eq!(conn.send_window, INITIAL_WINDOW - (next - 1) / 2 * 13);
+}
+
+#[test]
+fn wrapped_pending_queue_matches_credit_model_through_mixed_events() {
+    use std::collections::BTreeMap;
+    // Wider signed windows and an ordered map provide a storage-independent
+    // model, including partially sent responses with negative stream credit.
+    let mut model = BTreeMap::<u32, (i64, usize)>::new();
+    let mut conn = fresh(0);
+    let mut window = i64::from(INITIAL_WINDOW);
+    let mut initial = 0_i64;
+    let mut next = 1;
+    for _ in 0..128 {
+        deliver(&mut conn, &request(next));
+        model.insert(next, (0, 0));
+        next += 2;
+    }
+    for stream in (1..161).step_by(2) {
+        assert_eq!(
+            deliver(&mut conn, &credit(stream, 13)),
+            frame(0, 1, stream, BODY)
+        );
+        model.remove(&stream);
+        window -= 13;
+    }
+    for _ in 0..80 {
+        deliver(&mut conn, &request(next));
+        model.insert(next, (0, 0));
+        next += 2;
+    }
+    assert!(!conn.pending.as_slices().1.is_empty());
+    // Keep connection credit scarce so stream and SETTINGS grants must wait
+    // for later connection updates, including partial final bodies.
+    conn.send_window = 17;
+    window = 17;
+    let mut random = 0x59b3_7d91_u64;
+    for step in 0..8192 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let stream = (random as u32 % ((next - 1) / 2)) * 2 + 1;
+        let amount = (random >> 32) as u32 % 19 + 1;
+        let mut eligible = Vec::new();
+        let mut expected = Vec::new();
+        let wire = match step % 11 {
+            0..=2 => {
+                let stream = next;
+                next += 2;
+                model.insert(stream, (initial, 0));
+                expected.extend(response_headers(stream));
+                eligible.push(stream);
+                request(stream)
+            }
+            3 | 4 | 8 => {
+                if let Some((credit, _)) = model.get_mut(&stream) {
+                    *credit += i64::from(amount);
+                    eligible.push(stream);
+                }
+                credit(stream, amount)
+            }
+            5 => {
+                model.remove(&stream);
+                frame(3, 0, stream, &[0; 4])
+            }
+            6 | 9 => {
+                let changed = i64::from(amount % 14);
+                for (credit, _) in model.values_mut() {
+                    *credit += changed - initial;
+                }
+                initial = changed;
+                eligible.extend(model.keys().copied());
+                expected.extend(frame(4, 1, 0, b""));
+                setting(initial as u32)
+            }
+            7 => {
+                window += i64::from(amount);
+                eligible.extend(model.keys().copied());
+                credit(0, amount)
+            }
+            _ => {
+                // A zero stream grant resets only an unfinished response.
+                if model.remove(&stream).is_some() {
+                    expected.extend(frame(3, 0, stream, &PROTOCOL_ERROR.to_be_bytes()));
+                }
+                credit(stream, 0)
+            }
+        };
+        for stream in eligible {
+            let (credit, sent) = model.get_mut(&stream).unwrap();
+            let bytes = (*credit).min(window).max(0).min((13 - *sent) as i64) as usize;
+            if bytes != 0 {
+                expected.extend(frame(
+                    0,
+                    u8::from(*sent + bytes == 13),
+                    stream,
+                    &BODY[*sent..*sent + bytes],
+                ));
+                *sent += bytes;
+                *credit -= bytes as i64;
+                window -= bytes as i64;
+            }
+            if *sent == 13 {
+                model.remove(&stream);
+            }
+        }
+        assert_eq!(deliver(&mut conn, &wire), expected, "step {step}");
+        assert_eq!(i64::from(conn.send_window), window);
+        assert_eq!(i64::from(conn.initial_window), initial);
+        assert_eq!(
+            conn.pending
+                .iter()
+                .map(|p| (p.stream, (i64::from(p.window), usize::from(p.sent))))
+                .collect::<BTreeMap<_, _>>(),
+            model,
+            "step {step}"
+        );
+    }
+}

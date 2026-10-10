@@ -269,6 +269,60 @@ def invalid_updates(port, fragmented):
     return {"case": "invalid-updates", "fragmented": fragmented, "results": results}
 
 
+def pending_queue(port, fragmented):
+    """Retire/refill a blocked queue, then update both sides of its storage."""
+    peer = Peer(port, initial=0, fragmented=fragmented)
+    try:
+        active = [peer.request() for _ in range(256)]
+        peer.exchange()
+        replies = cancelled = 0
+        for cycle in range(12):
+            retiring, active = active[:192], active[192:]
+            if cycle % 3 == 1:
+                retiring.reverse()
+            elif cycle % 3 == 2:
+                retiring = retiring[::2] + retiring[1::2]
+            for i, stream in enumerate(retiring):
+                if i % 7 == 0:
+                    peer.client.reset_stream(stream)
+                    cancelled += 1
+                else:
+                    peer.grant(5, stream)
+            peer.exchange()
+            for i, stream in enumerate(retiring):
+                if i % 7 != 0:
+                    peer.expect(stream, 5)
+                    peer.grant(8, stream)
+            peer.exchange()
+            for i, stream in enumerate(retiring):
+                if i % 7 != 0:
+                    peer.expect(stream, 13, True)
+                    replies += 1
+            active.extend(peer.request() for _ in range(192))
+            peer.exchange()
+            for stream in active:
+                peer.expect(stream, 0)
+        # SETTINGS visits all live entries in order, including wrapped storage,
+        # and negative credit must survive partial DATA and later reductions.
+        peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 5})
+        peer.exchange()
+        for stream in active:
+            peer.expect(stream, 5)
+        peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0})
+        peer.exchange()
+        for stream in reversed(active):
+            peer.grant(13, stream)  # -5 + 13 releases the final eight bytes.
+        peer.exchange()
+        for stream in active:
+            peer.expect(stream, 13, True)
+        replies += len(active)
+        assert peer.client.inbound_flow_control_window == 65535 - replies * 13
+        return {"case": "pending-queue", "fragmented": fragmented,
+                "replies": replies, "cancelled": cancelled, "refills": 12}
+    finally:
+        peer.close()
+
+
 def backpressure(port, fragmented):
     # Complete valid responses exceed the TCP send and receive buffers; queued
     # DATA and GOAWAY must survive partial socket writes. For this large batch,
@@ -361,7 +415,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--case", choices=["stream-zero", "connection", "settings",
-                                          "invalid", "backpressure", "all"], default="all")
+                                          "invalid", "pending-queue", "backpressure",
+                                          "all"], default="all")
     args = parser.parse_args()
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -382,6 +437,7 @@ def main():
                     time.sleep(0.02)
             checks = {"stream-zero": stream_zero, "connection": connection_credit,
                       "settings": settings_and_resets, "invalid": invalid_updates,
+                      "pending-queue": pending_queue,
                       "backpressure": backpressure}
             results = [check(port, fragmented) for name, check in checks.items()
                        if args.case in [name, "all"]
