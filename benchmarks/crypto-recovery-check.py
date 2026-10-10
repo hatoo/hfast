@@ -41,12 +41,17 @@ class Relay(asyncio.DatagramProtocol):
         self.target = target
         self.peer = None
         self.dropped = 0
+        self.largest_datagram = 0
+        self.oversized = []
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, source):
         if source == self.target:
+            self.largest_datagram = max(self.largest_datagram, len(data))
+            if len(data) > 1200:
+                self.oversized.append(len(data))
             if self.dropped == 0:
                 # Initial headers are visible before header protection.
                 assert data[0] & 0xF0 == 0xC0, "expected server Initial flight"
@@ -60,9 +65,12 @@ class Relay(asyncio.DatagramProtocol):
             self.transport.sendto(data, destination)
 
 
-async def check(port, relay):
+async def check(port, relay, cid_length):
     conf = QuicConfiguration(
-        is_client=True, alpn_protocols=["h3"], initial_rtt=0.02
+        is_client=True,
+        alpn_protocols=["h3"],
+        initial_rtt=0.02,
+        connection_id_length=cid_length,
     )
     conf.verify_mode = ssl.CERT_NONE
     async with connect(
@@ -72,15 +80,17 @@ async def check(port, relay):
         assert client.forced_ack is not None, "sparse ACK was not exercised"
         for post in (False, True):
             await asyncio.gather(*(client.request(post) for _ in range(64)))
+        assert not relay.oversized, relay.oversized
         print(
-            "PASS: lost first server flight; ACK ranges",
+            f"PASS: peer CID length {cid_length}; lost first server flight; ACK ranges",
             client.forced_ack,
-            "exclude pn0; handshake and 64 GET + 64 POST recovered",
+            "exclude pn0; handshake and 64 GET + 64 POST recovered;",
+            f"largest server datagram {relay.largest_datagram} <= 1200",
             flush=True,
         )
 
 
-async def main(binary):
+async def main(binary, cid_length):
     # Ephemeral loopback ports avoid collisions with other benchmark servers.
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -99,7 +109,7 @@ async def main(binary):
         await asyncio.sleep(0.2)
         assert server.poll() is None, "server exited during startup"
         port = transport.get_extra_info("sockname")[1]
-        await asyncio.wait_for(check(port, relay), 8)
+        await asyncio.wait_for(check(port, relay, cid_length), 8)
     finally:
         transport.close()
         if server is not None:
@@ -108,4 +118,5 @@ async def main(binary):
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1]))
+    for cid_length in (0, 8, 20):
+        asyncio.run(main(sys.argv[1], cid_length))

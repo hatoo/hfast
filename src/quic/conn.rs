@@ -52,7 +52,8 @@ enum StreamSlot {
 }
 
 /// Room a packet's header and tag need before any payload fits
-const PACKET_OVERHEAD: usize = 1 + 4 + 1 + ConnectionId::MAX + 1 + ConnectionId::MAX + 1 + 4 + 4;
+const PACKET_OVERHEAD: usize =
+    1 + 4 + 1 + ConnectionId::MAX + 1 + ConnectionId::MAX + 1 + 4 + 4 + TAG_LEN;
 
 /// What the peer has sent that we owe an acknowledgement for
 #[derive(Default)]
@@ -1024,14 +1025,24 @@ impl Connection {
         let st = &mut self.spaces[space as usize];
         if st.ack.owed && !st.ack.ranges.is_empty() {
             frame::put_ack(body, &st.ack.ranges, 0);
-            st.ack.owed = false;
+            if body.len() <= body_room {
+                st.ack.owed = false;
+            } else {
+                // A coalesced packet may not have room for all the ranges.
+                // Keep the whole ACK owed for a later datagram. Smaller
+                // frames can still use the space left in this one.
+                body.clear();
+            }
         }
         let ack_only_len = body.len();
         st.write_crypto(body, body_room, pn);
         if space == Space::Data {
-            if let Some(data) = self.path_response.take() {
+            if let Some(data) = self.path_response
+                && body.len() + 1 + data.len() <= body_room
+            {
                 put_varint(body, frame::PATH_RESPONSE);
                 body.extend_from_slice(&data);
+                self.path_response = None;
             }
             // RFC 9001 Section 4.1.2: this says the handshake is confirmed,
             // which it is not until the client's Finished has arrived. Sending
@@ -1059,6 +1070,7 @@ impl Connection {
         if 1 + body.len() + TAG_LEN < SAMPLED {
             body.resize(SAMPLED - TAG_LEN - 1, 0);
         }
+        debug_assert!(body.len() <= body_room);
 
         let st = &mut self.spaces[space as usize];
         st.next_pn += 1;
@@ -1111,6 +1123,7 @@ impl Connection {
             pn_offset - packet_start,
             pn_len,
         )?;
+        debug_assert!(out.len() - datagram_start <= MAX_DATAGRAM);
 
         // A packet carrying nothing but an acknowledgement is not itself
         // acknowledged, so waiting for one would be waiting for ever
@@ -1216,6 +1229,8 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod datagram_budget;
 
     fn connection() -> Connection {
         connection_and_client().0
