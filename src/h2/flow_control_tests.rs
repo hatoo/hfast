@@ -403,6 +403,110 @@ fn repeated_retire_and_refill_reuses_bounded_capacity_and_survives_wrapped_growt
 }
 
 #[test]
+fn trickle_connection_grants_preserve_partial_bodies_across_queue_wraps() {
+    for grant in [1, 12, 13, 14] {
+        let mut conn = fresh(13);
+        conn.send_window = 0;
+        let mut next = 1;
+        for _ in 0..128 {
+            assert_eq!(deliver(&mut conn, &request(next)), response_headers(next));
+            next += 2;
+        }
+        let capacity = conn.pending.capacity();
+        let mut sent = 0_usize;
+        let mut wrapped = false;
+        for _ in 0..32 {
+            let end = sent + 65 * BODY.len();
+            while sent < end {
+                let amount = grant.min(end - sent);
+                let mut expected = Vec::new();
+                let stop = sent + amount;
+                while sent < stop {
+                    let stream = (sent / BODY.len()) as u32 * 2 + 1;
+                    let offset = sent % BODY.len();
+                    let count = (BODY.len() - offset).min(stop - sent);
+                    expected.extend(frame(
+                        DATA,
+                        u8::from(offset + count == BODY.len()),
+                        stream,
+                        &BODY[offset..offset + count],
+                    ));
+                    sent += count;
+                }
+                assert_eq!(deliver(&mut conn, &credit(0, amount as u32)), expected);
+                assert_eq!(conn.send_window, 0);
+            }
+            for _ in 0..65 {
+                assert_eq!(deliver(&mut conn, &request(next)), response_headers(next));
+                next += 2;
+            }
+            assert_eq!(conn.pending.len(), 128);
+            assert_eq!(conn.pending.capacity(), capacity);
+            wrapped |= !conn.pending.as_slices().1.is_empty();
+        }
+        assert!(wrapped);
+        let first = (sent / BODY.len()) as u32 * 2 + 1;
+        let expected = (first..next)
+            .step_by(2)
+            .flat_map(|stream| frame(DATA, 1, stream, BODY))
+            .collect::<Vec<_>>();
+        assert_eq!(deliver(&mut conn, &credit(0, 128 * 13)), expected);
+        assert!(conn.pending.is_empty());
+        assert_eq!(conn.send_window, 0);
+    }
+}
+
+#[test]
+fn connection_resume_passes_partial_and_negative_heads_without_refunding_resets() {
+    let mut conn = fresh(5);
+    conn.send_window = 0;
+    for stream in [1, 3, 5, 7, 9] {
+        assert_eq!(
+            deliver(&mut conn, &request(stream)),
+            response_headers(stream)
+        );
+    }
+    // The front consumes its five stream bytes; the fallback uses the final
+    // two connection bytes on the next stream in the same resume call.
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 7)),
+        [frame(DATA, 0, 1, b"Hello"), frame(DATA, 0, 3, b"He")].concat()
+    );
+    deliver(&mut conn, &setting(0));
+    assert_eq!(conn.pending[0].window, -5);
+    assert_eq!(conn.pending[1].window, -2);
+    assert!(deliver(&mut conn, &credit(3, 15)).is_empty());
+    assert!(deliver(&mut conn, &credit(7, 13)).is_empty());
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 14)),
+        [frame(DATA, 1, 3, b"llo, World!"), frame(DATA, 0, 7, b"Hel")].concat()
+    );
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 30)),
+        frame(DATA, 1, 7, b"lo, World!")
+    );
+    assert_eq!(conn.send_window, 20);
+    assert!(deliver(&mut conn, &frame(RST_STREAM, 0, 1, &[0; 4])).is_empty());
+    assert_eq!(conn.send_window, 20);
+    assert_eq!(
+        deliver(&mut conn, &setting(13)),
+        [
+            frame(SETTINGS, 1, 0, b""),
+            frame(DATA, 1, 5, BODY),
+            frame(DATA, 0, 9, b"Hello, ")
+        ]
+        .concat()
+    );
+    assert_eq!(conn.send_window, 0);
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 6)),
+        frame(DATA, 1, 9, b"World!")
+    );
+    assert!(conn.pending.is_empty());
+    assert!(deliver(&mut conn, &credit(1, 13)).is_empty());
+}
+
+#[test]
 fn wrapped_pending_queue_matches_credit_model_through_mixed_events() {
     use std::collections::BTreeMap;
     // Wider signed windows and an ordered map provide a storage-independent

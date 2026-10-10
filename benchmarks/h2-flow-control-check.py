@@ -323,6 +323,89 @@ def pending_queue(port, fragmented):
         peer.close()
 
 
+def connection_trickle(port, fragmented):
+    peer = Peer(port, fragmented=fragmented)
+    try:
+        streams = []
+        for start in range(0, 5042, 128):
+            streams.extend(peer.request() for _ in range(min(128, 5042 - start)))
+            peer.exchange()
+        for stream in streams[:-1]:
+            peer.expect(stream, 13, True)
+        head = streams[-1]
+        peer.expect(head, 2)
+        assert peer.client.inbound_flow_control_window == 0
+        peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0})
+        peer.exchange()  # The partial head now has negative stream credit.
+        replies = 5041
+        cancelled = 0
+        for grant in [1, 12, 13, 14]:
+            blocked = [peer.request() for _ in range(8)]
+            active = [peer.request() for _ in range(64)]
+            peer.exchange()
+            # With connection credit exhausted, every eligible stream waits.
+            for stream in active:
+                peer.grant(13, stream)
+            peer.exchange()
+            sent = 0
+            while sent < len(active) * len(BODY):
+                amount = min(grant, len(active) * len(BODY) - sent)
+                peer.grant(amount)
+                peer.exchange()
+                sent += amount
+                for index, stream in enumerate(active):
+                    length = min(13, max(0, sent - index * 13))
+                    peer.expect(stream, length, length == 13)
+                for stream in blocked:
+                    peer.expect(stream, 0)
+                assert peer.client.inbound_flow_control_window == 0
+            replies += len(active)
+            for stream in blocked:
+                peer.client.reset_stream(stream)
+            cancelled += len(blocked)
+            peer.exchange()
+            # Retire the negative head after testing the sparse fallback, then
+            # repeat the same credit pattern through the ready-front path.
+            if head is not None:
+                peer.expect(head, 2)
+                peer.client.reset_stream(head)
+                cancelled += 1
+                head = None
+            peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 13})
+            peer.exchange()
+            active = [peer.request() for _ in range(128)]
+            peer.exchange()
+            # Refill the same queue several times while connection grants
+            # retire prefixes, exercising wrapped storage and partial bodies.
+            for _ in range(3):
+                sent = 0
+                while sent < 65 * 13:
+                    amount = min(grant, 65 * 13 - sent)
+                    peer.grant(amount)
+                    peer.exchange()
+                    sent += amount
+                    for index, stream in enumerate(active):
+                        length = min(13, max(0, sent - index * 13))
+                        peer.expect(stream, length, length == 13)
+                    assert peer.client.inbound_flow_control_window == 0
+                replies += 65
+                active = active[65:] + [peer.request() for _ in range(65)]
+                peer.exchange()
+            peer.grant(128 * 13)
+            peer.exchange()
+            for stream in active:
+                peer.expect(stream, 13, True)
+            replies += len(active)
+            assert peer.client.inbound_flow_control_window == 0
+            peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0})
+            peer.exchange()
+        return {"case": "connection-trickle", "fragmented": fragmented,
+                "replies": replies, "cancelled": cancelled,
+                "grants": [1, 12, 13, 14], "refills": 12}
+    finally:
+        peer.close()
+
+
 def backpressure(port, fragmented):
     # Complete valid responses exceed the TCP send and receive buffers; queued
     # DATA and GOAWAY must survive partial socket writes. For this large batch,
@@ -415,7 +498,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--case", choices=["stream-zero", "connection", "settings",
-                                          "invalid", "pending-queue", "backpressure",
+                                          "invalid", "pending-queue", "connection-trickle", "backpressure",
                                           "all"], default="all")
     args = parser.parse_args()
     with socket.socket() as listener:
@@ -438,6 +521,7 @@ def main():
             checks = {"stream-zero": stream_zero, "connection": connection_credit,
                       "settings": settings_and_resets, "invalid": invalid_updates,
                       "pending-queue": pending_queue,
+                      "connection-trickle": connection_trickle,
                       "backpressure": backpressure}
             results = [check(port, fragmented) for name, check in checks.items()
                        if args.case in [name, "all"]
