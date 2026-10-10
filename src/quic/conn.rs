@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustls::Side;
-use rustls::quic::{DirectionalKeys, KeyChange, Keys, ServerConnection, Version};
+use rustls::quic::{
+    DirectionalKeys, KeyChange, Keys, PacketKey, PacketKeySet, Secrets, ServerConnection, Version,
+};
 
 use super::packet::{self, Kind, Space};
 use super::wire::{
@@ -276,12 +278,43 @@ impl SpaceState {
     }
 }
 
+/// Packet keys rotate together; header protection keys never change (RFC 9001
+/// Section 6). Retained secrets and extra keys live outside the inline stream state.
+struct KeyUpdates {
+    secrets: Secrets,
+    next: PacketKeySet,
+    previous: Option<(Box<dyn PacketKey>, Instant)>,
+    phase: bool,
+    /// Lowest authenticated packet number in the current generation.
+    first: Option<u64>,
+    /// Highest authenticated packet number in the previous generation.
+    previous_largest: Option<u64>,
+    failed_decryptions: u64,
+}
+
+impl KeyUpdates {
+    fn new(mut secrets: Secrets) -> Self {
+        // Preparing these here avoids deriving keys in response to forgery.
+        let next = secrets.next_packet_keys();
+        Self {
+            secrets,
+            next,
+            previous: None,
+            phase: false,
+            first: None,
+            previous_largest: None,
+            failed_decryptions: 0,
+        }
+    }
+}
+
 pub struct Connection {
     tls: ServerConnection,
     initial: Option<Keys>,
     handshake: Option<Keys>,
     one_rtt_local: Option<DirectionalKeys>,
     one_rtt_remote: Option<DirectionalKeys>,
+    key_updates: Option<Box<KeyUpdates>>,
     spaces: [SpaceState; 3],
     /// The id this server answers to
     pub local_cid: ConnectionId,
@@ -382,6 +415,7 @@ impl Connection {
             handshake: None,
             one_rtt_local: None,
             one_rtt_remote: None,
+            key_updates: None,
             spaces: Default::default(),
             local_cid,
             peer_cid,
@@ -506,7 +540,10 @@ impl Connection {
                 at = end;
                 continue;
             }
-            self.recv_packet(&mut datagram[at..end], space)?;
+            if !self.recv_packet(&mut datagram[at..end], space)? {
+                at = end;
+                continue;
+            }
             // RFC 9001 Section 4.9.1: a Handshake packet from the client
             // proves it has moved on, and the Initial space is done with
             if space == Space::Handshake {
@@ -525,13 +562,19 @@ impl Connection {
         Ok(())
     }
 
-    fn recv_packet(&mut self, packet: &mut [u8], space: Space) -> Result<()> {
+    fn recv_packet(&mut self, packet: &mut [u8], space: Space) -> Result<bool> {
+        // Having 1-RTT keys does not prove the client finished the handshake.
+        if space == Space::Data && self.tls.is_handshaking() {
+            return Ok(false);
+        }
         let pn_offset = {
             let h = packet::parse(packet, 0)?;
             h.pn_offset
         };
         let keys = self.remote_keys(space).ok_or(Error)?;
-        let (first, pn_len) = unprotect_header(keys.header.as_ref(), packet, pn_offset)?;
+        let Ok((first, pn_len)) = unprotect_header(keys.header.as_ref(), packet, pn_offset) else {
+            return Ok(false);
+        };
         packet[0] = first;
 
         let mut truncated = 0u64;
@@ -544,12 +587,19 @@ impl Connection {
 
         let header_end = pn_offset + pn_len;
         let (header, payload) = packet.split_at_mut(header_end);
-        let keys = self.remote_keys(space).ok_or(Error)?;
-        let plain = keys
-            .packet
-            .decrypt_in_place(pn, header, payload)
-            .map_err(|_| Error)?;
-        let plain_len = plain.len();
+        let plain_len = if space == Space::Data {
+            let Some(len) = self.decrypt_data(pn, largest, first & 0x04 != 0, header, payload)?
+            else {
+                return Ok(false);
+            };
+            len
+        } else {
+            let keys = self.remote_keys(space).ok_or(Error)?;
+            let Ok(plain) = keys.packet.decrypt_in_place(pn, header, payload) else {
+                return Ok(false);
+            };
+            plain.len()
+        };
 
         // The caller owns packet independently of the connection. Consume
         // borrowed frames directly instead of allocating a list per packet.
@@ -563,7 +613,76 @@ impl Connection {
             self.on_frame(&f, space)?;
         }
         self.spaces[space as usize].ack.record(pn, ack_eliciting);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Select one prepared receive key by phase and packet number. No keys,
+    /// ACKs, packet numbers or stream state advance until AEAD authenticates.
+    fn decrypt_data(
+        &mut self,
+        pn: u64,
+        largest: u64,
+        phase: bool,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> Result<Option<usize>> {
+        let updates = self.key_updates.as_mut().ok_or(Error)?;
+        let current = self.one_rtt_remote.as_mut().ok_or(Error)?;
+        let changed = phase != updates.phase;
+        let previous = changed && updates.first.is_some_and(|first| pn < first);
+        let retained = if previous {
+            updates
+                .previous
+                .as_ref()
+                .filter(|(_, until)| Instant::now() < *until)
+        } else {
+            None
+        };
+        let key = if !changed {
+            current.packet.as_ref()
+        } else {
+            // Expired/missing old keys still perform one AEAD attempt with a
+            // prepared key, avoiding a cheap oracle for the protected phase.
+            retained.map_or(updates.next.remote.as_ref(), |(key, _)| key.as_ref())
+        };
+        let plain_len = match key.decrypt_in_place(pn, header, payload) {
+            Ok(plain) => plain.len(),
+            Err(_) => {
+                updates.failed_decryptions += 1;
+                if updates.failed_decryptions >= current.packet.integrity_limit() {
+                    return Err(Error);
+                }
+                // An unauthenticated datagram must not tear down the connection.
+                return Ok(None);
+            }
+        };
+        if previous {
+            if retained.is_none() {
+                return Err(Error);
+            }
+            updates.previous_largest = Some(updates.previous_largest.map_or(pn, |n| n.max(pn)));
+        } else if changed {
+            // An update cannot move backwards in packet-number space.
+            if updates.first.is_some() && pn <= largest {
+                return Err(Error);
+            }
+            let next = std::mem::replace(&mut updates.next, updates.secrets.next_packet_keys());
+            let old = std::mem::replace(&mut current.packet, next.remote);
+            self.one_rtt_local.as_mut().ok_or(Error)?.packet = next.local;
+            let pto = self.srtt
+                + (4 * self.rttvar).max(Duration::from_millis(1))
+                + Duration::from_millis(25);
+            updates.previous = Some((old, Instant::now() + 3 * pto));
+            updates.previous_largest = updates.first.map(|_| largest);
+            updates.first = Some(pn);
+            updates.phase = phase;
+        } else {
+            if updates.previous_largest.is_some_and(|n| pn <= n) {
+                return Err(Error);
+            }
+            updates.first = Some(updates.first.map_or(pn, |n| n.min(pn)));
+        }
+        Ok(Some(plain_len))
     }
 
     fn on_frame(&mut self, f: &frame::Frame<'_>, space: Space) -> Result<()> {
@@ -866,7 +985,8 @@ impl Connection {
             }
             match change {
                 Some(KeyChange::Handshake { keys }) => self.handshake = Some(keys),
-                Some(KeyChange::OneRtt { keys, .. }) => {
+                Some(KeyChange::OneRtt { keys, next }) => {
+                    self.key_updates = Some(Box::new(KeyUpdates::new(next)));
                     self.one_rtt_local = Some(keys.local);
                     self.one_rtt_remote = Some(keys.remote);
                     if let Some(p) = self.tls.quic_transport_parameters()
@@ -1079,7 +1199,8 @@ impl Connection {
         let packet_start = out.len();
         let length_at = match space {
             Space::Data => {
-                out.push(0x40 | (pn_len as u8 - 1));
+                let phase = self.key_updates.as_ref().is_some_and(|keys| keys.phase);
+                out.push(0x40 | (u8::from(phase) << 2) | (pn_len as u8 - 1));
                 out.extend_from_slice(self.peer_cid.as_slice());
                 usize::MAX
             }
@@ -1145,17 +1266,34 @@ impl Connection {
     /// left in flight to trigger that does not sit there. Making it tight
     /// instead turns every quiet moment into a resend of everything.
     pub fn timeout(&self) -> Option<Instant> {
-        let oldest = self.spaces.iter().filter_map(|s| s.oldest_sent).min()?;
-        let pto = (self.srtt
-            + (4 * self.rttvar).max(Duration::from_millis(1))
-            + Duration::from_millis(25))
-            * (1 << self.pto_count.min(6));
-        Some(oldest + pto)
+        let key_deadline = self
+            .key_updates
+            .as_ref()
+            .and_then(|keys| keys.previous.as_ref().map(|(_, until)| *until));
+        self.loss_timeout().into_iter().chain(key_deadline).min()
     }
 
-    /// Put back everything still in flight, to be sent again
+    fn pto(&self) -> Duration {
+        self.srtt + (4 * self.rttvar).max(Duration::from_millis(1)) + Duration::from_millis(25)
+    }
+
+    fn loss_timeout(&self) -> Option<Instant> {
+        let oldest = self.spaces.iter().filter_map(|s| s.oldest_sent).min()?;
+        Some(oldest + self.pto() * (1 << self.pto_count.min(6)))
+    }
+
+    /// Discard expired receive keys and put back flight data only when its own
+    /// PTO expires. Key retirement alone must not trigger retransmissions.
     pub fn on_timeout(&mut self, now: Instant) {
-        if self.timeout().is_none_or(|t| now < t) {
+        if let Some(keys) = self.key_updates.as_mut()
+            && keys
+                .previous
+                .as_ref()
+                .is_some_and(|(_, until)| now >= *until)
+        {
+            keys.previous = None;
+        }
+        if self.loss_timeout().is_none_or(|t| now < t) {
             return;
         }
         self.pto_count = self.pto_count.saturating_add(1);
@@ -1231,6 +1369,7 @@ mod tests {
     use super::*;
 
     mod datagram_budget;
+    mod key_updates;
 
     fn connection() -> Connection {
         connection_and_client().0
