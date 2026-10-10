@@ -32,6 +32,8 @@ jobs:
         run: python benchmarks/interoperability.py target/release/hfast
       - name: HTTP/1 body fragments and pipelining
         run: python benchmarks/h1-body-check.py target/release/hfast
+      - name: HTTP/1 header fragments and delayed errors
+        run: python benchmarks/h1-header-check.py target/release/hfast
       - name: HTTP/2 request header continuations
         run: python benchmarks/h2-continuation-check.py target/release/hfast
       - name: QUIC handshake recovery with sparse ACKs
