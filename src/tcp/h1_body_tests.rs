@@ -112,7 +112,7 @@ fn large_fragmented_bodies_do_not_grow_the_input_buffer() {
         }
         assert!(consume(&mut conn, b"xGET / HTTP/1.1\r\n"));
         assert_eq!(conn.outbuf, RESPONSE);
-        assert_eq!(conn.inbuf, b"GET / HTTP/1.1\r\n");
+        assert!(conn.inbuf.is_empty(), "partial headers are consumed too");
         conn.outbuf.clear();
         assert!(consume(&mut conn, b"\r\n"));
         assert_eq!(conn.outbuf, RESPONSE);

@@ -20,12 +20,14 @@ enum Proto {
     Unknown,
     H1 {
         remaining_body: usize,
+        head: h1::Head,
     },
     H2(h2::Conn),
 }
 
 struct Conn {
-    /// Incomplete headers or frames. HTTP/1 body bytes are consumed directly.
+    /// Undecided protocol bytes or incomplete HTTP/2 frames. HTTP/1 headers
+    /// and body bytes are consumed directly.
     inbuf: Vec<u8>,
     /// Responses waiting to go out, written once per wakeup
     outbuf: Vec<u8>,
@@ -54,7 +56,12 @@ impl Conn {
         if let Proto::Unknown = self.proto {
             match settle(buf) {
                 Which::Undecided => return Some(0), // wait for more bytes
-                Which::H1 => self.proto = Proto::H1 { remaining_body: 0 },
+                Which::H1 => {
+                    self.proto = Proto::H1 {
+                        remaining_body: 0,
+                        head: h1::Head::default(),
+                    }
+                }
                 Which::H2 => {
                     at = h2::PREFACE.len();
                     self.proto = Proto::H2(h2::Conn::new(&mut self.outbuf));
@@ -62,7 +69,10 @@ impl Conn {
             }
         }
         match &mut self.proto {
-            Proto::H1 { remaining_body } => {
+            Proto::H1 {
+                remaining_body,
+                head,
+            } => {
                 if *remaining_body > 0 {
                     let used = (*remaining_body).min(buf.len());
                     *remaining_body -= used;
@@ -72,8 +82,8 @@ impl Conn {
                     }
                     h1::respond(&mut self.outbuf);
                 }
-                loop {
-                    match h1::parse(&buf[at..]) {
+                while at < buf.len() {
+                    match head.parse(&buf[at..]) {
                         h1::Request::Whole(n) => {
                             h1::respond(&mut self.outbuf);
                             at += n;
@@ -82,7 +92,7 @@ impl Conn {
                             *remaining_body = n;
                             return Some(buf.len());
                         }
-                        h1::Request::Partial => break,
+                        h1::Request::Partial => return Some(buf.len()),
                         h1::Request::Bad => return None,
                     }
                 }
@@ -358,6 +368,9 @@ mod h2_continuation_tests;
 
 #[cfg(test)]
 mod h1_body_tests;
+
+#[cfg(test)]
+mod h1_header_tests;
 
 #[cfg(test)]
 mod tests {
