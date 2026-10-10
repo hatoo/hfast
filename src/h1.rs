@@ -205,8 +205,21 @@ pub fn respond(out: &mut Vec<u8>) {
 /// RFC 9112 Section 2.2 spells the line ending CRLF, and a vectorised search for
 /// the four bytes beats walking the request looking for one of them.
 fn find_empty_line(buf: &[u8]) -> Option<usize> {
-    memchr::memmem::find(buf, b"\r\n\r\n").map(|i| i + 4)
+    // Keep memmem's short-haystack path, but prepare the vectorised searcher
+    // only once for longer receives and pipelines. Finder::find shares no
+    // mutable search state between workers.
+    static FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"\r\n\r\n"));
+    let found = if buf.len() < 64 {
+        memchr::memmem::find(buf, b"\r\n\r\n")
+    } else {
+        FINDER.find(buf)
+    };
+    found.map(|i| i + 4)
 }
+
+#[cfg(test)]
+mod delimiter_tests;
 
 /// The declared body length, or `None` if the header is there but unreadable.
 /// A request without one has no body.
