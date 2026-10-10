@@ -290,7 +290,15 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
                 continue;
             }
             if let Some(conn) = conns[token as usize].as_ref() {
-                let flags = libc::POLLIN
+                let closing = matches!(&conn.proto, Proto::H2(h2) if h2.is_closing());
+                if closing && conn.out_off == conn.outbuf.len() {
+                    unsafe {
+                        libc::close(token as RawFd);
+                    }
+                    conns[token as usize] = None;
+                    continue;
+                }
+                let flags = if closing { 0 } else { libc::POLLIN }
                     | if conn.out_off < conn.outbuf.len() {
                         libc::POLLOUT
                     } else {

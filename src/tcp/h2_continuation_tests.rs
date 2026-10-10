@@ -79,3 +79,36 @@ fn consume_closes_on_interleaving_even_with_carried_input() {
         }
     }
 }
+
+#[test]
+fn credit_error_preserves_queued_output_until_tcp_finishes_writing() {
+    let input = [
+        h2::PREFACE.to_vec(),
+        frame(4, 0, 0, &[0, 4, 0, 0, 0, 0]),
+        frame(1, 5, 1, b"request"),
+        frame(8, 0, 1, &[0, 0, 0, 5]),
+        frame(8, 0, 0, &[0, 0, 0, 0]),
+        frame(1, 5, 3, b"ignored after GOAWAY"),
+    ]
+    .concat();
+    for chunk in 1..=input.len() {
+        let mut conn = Conn::new();
+        for part in input.chunks(chunk) {
+            assert!(consume(&mut conn, part));
+        }
+        assert!(conn.inbuf.is_empty());
+        assert!(matches!(&conn.proto, Proto::H2(h2) if h2.is_closing()));
+        let suffix = [
+            frame(1, 4, 1, b"\x88\x0f\x10\x0atext/plain\x0f\x0d\x02\x31\x33"),
+            frame(0, 0, 1, b"Hello"),
+            frame(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 1]),
+        ]
+        .concat();
+        assert!(conn.outbuf.ends_with(&suffix));
+        let saved = conn.outbuf.clone();
+        conn.out_off = saved.len() - 3; // The last send wrote only part of GOAWAY.
+        assert!(consume(&mut conn, &frame(8, 0, 1, &[0, 0, 0, 8])));
+        assert_eq!(conn.outbuf, saved);
+        assert_eq!(conn.out_off, saved.len() - 3);
+    }
+}
