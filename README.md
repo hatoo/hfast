@@ -59,6 +59,10 @@ Only unfinished response bodies retain stream state; a response with sufficient
 credit needs no stream allocation. Request trailers do not trigger another
 response. HTTP/2 and HTTP/3 advertise large stream receive windows for request
 bodies; those windows do not determine how much response data the client permits.
+HTTP/3 replenishes stream credit as request data is discarded, so a body can
+exceed the initial 16 MiB window. Credit updates are recovered after packet loss
+and stop when FIN or RESET_STREAM establishes the final size. See the
+[large-body credit regression](benchmarks/stream-receive-credit.md).
 
 ## How it is built
 

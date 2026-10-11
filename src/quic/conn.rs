@@ -20,6 +20,9 @@ use super::{MAX_DATAGRAM, TAG_LEN, assemble::Assembler, frame, transport};
 
 use crate::h3::{CONTROL_PRELUDE, RESPONSE};
 
+mod stream_credit;
+use stream_credit::{MAX_STREAM_OFFSET, StreamCredits};
+
 /// The uni stream this server opens for its control stream. Server-initiated
 /// unidirectional streams are 3, 7, 11 (RFC 9000 Section 2.1) and this opens
 /// exactly one.
@@ -195,7 +198,9 @@ impl Credit {
     }
 
     fn owed(&self, limit: u64, window: u64) -> bool {
-        self.flight.pending || limit.saturating_sub(self.told) >= (window / 2).max(1)
+        self.flight.pending
+            || limit.saturating_sub(self.told) >= (window / 2).max(1)
+            || (limit == MAX_STREAM_OFFSET && limit > self.told)
     }
 
     fn write(&mut self, body: &mut Vec<u8>, body_room: usize, pn: u64, kind: u64, limit: u64) {
@@ -341,8 +346,10 @@ pub struct Connection {
     uni_sizes: [u64; transport::MAX_STREAMS_UNI],
     /// One bit per uni stream whose final size is known (FIN or RESET_STREAM).
     uni_final: u8,
-    /// The advertised byte limit per stream; no MAX_STREAM_DATA updates are sent.
+    /// The initial receive window, replenished as request bytes are discarded.
     stream_max_data: u64,
+    /// Only streams that outgrow their initial window need delivery state.
+    receive_credit: Option<Box<StreamCredits>>,
     /// Streams whose answer is written but not yet in a packet
     ready: Vec<u64>,
     /// `(packet number, stream)` for every answer sent and not yet
@@ -429,6 +436,7 @@ impl Connection {
             uni_sizes: [0; transport::MAX_STREAMS_UNI],
             uni_final: 0,
             stream_max_data: initial_max_stream_data,
+            receive_credit: None,
             ready: Vec::new(),
             unacked: Vec::new(),
             resets: Vec::new(),
@@ -737,6 +745,9 @@ impl Connection {
                         .flight
                         .on_ack(largest, first_range, rest);
                     progress |= self.data_credit.flight.on_ack(largest, first_range, rest);
+                    if let Some(credits) = &mut self.receive_credit {
+                        progress |= credits.on_ack(largest, first_range, rest);
+                    }
                     if !self.unacked.is_empty() || !self.resets.is_empty() {
                         progress |= self.on_ack(largest, first_range, rest);
                     }
@@ -779,25 +790,31 @@ impl Connection {
     /// changes the answer, so nothing in it is put back together.
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
         let end = offset.checked_add(data.len() as u64).ok_or(Error)?;
-        if end > self.stream_max_data {
+        if end > MAX_STREAM_OFFSET {
             return Err(Error);
         }
         if id & 3 == 2 {
             return self.receive_uni(id, end, fin);
         }
         let available = self.data_credit.told.saturating_sub(self.data_seen);
+        let limit = self.receive_limit(id);
         let Some(req) = self.stream_mut(id) else {
             // Completed requests, invalid stream types and ungranted ids do
             // not reopen a request or replenish its connection credit.
             return Ok(());
         };
+        if end > if req.fin { req.size } else { limit } {
+            return Err(Error);
+        }
         let fresh = Self::received_bytes(req.size, req.fin, end, fin, available)?;
         req.size = req.size.max(end);
         req.fin |= fin;
         let answer = req.fin && !req.answered && !req.stopped;
         req.answered |= answer;
         let complete = req.fin && req.send_done;
+        let (size, final_known) = (req.size, req.fin);
         self.data_seen += fresh;
+        self.update_receive_credit(id, size, final_known);
         if answer {
             self.ready.push(id);
         }
@@ -830,10 +847,19 @@ impl Connection {
         if n >= self.uni_sizes.len() as u64 {
             return Ok(());
         }
+        let final_known = self.uni_final & (1 << n) != 0;
+        let limit = if final_known {
+            self.uni_sizes[n as usize]
+        } else {
+            self.receive_limit(id)
+        };
+        if end > limit {
+            return Err(Error);
+        }
         let size = &mut self.uni_sizes[n as usize];
         let fresh = Self::received_bytes(
             *size,
-            self.uni_final & (1 << n) != 0,
+            final_known,
             end,
             fin,
             self.data_credit.told.saturating_sub(self.data_seen),
@@ -843,20 +869,25 @@ impl Connection {
             self.uni_final |= 1 << n;
         }
         self.data_seen += fresh;
+        self.update_receive_credit(id, self.uni_sizes[n as usize], final_known || fin);
         Ok(())
     }
 
     fn on_reset(&mut self, id: u64, error_code: u64, final_size: u64) -> Result<()> {
-        if final_size > self.stream_max_data {
+        if final_size > MAX_STREAM_OFFSET {
             return Err(Error);
         }
         if id & 3 == 2 {
             return self.receive_uni(id, final_size, true);
         }
         let available = self.data_credit.told.saturating_sub(self.data_seen);
+        let limit = self.receive_limit(id);
         let Some(req) = self.stream_mut(id) else {
             return Ok(());
         };
+        if final_size > if req.fin { req.size } else { limit } {
+            return Err(Error);
+        }
         let fresh = Self::received_bytes(req.size, req.fin, final_size, true, available)?;
         req.size = final_size;
         req.fin = true;
@@ -866,6 +897,7 @@ impl Connection {
         let cancel = !req.answered;
         let complete = req.send_done;
         self.data_seen += fresh;
+        self.update_receive_credit(id, final_size, true);
         if cancel {
             self.stop_sending(id, error_code);
         }
@@ -873,6 +905,30 @@ impl Connection {
             self.complete_stream(id);
         }
         Ok(())
+    }
+
+    fn receive_limit(&self, id: u64) -> u64 {
+        self.receive_credit
+            .as_ref()
+            .map_or(self.stream_max_data, |credits| credits.limit(id))
+    }
+
+    fn update_receive_credit(&mut self, id: u64, size: u64, final_known: bool) {
+        if final_known {
+            if let Some(credits) = &mut self.receive_credit {
+                credits.remove(id);
+                if credits.is_empty() {
+                    self.receive_credit = None;
+                }
+                if !self.in_flight(Space::Data) {
+                    self.spaces[Space::Data as usize].oldest_sent = None;
+                }
+            }
+        } else if size >= (self.stream_max_data / 2).max(1) {
+            self.receive_credit
+                .get_or_insert_with(|| Box::new(StreamCredits::new(self.stream_max_data)))
+                .update(id, size);
+        }
     }
 
     fn stop_sending(&mut self, id: u64, error_code: u64) {
@@ -1033,7 +1089,9 @@ impl Connection {
     }
 
     fn data_limit(&self) -> u64 {
-        self.initial_max_data + self.data_seen
+        self.initial_max_data
+            .saturating_add(self.data_seen)
+            .min(MAX_STREAM_OFFSET)
     }
 
     /// Whether a credit has grown enough to be worth a frame. Half a window at
@@ -1045,6 +1103,7 @@ impl Connection {
             || self
                 .data_credit
                 .owed(self.data_limit(), self.initial_max_data)
+            || self.receive_credit.as_ref().is_some_and(|c| c.owed())
     }
 
     /// The 1-RTT payload: the control stream, credit, and answers
@@ -1073,6 +1132,9 @@ impl Connection {
         {
             self.data_credit
                 .write(body, body_room, pn, frame::MAX_DATA, self.data_limit());
+        }
+        if let Some(credits) = &mut self.receive_credit {
+            credits.write(body, body_room, pn);
         }
         for reset in &mut self.resets {
             if !reset.flight.pending {
@@ -1314,6 +1376,9 @@ impl Connection {
         self.handshake_done.on_timeout();
         self.streams_credit.flight.on_timeout();
         self.data_credit.flight.on_timeout();
+        if let Some(credits) = &mut self.receive_credit {
+            credits.on_timeout();
+        }
         for reset in &mut self.resets {
             reset.flight.on_timeout();
         }
@@ -1341,7 +1406,8 @@ impl Connection {
                     || !self.control.sent_in.is_empty()
                     || !self.handshake_done.sent_in.is_empty()
                     || !self.streams_credit.flight.sent_in.is_empty()
-                    || !self.data_credit.flight.sent_in.is_empty()))
+                    || !self.data_credit.flight.sent_in.is_empty()
+                    || self.receive_credit.as_ref().is_some_and(|c| c.in_flight())))
             || (space == Space::Data
                 && self
                     .resets
@@ -1370,6 +1436,7 @@ mod tests {
 
     mod datagram_budget;
     mod key_updates;
+    mod stream_credit;
 
     fn connection() -> Connection {
         connection_and_client().0
