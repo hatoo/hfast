@@ -22,6 +22,8 @@ use crate::h3::{CONTROL_PRELUDE, RESPONSE};
 
 mod stream_credit;
 use stream_credit::{MAX_STREAM_OFFSET, StreamCredits};
+mod send_credit;
+use send_credit::SendCredit;
 
 /// The uni stream this server opens for its control stream. Server-initiated
 /// unidirectional streams are 3, 7, 11 (RFC 9000 Section 2.1) and this opens
@@ -40,10 +42,16 @@ struct Request {
     answered: bool,
     /// The sending direction was reset; receive accounting must continue.
     stopped: bool,
-    /// The fixed response has been transmitted at least once.
-    sent: bool,
+    /// Highest response offset sent, charged once to connection credit.
+    sent: u8,
     /// The peer acknowledged the response or our RESET_STREAM.
     send_done: bool,
+    /// The peer's limit, capped at the fixed response length.
+    send_limit: u8,
+    /// Credit forced this response to use range recovery.
+    partial: bool,
+    /// The response has an entry in `ready`.
+    queued: bool,
 }
 
 /// A higher stream opens the lower slots too, but their request data may still
@@ -362,6 +370,7 @@ pub struct Connection {
     packet_body: Vec<u8>,
     /// The fixed SETTINGS prelude at control-stream offset zero
     control: ControlFlight,
+    send_credit: SendCredit,
     /// Requests finished, which is the credit the client gets back
     finished: u64,
     /// The latest stream/data credit and its delivery state
@@ -443,6 +452,7 @@ impl Connection {
             ack_ranges: Vec::new(),
             packet_body: Vec::new(),
             control: ControlFlight::new(),
+            send_credit: SendCredit::default(),
             finished: 0,
             streams_credit: Credit::new(max_streams_bidi),
             data_credit: Credit::new(initial_max_data),
@@ -479,9 +489,16 @@ impl Connection {
     }
 
     fn stream_mut(&mut self, id: u64) -> Option<&mut Request> {
+        let send_limit = self
+            .peer
+            .initial_max_stream_data_bidi_local
+            .min(RESPONSE.len() as u64) as u8;
         let slot = self.stream_slot_mut(id)?;
         if matches!(slot, StreamSlot::Unseen) {
-            *slot = StreamSlot::Active(Request::default());
+            *slot = StreamSlot::Active(Request {
+                send_limit,
+                ..Request::default()
+            });
         }
         match slot {
             StreamSlot::Active(req) => Some(req),
@@ -739,6 +756,7 @@ impl Connection {
                 }
                 if space == Space::Data {
                     progress |= self.control.on_ack(largest, first_range, rest);
+                    progress |= self.on_send_credit_ack(largest, first_range, rest);
                     progress |= self.handshake_done.on_ack(largest, first_range, rest);
                     progress |= self
                         .streams_credit
@@ -759,9 +777,12 @@ impl Connection {
             }
             frame::Frame::PathChallenge(data) => self.path_response = Some(data),
             frame::Frame::Close => self.closed = true,
-            frame::Frame::MaxData(_)
-            | frame::Frame::MaxStreamData { .. }
-            | frame::Frame::MaxStreams { .. }
+            frame::Frame::MaxData(limit) => self.on_max_data(limit),
+            frame::Frame::MaxStreamData { id, limit } => self.on_max_stream_data(id, limit),
+            frame::Frame::MaxStreams { bidi: false, limit } => {
+                self.send_credit.control_allowed |= limit > 0;
+            }
+            frame::Frame::MaxStreams { bidi: true, .. }
             | frame::Frame::Ping
             | frame::Frame::Padding
             | frame::Frame::Ignored => {}
@@ -816,7 +837,7 @@ impl Connection {
         self.data_seen += fresh;
         self.update_receive_credit(id, size, final_known);
         if answer {
-            self.ready.push(id);
+            self.queue_response(id);
         }
         if complete {
             self.complete_stream(id);
@@ -939,7 +960,8 @@ impl Connection {
             return;
         }
         req.stopped = true;
-        let final_size = if req.sent { RESPONSE.len() as u64 } else { 0 };
+        let final_size = u64::from(req.sent);
+        req.queued = false;
         self.resets.push(ResetFlight {
             id,
             error_code,
@@ -948,6 +970,8 @@ impl Connection {
         });
         self.ready.retain(|&stream| stream != id);
         self.unacked.retain(|&(_, stream)| stream != id);
+        self.send_credit.responses.remove(&id);
+        self.send_credit.blocked.remove(&id);
         if !self.in_flight(Space::Data) {
             self.spaces[Space::Data as usize].oldest_sent = None;
         }
@@ -983,36 +1007,45 @@ impl Connection {
         let streams = &mut self.streams;
         let base = self.base_stream;
         let mut finished = self.finished;
-        let mut finish_send = |id: u64| {
-            if let Some(i) = (id >> 2)
-                .checked_sub(base)
-                .and_then(|n| usize::try_from(n).ok())
-                && let Some(StreamSlot::Active(req)) = streams.get_mut(i)
-            {
-                req.send_done = true;
-                if req.fin {
-                    streams[i] = StreamSlot::Complete;
-                    finished += 1;
-                    retired = true;
+        let finish_send =
+            |streams: &mut Vec<StreamSlot>, finished: &mut u64, retired: &mut bool, id: u64| {
+                if let Some(i) = (id >> 2)
+                    .checked_sub(base)
+                    .and_then(|n| usize::try_from(n).ok())
+                    && let Some(StreamSlot::Active(req)) = streams.get_mut(i)
+                {
+                    req.send_done = true;
+                    if req.fin {
+                        streams[i] = StreamSlot::Complete;
+                        *finished += 1;
+                        *retired = true;
+                    }
                 }
-            }
-        };
+            };
         self.unacked.retain(|&(pn, id)| {
             if !ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi) {
                 if pn < lost_before {
-                    ready.push(id);
+                    if let Some(StreamSlot::Active(req)) =
+                        streams.get_mut(((id >> 2) - base) as usize)
+                        && !req.queued
+                        && !req.stopped
+                        && !req.send_done
+                    {
+                        req.queued = true;
+                        ready.push(id);
+                    }
                     return false;
                 }
                 return true;
             }
             acknowledged = true;
-            finish_send(id);
+            finish_send(streams, &mut finished, &mut retired, id);
             false
         });
         self.resets.retain_mut(|reset| {
             if reset.flight.on_ack(largest, first_range, rest) {
                 acknowledged = true;
-                finish_send(reset.id);
+                finish_send(streams, &mut finished, &mut retired, reset.id);
                 return false;
             }
             true
@@ -1049,6 +1082,7 @@ impl Connection {
                         && let Ok(peer) = transport::decode(p)
                     {
                         self.peer = peer;
+                        self.send_credit.initialize(&peer);
                     }
                     self.connected = true;
                     return;
@@ -1064,7 +1098,7 @@ impl Connection {
             || self.resets.iter().any(|reset| reset.flight.pending)
             || self.path_response.is_some()
             || (!self.tls.is_handshaking() && self.handshake_done.pending)
-            || (self.connected && self.control.pending)
+            || (self.connected && self.control_sendable())
             || self.credit_owed()
             || self.spaces.iter().any(|s| {
                 !s.crypto_out.is_empty() || s.crypto_flight.iter().any(|f| f.pending) || s.ack.owed
@@ -1108,12 +1142,7 @@ impl Connection {
 
     /// The 1-RTT payload: the control stream, credit, and answers
     fn write_data(&mut self, body: &mut Vec<u8>, body_room: usize, pn: u64) {
-        let control_len = frame::stream_overhead(CONTROL_STREAM, 0, CONTROL_PRELUDE.len())
-            + CONTROL_PRELUDE.len();
-        if self.control.pending && body.len() + control_len <= body_room {
-            frame::put_stream(body, CONTROL_STREAM, 0, false, CONTROL_PRELUDE);
-            self.control.sent(pn);
-        }
+        self.write_control(body, body_room, pn);
         if self
             .streams_credit
             .owed(self.streams_limit(), self.max_streams_bidi)
@@ -1156,13 +1185,35 @@ impl Connection {
         // Answers, as many as the packet holds. They go out newest first,
         // which costs nothing: every one of them is the same answer.
         while let Some(&id) = self.ready.last() {
+            let available = self.send_credit.available();
+            let Some(req) = self.stream_mut(id) else {
+                self.ready.pop();
+                continue;
+            };
+            if req.stopped || req.send_done {
+                req.queued = false;
+                self.ready.pop();
+                continue;
+            }
+            if req.partial
+                || req.send_limit < RESPONSE.len() as u8
+                || (req.sent == 0 && available < RESPONSE.len() as u64)
+            {
+                if self.write_partial_response(id, body, body_room, pn) {
+                    break;
+                }
+                continue;
+            }
             let need = frame::stream_overhead(id, 0, RESPONSE.len()) + RESPONSE.len();
             if body.len() + need > body_room {
                 break;
             }
             self.ready.pop();
             if let Some(req) = self.stream_mut(id) {
-                req.sent = true;
+                let fresh = RESPONSE.len() as u8 - req.sent;
+                req.sent = RESPONSE.len() as u8;
+                req.queued = false;
+                self.send_credit.sent += u64::from(fresh);
             }
             frame::put_stream(body, id, 0, true, RESPONSE);
             self.unacked.push((pn, id));
@@ -1369,9 +1420,20 @@ impl Connection {
             }
         }
         // An answer that was not acknowledged is queued to go again
-        for (_, id) in self.unacked.drain(..) {
-            self.ready.push(id);
+        for &(_, id) in &self.unacked {
+            if let Some(StreamSlot::Active(req)) = self
+                .streams
+                .get_mut(((id >> 2) - self.base_stream) as usize)
+                && !req.queued
+                && !req.stopped
+                && !req.send_done
+            {
+                req.queued = true;
+                self.ready.push(id);
+            }
         }
+        self.unacked.clear();
+        self.on_send_credit_timeout();
         self.control.on_timeout();
         self.handshake_done.on_timeout();
         self.streams_credit.flight.on_timeout();
@@ -1404,6 +1466,7 @@ impl Connection {
             || (space == Space::Data
                 && (!self.unacked.is_empty()
                     || !self.control.sent_in.is_empty()
+                    || self.send_credit.in_flight()
                     || !self.handshake_done.sent_in.is_empty()
                     || !self.streams_credit.flight.sent_in.is_empty()
                     || !self.data_credit.flight.sent_in.is_empty()
@@ -1436,6 +1499,7 @@ mod tests {
 
     mod datagram_budget;
     mod key_updates;
+    mod send_credit;
     mod stream_credit;
 
     fn connection() -> Connection {
@@ -1462,11 +1526,23 @@ mod tests {
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
+        let mut params = Vec::new();
+        for (id, value) in [
+            (4, 1 << 30),
+            (5, 1 << 24),
+            (6, 1 << 24),
+            (7, 1 << 24),
+            (9, 8),
+        ] {
+            put_varint(&mut params, id);
+            put_varint(&mut params, varint_len(value) as u64);
+            put_varint(&mut params, value);
+        }
         let client = rustls::quic::ClientConnection::new(
             Arc::new(client_config),
             Version::V1,
             "localhost".try_into().unwrap(),
-            vec![],
+            params,
         )
         .unwrap();
         let conn = Connection::accept(
