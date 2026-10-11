@@ -236,7 +236,34 @@ async def check(port, case):
                        create_protocol=lambda *a, **k: CreditClient(*a, case=case, **k)) as client:
         requests = [client.start_request() for _ in range(case.get("count", 8))]
         name = case["name"]
-        if name.startswith("stream"):
+        if name == "sparse-acks":
+            await client.until(lambda: client.raw.get(3) == CONTROL and
+                               all(len(client.raw.get(s, b"")) == 1 for s, _ in requests))
+            assert len(client.dropped) == 2
+            for packet, addr in reversed(client.held):
+                client.datagram_received(packet, addr)
+                client.datagram_received(packet, addr)
+            # Repeated ACK traffic with hundreds of credit-blocked replies;
+            # only one sparse response receives fresh credit at a time.
+            selected = [requests[i] for i in [511, 257, 2, 1]]
+            for stream, future in selected:
+                for end in [9, 19, len(RESPONSE)]:
+                    if stream == selected[0][0] and end == 9:
+                        client.drop_grant = True
+                    client.grant(stream, end)
+                    await client.until(lambda: len(client.raw.get(stream, b"")) == end)
+                    await asyncio.wait_for(client.ping(), 8)
+                    client.stale.extend([(stream, 0), (stream, end)])
+                    client.transmit()
+                    assert all(len(client.raw.get(s, b"")) == 1
+                               for s, _ in requests if s not in {x for x, _ in selected})
+                await client.until(future.done)
+            await client.stable()
+            # A dense refill and FIN retirement follow the sparse phase.
+            for stream, future in requests:
+                if not future.done():
+                    client.grant(stream, len(RESPONSE))
+        elif name.startswith("stream"):
             initial = case["stream"]
             await client.until(lambda: client.raw.get(3) == CONTROL)
             if initial:
@@ -332,7 +359,8 @@ async def main(args):
              dict(name="stream-loss", stream=4, fault="loss"),
              dict(name="stream-reorder", stream=4, fault="reorder"),
              dict(name="connection", data=0), dict(name="control", uni=0),
-             dict(name="uni-count", uni_count=0), dict(name="stop", stream=4)]
+             dict(name="uni-count", uni_count=0), dict(name="stop", stream=4),
+             dict(name="sparse-acks", stream=1, count=512, fault="reorder")]
     try:
         await asyncio.sleep(.2)
         assert server.poll() is None
