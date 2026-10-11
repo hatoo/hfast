@@ -63,6 +63,11 @@ HTTP/3 replenishes stream credit as request data is discarded, so a body can
 exceed the initial 16 MiB window. Credit updates are recovered after packet loss
 and stop when FIN or RESET_STREAM establishes the final size. See the
 [large-body credit regression](benchmarks/stream-receive-credit.md).
+HTTP/3 responses and SETTINGS also honor the peer's stream and connection
+receive limits. Small grants split the fixed messages into recoverable ranges;
+retransmissions do not consume fresh credit. The control stream waits for the
+peer's unidirectional stream allowance. See the
+[response-credit regression](benchmarks/response-credit.md).
 
 ## How it is built
 
