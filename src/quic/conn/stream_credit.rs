@@ -9,13 +9,21 @@ pub(super) const MAX_STREAM_OFFSET: u64 = (1 << 62) - 1;
 // Retain recent copies for late ACKs, but never grow memory with repeated loss.
 // Forgetting an older copy can only cause a redundant credit transmission.
 const COPIES: usize = 8;
+const NO_FLIGHT: usize = usize::MAX;
 
 struct Update {
     desired: u64,
     told: u64,
+    // NO_FLIGHT once acknowledged. ACK compaction and FIN/RESET removal
+    // keep this index in sync with StreamCredits::flights.
+    flight_index: usize,
+    queued: bool,
+}
+
+struct Flight {
+    id: u64,
     sent_in: [u64; COPIES],
     copies: usize,
-    queued: bool,
 }
 
 impl Update {
@@ -30,7 +38,9 @@ pub(super) struct StreamCredits {
     window: u64,
     streams: HashMap<u64, Update>,
     pending: VecDeque<u64>,
-    flights: usize,
+    // Advertised limits live until FIN/RESET, but only outstanding copies
+    // need ACK/loss/PTO work. Keep that work proportional to live flights.
+    flights: Vec<Flight>,
 }
 
 impl StreamCredits {
@@ -39,7 +49,7 @@ impl StreamCredits {
             window,
             streams: HashMap::new(),
             pending: VecDeque::new(),
-            flights: 0,
+            flights: Vec::new(),
         }
     }
 
@@ -52,8 +62,7 @@ impl StreamCredits {
         let update = self.streams.entry(id).or_insert(Update {
             desired,
             told: self.window,
-            sent_in: [0; COPIES],
-            copies: 0,
+            flight_index: NO_FLIGHT,
             queued: false,
         });
         update.desired = update.desired.max(desired);
@@ -68,7 +77,7 @@ impl StreamCredits {
     }
 
     pub(super) fn in_flight(&self) -> bool {
-        self.flights != 0
+        !self.flights.is_empty()
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -79,7 +88,12 @@ impl StreamCredits {
     /// Final-size validation remains in the connection's receive state.
     pub(super) fn remove(&mut self, id: u64) {
         if let Some(update) = self.streams.remove(&id) {
-            self.flights -= usize::from(update.copies != 0);
+            if update.flight_index != NO_FLIGHT {
+                self.flights.swap_remove(update.flight_index);
+                if let Some(flight) = self.flights.get(update.flight_index) {
+                    self.streams.get_mut(&flight.id).unwrap().flight_index = update.flight_index;
+                }
+            }
             if update.queued {
                 self.pending.retain(|&pending| pending != id);
             }
@@ -96,55 +110,69 @@ impl StreamCredits {
             put_varint(body, frame::MAX_STREAM_DATA);
             put_varint(body, id);
             put_varint(body, update.desired);
+            if update.flight_index == NO_FLIGHT {
+                update.flight_index = self.flights.len();
+                self.flights.push(Flight {
+                    id,
+                    sent_in: [0; COPIES],
+                    copies: 0,
+                });
+            }
+            let flight = &mut self.flights[update.flight_index];
             // Only a frame that fits advertises or supersedes a limit.
             if update.told != update.desired {
-                self.flights -= usize::from(update.copies != 0);
-                update.copies = 0;
+                flight.copies = 0;
                 update.told = update.desired;
             }
-            if update.copies == COPIES {
-                update.sent_in.copy_within(1.., 0);
-                update.copies -= 1;
+            if flight.copies == COPIES {
+                flight.sent_in.copy_within(1.., 0);
+                flight.copies -= 1;
             }
-            self.flights += usize::from(update.copies == 0);
-            update.sent_in[update.copies] = pn;
-            update.copies += 1;
+            flight.sent_in[flight.copies] = pn;
+            flight.copies += 1;
             update.queued = false;
             self.pending.pop_front();
         }
     }
 
     pub(super) fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) -> bool {
-        if self.flights == 0 {
+        if self.flights.is_empty() {
             return false;
         }
         let mut progress = false;
         let mut cancelled = false;
-        for (&id, update) in &mut self.streams {
-            if update.copies == 0 {
-                continue;
-            }
-            let acknowledged = update.sent_in[..update.copies].iter().any(|&pn| {
+        let mut kept = 0;
+        let mut compacting = false;
+        self.flights.retain(|flight| {
+            let acknowledged = flight.sent_in[..flight.copies].iter().any(|&pn| {
                 frame::AckRanges::new(largest, first_range, rest)
                     .any(|(lo, hi)| pn >= lo && pn <= hi)
             });
             if acknowledged {
-                update.copies = 0;
-                self.flights -= 1;
+                let update = self.streams.get_mut(&flight.id).unwrap();
+                update.flight_index = NO_FLIGHT;
+                compacting = true;
                 progress = true;
                 // An ACK can cancel a retry, but not a still-unsent increase.
                 if update.queued && !update.needs_update(self.window) {
                     update.queued = false;
                     cancelled = true;
                 }
-            } else if !update.queued
-                && largest.saturating_sub(update.sent_in[update.copies - 1])
-                    >= Connection::LOSS_THRESHOLD
-            {
-                update.queued = true;
-                self.pending.push_back(id);
+                return false;
             }
-        }
+            let lost = largest.saturating_sub(flight.sent_in[flight.copies - 1])
+                >= Connection::LOSS_THRESHOLD;
+            if compacting || lost {
+                let update = self.streams.get_mut(&flight.id).unwrap();
+                update.flight_index = kept;
+                if lost && !update.queued {
+                    update.queued = true;
+                    self.pending.push_back(flight.id);
+                }
+            }
+            kept += 1;
+            true
+        });
         if cancelled {
             self.pending.retain(|id| self.streams[id].queued);
         }
@@ -152,14 +180,19 @@ impl StreamCredits {
     }
 
     pub(super) fn on_timeout(&mut self) {
-        for (&id, update) in &mut self.streams {
-            if update.copies != 0 && !update.queued {
+        for flight in &self.flights {
+            let update = self.streams.get_mut(&flight.id).unwrap();
+            if !update.queued {
                 update.queued = true;
-                self.pending.push_back(id);
+                self.pending.push_back(flight.id);
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "stream_credit_model.rs"]
+mod model_tests;
 
 #[cfg(test)]
 mod tests {
@@ -173,8 +206,8 @@ mod tests {
         for pn in 0..100 {
             body.clear();
             credits.write(&mut body, 1200, pn);
-            assert_eq!(credits.flights, 1);
-            assert_eq!(credits.streams[&0].copies, ((pn + 1) as usize).min(COPIES));
+            assert_eq!(credits.flights.len(), 1);
+            assert_eq!(credits.flights[0].copies, ((pn + 1) as usize).min(COPIES));
             credits.on_timeout();
         }
         assert!(
@@ -190,9 +223,10 @@ mod tests {
         assert!(!credits.in_flight());
         assert_eq!(credits.limit(0), 96);
         println!(
-            "StreamCredits={} Update={} copies={COPIES}",
+            "StreamCredits={} Update={} Flight={} copies={COPIES}",
             size_of::<StreamCredits>(),
-            size_of::<Update>()
+            size_of::<Update>(),
+            size_of::<Flight>()
         );
     }
 
@@ -205,11 +239,11 @@ mod tests {
         credits.write(&mut body, 4, 10);
         body.clear();
         credits.write(&mut body, 4, 11);
-        assert_eq!(credits.flights, 2);
+        assert_eq!(credits.flights.len(), 2);
         credits.on_timeout();
         assert!(credits.on_ack(10, 0, &[]));
         assert!(credits.owed());
-        assert_eq!(credits.flights, 1);
+        assert_eq!(credits.flights.len(), 1);
         credits.remove(0);
         assert!(credits.owed());
         credits.remove(4);

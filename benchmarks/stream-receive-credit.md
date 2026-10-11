@@ -1,5 +1,9 @@
 # HTTP/3 stream receive credit
 
+This document records the c94 repair and its original costs. This branch's
+experimental c95 layout and measurements are in
+[Sparse stream-credit recovery](sparse-stream-credit.md).
+
 Previously each stream had a fixed 16 MiB receive limit. hfast waits for request
 FIN before answering, so larger request bodies stalled even though received
 data is immediately discarded. The c94 repair sends MAX_STREAM_DATA as offsets
