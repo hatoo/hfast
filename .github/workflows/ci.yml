@@ -48,6 +48,8 @@ jobs:
         run: python benchmarks/stream-recovery-check.py target/release/hfast
       - name: QUIC credit recovery with repeated packet loss
         run: python benchmarks/credit-recovery-check.py target/release/hfast
+      - name: QUIC stream receive credit for large request bodies
+        run: python benchmarks/stream-credit-check.py target/release/hfast
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
