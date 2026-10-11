@@ -33,6 +33,8 @@ struct Conn {
     outbuf: Vec<u8>,
     /// How much of `outbuf` the socket has taken
     out_off: usize,
+    /// The peer finished sending, but may still be waiting for queued replies.
+    read_eof: bool,
     proto: Proto,
 }
 
@@ -45,6 +47,7 @@ impl Conn {
             inbuf: Vec::new(),
             outbuf: Vec::new(),
             out_off: 0,
+            read_eof: false,
             proto: Proto::Unknown,
         }
     }
@@ -231,6 +234,11 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
                 let conn = conns[fd as usize].as_mut().unwrap();
                 let alive = if result > 0 {
                     consume(conn, &scratch[i * CHUNK..i * CHUNK + result as usize])
+                } else if result == 0 {
+                    // EOF ends input, not output. A previous partial send or
+                    // EAGAIN can leave complete responses waiting in outbuf.
+                    conn.read_eof = true;
+                    true
                 } else {
                     result == -libc::EAGAIN || result == -libc::EINTR
                 };
@@ -290,7 +298,8 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
                 continue;
             }
             if let Some(conn) = conns[token as usize].as_ref() {
-                let closing = matches!(&conn.proto, Proto::H2(h2) if h2.is_closing());
+                let closing =
+                    conn.read_eof || matches!(&conn.proto, Proto::H2(h2) if h2.is_closing());
                 if closing && conn.out_off == conn.outbuf.len() {
                     unsafe {
                         libc::close(token as RawFd);

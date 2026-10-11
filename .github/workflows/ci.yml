@@ -44,6 +44,10 @@ jobs:
         run: |
           python benchmarks/tcp-buffered-read-check.py target/release/hfast
           python benchmarks/tcp-buffered-read-check.py target/release/hfast --threads 2
+      - name: TCP half-close with queued responses
+        run: |
+          python benchmarks/tcp-halfclose-check.py target/release/hfast
+          python benchmarks/tcp-halfclose-check.py target/release/hfast --threads 2
       - name: HTTP/2 request header continuations
         run: python benchmarks/h2-continuation-check.py target/release/hfast
       - name: HTTP/2 response credit and backpressure
