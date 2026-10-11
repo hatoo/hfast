@@ -32,6 +32,7 @@ CARGO_INCREMENTAL=0 cargo test --release --locked
 CARGO_INCREMENTAL=0 cargo build --release --locked
 python -m pip install -r benchmarks/interop-requirements.txt
 python benchmarks/stream-credit-check.py target/release/hfast
+python benchmarks/sparse-stream-credit-check.py target/release/hfast
 ```
 
 The independent aioquic client sends two concurrent 16,842,759-byte POST bodies
@@ -44,6 +45,17 @@ The three connections exercise ordinary delivery, repeated credit-packet loss
 until the sender blocks, and delivery of obsolete credit packets in reverse
 order with duplicates after recovery. Each connection then completes eight
 additional GET/POST requests. The fixture is part of required CI.
+
+The sparse-credit fixture leaves eight extended streams open after each real
+8,388,625-byte body has been acknowledged. While those limits remain live,
+stream 0 sends another 16,842,759 bytes. It checks both ordinary delivery and
+credit-packet loss until the sender actually blocks, then replays the lost
+datagrams in reverse order with duplicates after recovery. Every encoded byte
+must be acknowledged before FIN, every FIN must be acknowledged, and all response
+statuses and bodies must match. It finishes streams in a different order from
+their creation, then verifies eight followup GET/POST responses per connection.
+Both modes run in required CI. This is a transport correctness test, not a
+throughput benchmark; it also passes on the original stream-credit repair.
 
 Baseline 30b137401746eab4fc9670550e143ce313e489b2 stalls at exactly 16,777,216
 bytes sent and acknowledged, with an encoded request end of 16,842,787 and no
