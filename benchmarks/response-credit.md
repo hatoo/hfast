@@ -32,7 +32,7 @@ cargo build --release --locked
 python benchmarks/response-credit-check.py target/release/hfast
 ```
 
-Its eight cases cover zero and tiny stream windows, sparse grants to 32
+Its nine cases cover zero and tiny stream windows, sparse grants to 32
 requests, connection exhaustion including SETTINGS, zero control credit,
 zero uni-stream allowance, cancellation after four response bytes, dropped
 response fragments, dropped credit updates, reordered duplicate packets, and
@@ -40,8 +40,17 @@ GET/POST followups. It checks authenticated frame offsets, every response byte,
 single delivered FINs, reset final sizes, and the serialized transport parameters.
 Automatic client window growth is disabled; intentional grants retain aioquic's
 delivery callbacks and recovery. Baseline fails the same fixture at response
-offset 25 with a stream limit of 1. The repaired server passes 87 initial
-responses, one intentional cancellation, and 64 followups.
+offset 25 with a stream limit of 1. The repaired server passes 599 initial
+responses, one intentional cancellation, and 72 followups.
+
+The `sparse-acks` case starts 512 responses with one byte of receive credit
+each. It loses two response packets, replays delayed duplicate packets, and
+then grants three increments to each of four widely separated streams while
+the other 508 remain blocked. PING/ACK traffic and stale grants accompany
+each increment, including one lost grant. A final dense refill completes all
+512 responses with exact bytes and one delivered FIN each. It runs in the
+existing required response-credit CI step and can be selected with
+`--case sparse-acks`. This is correctness coverage, with no rate measurement.
 
 Validation on Rust 1.98.0: 214 debug tests, 214 release tests, all 16 independent
 protocol fixtures, formatting, and strict production Clippy pass. Strict
