@@ -362,9 +362,9 @@ pub struct Connection {
     receive_credit: Option<Box<StreamCredits>>,
     /// Streams whose answer is written but not yet in a packet
     ready: Vec<u64>,
-    /// `(packet number, stream)` for every answer sent and not yet
-    /// acknowledged, so a lost one can be sent again
-    unacked: Vec<(u64, u64)>,
+    /// `(packet number, stream)` for complete answers, in packet-number order.
+    /// ACKs consume only the affected prefix; newer packets stay in place.
+    unacked: VecDeque<(u64, u64)>,
     resets: Vec<ResetFlight>,
     /// Scratch ranges reused as ACK frames arrive.
     ack_ranges: Vec<(u64, u64)>,
@@ -449,7 +449,7 @@ impl Connection {
             stream_max_data: initial_max_stream_data,
             receive_credit: None,
             ready: Vec::new(),
-            unacked: Vec::new(),
+            unacked: VecDeque::new(),
             resets: Vec::new(),
             ack_ranges: Vec::new(),
             packet_body: Vec::new(),
@@ -1027,7 +1027,12 @@ impl Connection {
                 }
             }
         };
-        self.unacked.retain(|&(pn, id)| {
+        let mut examined = 0;
+        let mut retained = 0;
+        while let Some(&(pn, id)) = self.unacked.get(examined)
+            && pn <= largest
+        {
+            examined += 1;
             if !ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi) {
                 if pn < lost_before {
                     if let Some(StreamSlot::Active(req)) =
@@ -1044,14 +1049,19 @@ impl Connection {
                             ready.push(id);
                         }
                     }
-                    return false;
+                    continue;
                 }
-                return true;
+                self.unacked[retained] = (pn, id);
+                retained += 1;
+                continue;
             }
             acknowledged = true;
             finish_send(streams, &mut finished, &mut retired, id);
-            false
-        });
+        }
+        // Only the few packet numbers within the loss threshold can survive
+        // this prefix. Draining a ring moves the shorter side, so it never
+        // shifts the entire newer suffix for a small ascending ACK.
+        self.unacked.drain(retained..examined);
         self.resets.retain_mut(|reset| {
             if reset.flight.on_ack(largest, first_range, rest) {
                 acknowledged = true;
@@ -1226,7 +1236,7 @@ impl Connection {
                 self.send_credit.sent += u64::from(fresh);
             }
             frame::put_stream(body, id, 0, true, RESPONSE);
-            self.unacked.push((pn, id));
+            self.unacked.push_back((pn, id));
         }
     }
 
@@ -1508,6 +1518,7 @@ impl Connection {
 mod tests {
     use super::*;
 
+    mod ack_ledger;
     mod datagram_budget;
     mod key_updates;
     mod response_recovery;
@@ -2273,7 +2284,7 @@ mod tests {
             conn.on_stream(id, 0, b"request", true).unwrap();
         }
         conn.ready.clear();
-        conn.unacked = vec![(10, 0), (11, 4), (12, 8)];
+        conn.unacked = [(10, 0), (11, 4), (12, 8)].into();
         conn.on_ack(11, 0, &[]);
         assert_eq!(conn.unacked, [(10, 0), (12, 8)]);
         assert_eq!(conn.finished, 1);
@@ -2974,7 +2985,7 @@ mod tests {
             conn.on_stream(id, 0, b"request", true).unwrap();
         }
         conn.ready.clear();
-        conn.unacked = vec![(10, 0), (11, 4), (12, 8)];
+        conn.unacked = [(10, 0), (11, 4), (12, 8)].into();
         acknowledge(&mut conn, Space::Data, &[(12, 12)]);
         let deadline = conn.timeout();
         conn.pto_count = 2;
