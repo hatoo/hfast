@@ -68,6 +68,8 @@ jobs:
         run: python benchmarks/response-credit-check.py target/release/hfast
       - name: QUIC late ACKs of complete responses
         run: python benchmarks/response-recovery-check.py target/release/hfast
+      - name: QUIC stream table retirement with an unfinished higher request
+        run: python benchmarks/stream-table-bench.py target/release/hfast --slots 4096 --requests 2048 --warmup 128
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
