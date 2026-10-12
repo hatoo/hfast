@@ -1029,11 +1029,21 @@ impl Connection {
         };
         let mut examined = 0;
         let mut retained = 0;
+        // Packet numbers ascend in this ledger; decoded ACK ranges descend.
+        // Walk each range once instead of restarting the search per response.
+        // There is always a first range ending at `largest`, and the loop below
+        // only examines pn <= largest, so the cursor cannot pass that range.
+        let mut range = ranges.len() - 1;
+        let (mut lo, mut hi) = ranges[range];
         while let Some(&(pn, id)) = self.unacked.get(examined)
             && pn <= largest
         {
             examined += 1;
-            if !ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi) {
+            while pn > hi {
+                range -= 1;
+                (lo, hi) = ranges[range];
+            }
+            if pn < lo {
                 if pn < lost_before {
                     if let Some(StreamSlot::Active(req)) =
                         streams.get_mut(((id >> 2) - base) as usize)
