@@ -3,6 +3,7 @@
 //! rustls does TLS 1.3, the QUIC key schedule and the AEAD. What is here is
 //! the transport around it.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -346,8 +347,9 @@ pub struct Connection {
     // ---- streams ----
     /// Client bidirectional streams, which requests are, indexed by number
     /// from `base_stream`. A stream id says where its stream is, so nothing is
-    /// searched for.
-    streams: Vec<StreamSlot>,
+    /// searched for. A circular table retires prefixes without moving the
+    /// remaining requests, even when ACKs arrive one stream at a time.
+    streams: VecDeque<StreamSlot>,
     base_stream: u64,
     /// Largest received offsets for the fixed allowance of client uni streams.
     /// Retained after FIN too, so late duplicates cannot grant credit again.
@@ -440,7 +442,7 @@ impl Connection {
             handshake_done: ControlFlight::new(),
             path_response: None,
             closed: false,
-            streams: Vec::new(),
+            streams: VecDeque::new(),
             base_stream: 0,
             uni_sizes: [0; transport::MAX_STREAMS_UNI],
             uni_final: 0,
@@ -515,8 +517,8 @@ impl Connection {
             .position(|s| !matches!(s, StreamSlot::Complete))
             .unwrap_or(self.streams.len());
         if n > 0 {
-            // Counted first and shifted once: taking them off the front one at
-            // a time would move the rest as many times as there are of them
+            // A prefix drain advances the circular table's head and retains
+            // its capacity for newly granted streams.
             self.streams.drain(..n);
             self.base_stream += n as u64;
         }
@@ -1008,21 +1010,23 @@ impl Connection {
         let streams = &mut self.streams;
         let base = self.base_stream;
         let mut finished = self.finished;
-        let finish_send =
-            |streams: &mut Vec<StreamSlot>, finished: &mut u64, retired: &mut bool, id: u64| {
-                if let Some(i) = (id >> 2)
-                    .checked_sub(base)
-                    .and_then(|n| usize::try_from(n).ok())
-                    && let Some(StreamSlot::Active(req)) = streams.get_mut(i)
-                {
-                    req.send_done = true;
-                    if req.fin {
-                        streams[i] = StreamSlot::Complete;
-                        *finished += 1;
-                        *retired = true;
-                    }
+        let finish_send = |streams: &mut VecDeque<StreamSlot>,
+                           finished: &mut u64,
+                           retired: &mut bool,
+                           id: u64| {
+            if let Some(i) = (id >> 2)
+                .checked_sub(base)
+                .and_then(|n| usize::try_from(n).ok())
+                && let Some(StreamSlot::Active(req)) = streams.get_mut(i)
+            {
+                req.send_done = true;
+                if req.fin {
+                    streams[i] = StreamSlot::Complete;
+                    *finished += 1;
+                    *retired = true;
                 }
-            };
+            }
+        };
         self.unacked.retain(|&(pn, id)| {
             if !ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi) {
                 if pn < lost_before {
@@ -1509,6 +1513,7 @@ mod tests {
     mod response_recovery;
     mod send_credit;
     mod stream_credit;
+    mod stream_table;
 
     fn connection() -> Connection {
         connection_and_client().0
