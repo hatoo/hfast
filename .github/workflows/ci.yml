@@ -72,6 +72,19 @@ jobs:
         run: python benchmarks/stream-table-bench.py target/release/hfast --slots 4096 --requests 2048 --warmup 128
       - name: QUIC ascending ACKs with a full response window
         run: python benchmarks/ack-ledger-bench.py target/release/hfast --window 1024 --requests 256 --warmup 64
+      - name: QUIC sparse ACK ranges with a full response window
+        run: python benchmarks/sparse-ack-bench.py target/release/hfast --window 1024 --ranges 64 --cycles 1
+      - name: Fixed native QUIC workload transport
+        uses: actions/checkout@v5
+        with:
+          repository: hatoo/shb
+          ref: 48b2d7e2ca138ea9f69190cd3ae4112058fb56d7
+          path: .native-peer-shb
+          persist-credentials: false
+      - name: Native sparse ACK oracle and response fences
+        run: |
+          python benchmarks/build-sparse-ack-peer.py .native-peer-shb "$RUNNER_TEMP/sparse-ack-peer"
+          python benchmarks/compare-sparse-acks.py target/release/hfast target/release/hfast "$RUNNER_TEMP/sparse-ack-peer/sparse-ack-peer" "$RUNNER_TEMP/sparse-ack-smoke" --window 1024 --ranges 64 --batch 8 --cycles 1 --pairs 1 --client-cpu 1
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
