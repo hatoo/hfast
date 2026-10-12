@@ -23,7 +23,7 @@ use crate::h3::{CONTROL_PRELUDE, RESPONSE};
 mod stream_credit;
 use stream_credit::{MAX_STREAM_OFFSET, StreamCredits};
 mod send_credit;
-use send_credit::SendCredit;
+use send_credit::{Fragments, SendCredit};
 
 /// The uni stream this server opens for its control stream. Server-initiated
 /// unidirectional streams are 3, 7, 11 (RFC 9000 Section 2.1) and this opens
@@ -48,7 +48,7 @@ struct Request {
     send_done: bool,
     /// The peer's limit, capped at the fixed response length.
     send_limit: u8,
-    /// Credit forced this response to use range recovery.
+    /// Credit or loss moved this response to range recovery.
     partial: bool,
     /// The response has an entry in `ready`.
     queued: bool,
@@ -1004,6 +1004,7 @@ impl Connection {
         let mut acknowledged = false;
         let lost_before = largest.saturating_sub(Self::LOSS_THRESHOLD);
         let ready = &mut self.ready;
+        let responses = &mut self.send_credit.responses;
         let streams = &mut self.streams;
         let base = self.base_stream;
         let mut finished = self.finished;
@@ -1027,12 +1028,17 @@ impl Connection {
                 if pn < lost_before {
                     if let Some(StreamSlot::Active(req)) =
                         streams.get_mut(((id >> 2) - base) as usize)
-                        && !req.queued
                         && !req.stopped
                         && !req.send_done
                     {
-                        req.queued = true;
-                        ready.push(id);
+                        // Keep the original identity while a retry is queued,
+                        // then let bounded range recovery track later copies.
+                        req.partial = true;
+                        responses.insert(id, Fragments::lost_response(pn));
+                        if !req.queued {
+                            req.queued = true;
+                            ready.push(id);
+                        }
                     }
                     return false;
                 }
@@ -1420,16 +1426,17 @@ impl Connection {
             }
         }
         // An answer that was not acknowledged is queued to go again
-        for &(_, id) in &self.unacked {
+        for &(pn, id) in &self.unacked {
             if let Some(StreamSlot::Active(req)) = self
                 .streams
                 .get_mut(((id >> 2) - self.base_stream) as usize)
-                && !req.queued
                 && !req.stopped
                 && !req.send_done
             {
-                req.queued = true;
-                self.ready.push(id);
+                req.partial = true;
+                self.send_credit
+                    .responses
+                    .insert(id, Fragments::lost_response(pn));
             }
         }
         self.unacked.clear();
@@ -1499,6 +1506,7 @@ mod tests {
 
     mod datagram_budget;
     mod key_updates;
+    mod response_recovery;
     mod send_credit;
     mod stream_credit;
 

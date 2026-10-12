@@ -1,5 +1,5 @@
 //! Peer receive credit. Ordinary replies keep the single-frame path; only
-//! credit-fragmented replies allocate range recovery state.
+//! credit-fragmented or lost replies allocate range recovery state.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -79,6 +79,21 @@ pub(super) struct Fragments {
 }
 
 impl Fragments {
+    /// Promote a lost single-frame response without forgetting its first
+    /// transmission or charging its bytes to peer credit a second time.
+    pub(super) fn lost_response(pn: u64) -> Self {
+        Self {
+            flights: vec![RangeFlight {
+                start: 0,
+                end: RESPONSE.len() as u8,
+                delivery: ControlFlight {
+                    sent_in: vec![pn],
+                    pending: true,
+                },
+            }],
+        }
+    }
+
     fn pending(&self) -> bool {
         self.flights.iter().any(|f| f.delivery.pending)
     }
@@ -352,6 +367,38 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promoted_response_history_is_bounded_and_acks_newest_copy() {
+        let mut fragments = Fragments::lost_response(10);
+        let mut sent = RESPONSE.len() as u8;
+        let mut body = Vec::new();
+        for pn in 11..40 {
+            fragments.on_timeout();
+            body.clear();
+            assert!(!fragments.write(
+                0,
+                RESPONSE,
+                true,
+                &mut sent,
+                RESPONSE.len() as u8,
+                0,
+                &mut body,
+                4096,
+                pn,
+            ));
+            assert_eq!(sent as usize, RESPONSE.len());
+            assert_eq!(fragments.flights.len(), 1);
+            assert!(fragments.flights[0].delivery.sent_in.len() <= MAX_COPIES);
+        }
+        assert_eq!(
+            fragments.flights[0].delivery.sent_in,
+            (32..40).collect::<Vec<_>>()
+        );
+        assert!(!fragments.on_ack(10, 0, &[]));
+        assert!(fragments.on_ack(39, 0, &[]));
+        assert!(fragments.flights.is_empty());
+    }
 
     #[test]
     fn bytewise_flight_history_is_bounded_and_sparse_acks_cancel_each_range() {
