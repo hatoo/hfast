@@ -66,6 +66,8 @@ jobs:
         run: python benchmarks/sparse-stream-credit-check.py target/release/hfast
       - name: QUIC response credit, partial sends and recovery
         run: python benchmarks/response-credit-check.py target/release/hfast
+      - name: QUIC late ACKs of complete responses
+        run: python benchmarks/response-recovery-check.py target/release/hfast
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
