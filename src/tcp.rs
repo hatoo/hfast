@@ -15,6 +15,8 @@ const BATCH: usize = 128;
 const LISTENER: u64 = u32::MAX as u64;
 const IO: u64 = 1 << 63;
 
+mod multirecv;
+
 enum Proto {
     /// Too few bytes to tell yet
     Unknown,
@@ -50,6 +52,10 @@ impl Conn {
             read_eof: false,
             proto: Proto::Unknown,
         }
+    }
+
+    fn closing(&self) -> bool {
+        self.read_eof || matches!(&self.proto, Proto::H2(h2) if h2.is_closing())
     }
 
     /// Answer everything complete in `buf`, returning how much of it was used,
@@ -133,6 +139,7 @@ fn settle(buf: &[u8]) -> Which {
 /// why it is pinned.
 pub fn worker(lfd: RawFd, cpu: usize) {
     let ring = io_uring::IoUring::new(BATCH as u32).expect("TCP workers require io_uring");
+    let ring = multirecv::worker(lfd, cpu, ring);
     worker_ring(lfd, cpu, ring);
 }
 
@@ -298,8 +305,7 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
                 continue;
             }
             if let Some(conn) = conns[token as usize].as_ref() {
-                let closing =
-                    conn.read_eof || matches!(&conn.proto, Proto::H2(h2) if h2.is_closing());
+                let closing = conn.closing();
                 if closing && conn.out_off == conn.outbuf.len() {
                     unsafe {
                         libc::close(token as RawFd);
