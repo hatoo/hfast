@@ -40,6 +40,10 @@ def main(args):
                    seconds=time.monotonic() - start)
         rows.append(row)
         print(json.dumps(row), flush=True)
+        if result.returncode != 0:
+            # Keep the actual oracle/transport failure in hosted CI logs too.
+            # The temporary per-fixture file is otherwise lost with the runner.
+            print((args.output / (name + '.log')).read_text(), flush=True)
         assert result.returncode == 0, row
     (args.output / 'results.json').open('x').write(json.dumps(rows, indent=2) + '\n')
 

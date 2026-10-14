@@ -81,6 +81,13 @@ boundaries and requires actual grouped sends. It leaves each independent
 fixture's loss, recovery, key, patterned-body and credit assertions intact.
 Passing these cases does not establish full QUIC recovery or security coverage.
 
+The otherwise serial late-response ACK fixture starts with two concurrent,
+authenticated PINGs, giving the transport distinct datagrams to group without
+relying on incidental handshake timing. Both PING acknowledgements must arrive
+before response withholding starts. The original late-ACK/retry/credit checks
+and the requirement to observe actual GSO sends remain intact. Failed fixture
+logs are also printed into CI output.
+
 ## c142 measurements (2026-10-14)
 
 Accepted only for the controlled GSO workload. Baseline hfast `5217970`, pinned

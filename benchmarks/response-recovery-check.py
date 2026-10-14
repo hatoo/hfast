@@ -99,8 +99,12 @@ async def check(port, copies, observe, logger):
         "127.0.0.1", port, configuration=conf,
         create_protocol=lambda *a, **kw: LateAckClient(*a, copies=copies, **kw),
     ) as client:
-        # Let control ACKs settle before holding the first response.
-        await client.ping()
+        # Each ping transmits a distinct authenticated packet before awaiting
+        # its ACK. Scheduling both in one event-loop turn gives the optional
+        # GSO transport two real datagrams to group, rather than depending on
+        # incidental handshake/ACK timing in this otherwise serial fixture.
+        # Both ACKs must settle before holding the first response.
+        await asyncio.gather(client.ping(), client.ping())
         await asyncio.sleep(0.05)
         assert client._quic._remote_max_streams_bidi == 1
         task = asyncio.create_task(client.request())
