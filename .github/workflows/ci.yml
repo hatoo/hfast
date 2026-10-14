@@ -91,3 +91,13 @@ jobs:
         run: python benchmarks/reset-accounting-check.py target/release/hfast
       - name: QUIC peer key updates, reordering and forgery
         run: python benchmarks/key-update-check.py target/release/hfast
+      - name: QUIC recovery with UDP_GRO unavailable
+        run: python benchmarks/gro-interop.py target/release/hfast "$RUNNER_TEMP/gro-denied" --without-gro
+      - name: QUIC recovery over actual UDP_SEGMENT groups
+        run: |
+          python benchmarks/gro-interop.py target/release/hfast "$RUNNER_TEMP/gso-native" --gso
+          python benchmarks/gro-interop.py target/release/hfast "$RUNNER_TEMP/gso-denied" --gso --without-gro
+      - name: Native GSO response oracle
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: python benchmarks/build-sparse-ack-peer.py .native-peer-shb "$RUNNER_TEMP/gso-peer" --burst

@@ -15,7 +15,7 @@ use super::packet::{self, Kind, LOCAL_CID_LEN};
 use super::wire::ConnectionId;
 use super::{
     packet::VERSION_1,
-    udp::{ReceiveBatch, SendBatch},
+    udp::{ReceiveBatch, SendBatch, enable_gro},
 };
 use crate::sys;
 
@@ -43,6 +43,7 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn new(socket: UdpSocket, config: Arc<rustls::ServerConfig>, max_streams: u32) -> Self {
+        let _ = enable_gro(&socket);
         Endpoint {
             socket,
             config,
@@ -62,42 +63,44 @@ impl Endpoint {
         let _ = self.socket.set_read_timeout(Some(Duration::from_millis(5)));
         let mut since_tick = 0u32;
         loop {
-            let received = if self.conns.len() <= 1 {
-                // A lone client need not pay for a receive batch on each
-                // request/response round trip. Switch once more clients arrive.
-                self.socket
-                    .recv_from(batch.single_buffer())
-                    .map(|(n, from)| {
-                        self.datagram(&mut batch.single_buffer()[..n], from);
-                        1
-                    })
-            } else {
-                batch.receive(&self.socket).inspect(|&count| {
-                    for i in 0..count {
-                        let (datagram, from) = batch.datagram(i);
-                        self.datagram(datagram, from);
-                    }
-                })
-            };
+            let received = self.receive(&mut batch, &mut since_tick);
             // Do not wait for another receive to finish a connection's output.
             self.flush_ready();
-            match received {
-                Ok(count) => {
-                    since_tick += count as u32;
-                    // Under load the socket never goes quiet, so the timers
-                    // would never be looked at if this were the only way in
-                    if since_tick >= TICK_EVERY {
-                        since_tick = 0;
-                        self.tick();
-                    }
-                }
-                Err(_) => {
-                    since_tick = 0;
-                    self.tick();
-                }
+            if received.is_err() {
+                since_tick = 0;
+                self.tick();
             }
             // Never wait for another receive to complete a partial send batch.
             let _ = self.out.flush(&self.socket);
+        }
+    }
+
+    fn receive(&mut self, batch: &mut ReceiveBatch, since_tick: &mut u32) -> std::io::Result<()> {
+        // A lone client still uses one receive message per round trip. Both
+        // paths split aggregates before QUIC parsing or in-place decryption.
+        let messages = batch.receive(&self.socket, self.conns.len() <= 1)?;
+        for i in 0..messages {
+            let (datagrams, from) = batch.datagrams(i);
+            let mut processed = false;
+            for datagram in datagrams {
+                self.datagram(datagram, from);
+                self.received_one(since_tick);
+                processed = true;
+            }
+            if !processed {
+                // Invalid/truncated input cannot indefinitely starve timers.
+                self.received_one(since_tick);
+            }
+        }
+        Ok(())
+    }
+
+    fn received_one(&mut self, since_tick: &mut u32) {
+        *since_tick += 1;
+        if *since_tick >= TICK_EVERY {
+            *since_tick = 0;
+            self.flush_ready();
+            self.tick();
         }
     }
 
@@ -286,6 +289,186 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.set_nonblocking(true).unwrap();
         (Endpoint::new(server, Arc::new(tls_config()), 64), client)
+    }
+
+    fn send_initials(client: &UdpSocket, to: SocketAddr, packets: &[(u8, &[u8])]) {
+        let mut tx = SendBatch::new();
+        for &(pn, payload) in packets {
+            tx.buffer().extend_from_slice(&initial(pn, payload));
+            tx.push(to, client).unwrap();
+        }
+        tx.flush(client).unwrap();
+    }
+
+    #[test]
+    fn gro_receive_preserves_sparse_ack_ranges_duplicates_and_reordering() {
+        for gro in [false, true] {
+            let (mut ep, client) = endpoint();
+            if !gro {
+                use std::os::fd::AsRawFd;
+                let zero: libc::c_int = 0;
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            ep.socket.as_raw_fd(),
+                            libc::IPPROTO_UDP,
+                            libc::UDP_GRO,
+                            (&zero as *const libc::c_int).cast(),
+                            std::mem::size_of_val(&zero) as _,
+                        )
+                    },
+                    0
+                );
+            }
+            let ping = [frame::PING as u8];
+            send_initials(
+                &client,
+                ep.socket.local_addr().unwrap(),
+                &[(0, &ping), (4, &ping), (2, &ping), (4, &ping), (1, &ping)],
+            );
+            let mut batch = ReceiveBatch::new();
+            let mut received = 0;
+            while received < 5 {
+                ep.receive(&mut batch, &mut received).unwrap();
+            }
+            assert_eq!(received, 5);
+            assert_eq!(ep.conns.len(), 1);
+            assert_eq!(ep.ready, [client.local_addr().unwrap()]);
+            ep.flush_ready();
+            ep.out.flush(&ep.socket).unwrap();
+            let mut buf = [0; 2048];
+            let n = client.recv(&mut buf).unwrap();
+            let packet = &mut buf[..n];
+            let header = packet::parse(packet, 0).unwrap();
+            let keys = client_keys();
+            let (_, pn_len) =
+                wire::unprotect_header(keys.remote.header.as_ref(), packet, header.pn_offset)
+                    .unwrap();
+            let (head, body) = packet.split_at_mut(header.pn_offset + pn_len);
+            let plain = keys.remote.packet.decrypt_in_place(0, head, body).unwrap();
+            let frames = frame::Frames::new(plain)
+                .collect::<wire::Result<Vec<_>>>()
+                .unwrap();
+            let [
+                frame::Frame::Ack {
+                    largest,
+                    first_range,
+                    rest,
+                    ..
+                },
+            ] = frames.as_slice()
+            else {
+                panic!("expected one ACK");
+            };
+            assert_eq!(
+                frame::AckRanges::new(*largest, *first_range, rest).collect::<Vec<_>>(),
+                [(4, 4), (0, 2)]
+            );
+            assert_eq!(
+                client.recv(&mut buf).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn gro_receive_switches_one_many_one_peers_and_counts_datagrams_for_timers() {
+        let (mut ep, first) = endpoint();
+        let second = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = ep.socket.local_addr().unwrap();
+        let ping = [frame::PING as u8];
+        let mut batch = ReceiveBatch::new();
+        let mut received = 0;
+        send_initials(&first, to, &[(0, &ping), (2, &ping), (1, &ping)]);
+        ep.receive(&mut batch, &mut received).unwrap();
+        assert_eq!(received, 3);
+        assert_eq!(ep.conns.len(), 1);
+        send_initials(&second, to, &[(0, &ping), (1, &ping)]);
+        ep.receive(&mut batch, &mut received).unwrap();
+        assert_eq!(received, 5);
+        assert_eq!(ep.conns.len(), 2);
+        send_initials(&first, to, &[(3, &ping), (4, &ping)]);
+        send_initials(
+            &second,
+            to,
+            &[(2, &[frame::CONNECTION_CLOSE as u8, 0, 0, 0])],
+        );
+        ep.receive(&mut batch, &mut received).unwrap();
+        assert_eq!(received, 8);
+        assert_eq!(ep.conns.len(), 1);
+        assert!(ep.conns.contains_key(&first.local_addr().unwrap()));
+        assert!(!ep.conns.contains_key(&second.local_addr().unwrap()));
+        // Crossing the timer budget within an aggregate retains the remainder.
+        received = TICK_EVERY - 1;
+        send_initials(&first, to, &[(5, &ping), (6, &ping)]);
+        ep.receive(&mut batch, &mut received).unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(ep.conns.len(), 1);
+        ep.flush_ready();
+        ep.out.flush(&ep.socket).unwrap();
+    }
+
+    #[test]
+    fn invalid_quic_segments_still_run_timers_inside_a_gro_aggregate() {
+        let (mut ep, idle) = endpoint();
+        let idle_addr = idle.local_addr().unwrap();
+        ep.datagram(&mut initial(0, &[frame::PING as u8]), idle_addr);
+        ep.conns.get_mut(&idle_addr).unwrap().1 =
+            Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut tx = SendBatch::new();
+        for _ in 0..8 {
+            tx.buffer().extend_from_slice(&[0; 13]);
+            tx.push(ep.socket.local_addr().unwrap(), &attacker).unwrap();
+        }
+        tx.flush(&attacker).unwrap();
+        let mut batch = ReceiveBatch::new();
+        let mut received = TICK_EVERY - 3;
+        ep.receive(&mut batch, &mut received).unwrap();
+        assert_eq!(
+            received, 5,
+            "count original datagrams, including invalid QUIC"
+        );
+        assert!(ep.conns.is_empty(), "the timer must expire the idle peer");
+        assert!(ep.ready.is_empty());
+    }
+
+    #[test]
+    fn truncated_control_is_discarded_without_starving_timers() {
+        use std::os::fd::AsRawFd;
+        let (mut ep, idle) = endpoint();
+        let idle_addr = idle.local_addr().unwrap();
+        ep.datagram(&mut initial(0, &[frame::PING as u8]), idle_addr);
+        ep.conns.get_mut(&idle_addr).unwrap().1 =
+            Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        // A timestamp needs more ancillary storage than the GRO-only receiver.
+        // The kernel must report MSG_CTRUNC; this otherwise valid Initial must
+        // not create a connection, and the discarded message must tick timers.
+        let one: libc::c_int = 1;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    ep.socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_TIMESTAMPNS,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&one) as _,
+                )
+            },
+            0
+        );
+        let newcomer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        send_initials(
+            &newcomer,
+            ep.socket.local_addr().unwrap(),
+            &[(0, &[frame::PING as u8])],
+        );
+        let mut batch = ReceiveBatch::new();
+        let mut received = TICK_EVERY - 1;
+        ep.receive(&mut batch, &mut received).unwrap();
+        assert_eq!(received, 0);
+        assert!(ep.conns.is_empty());
+        assert!(ep.ready.is_empty());
     }
 
     #[test]

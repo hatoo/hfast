@@ -17,10 +17,81 @@ union SegmentControl {
     bytes: [u8; SEGMENT_CONTROL_SIZE],
 }
 
+// Linux returns UDP_GRO's segment size as an int (UDP_SEGMENT uses a u16).
+const RECEIVE_CONTROL_SIZE: usize = unsafe { libc::CMSG_SPACE(4) as usize };
+union ReceiveControl {
+    _alignment: libc::cmsghdr,
+    bytes: [u8; RECEIVE_CONTROL_SIZE],
+}
+
+impl ReceiveControl {
+    fn segment_size(
+        &self,
+        msg: &libc::msghdr,
+        length: usize,
+        addr: &libc::sockaddr_in,
+    ) -> Option<usize> {
+        if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+            || length > RECEIVE_SIZE
+            || msg.msg_namelen as usize != std::mem::size_of::<libc::sockaddr_in>()
+            || addr.sin_family != libc::AF_INET as _
+            || msg.msg_controllen > RECEIVE_CONTROL_SIZE
+        {
+            return None;
+        }
+        if msg.msg_controllen == 0 {
+            return Some(length.max(1));
+        }
+        let header_len = unsafe { libc::CMSG_LEN(0) as usize };
+        if msg.msg_controllen < header_len {
+            return None;
+        }
+        // This buffer can hold at most one cmsg. All bytes are initialized and
+        // the union supplies header alignment; check lengths before the payload.
+        let header = unsafe { &self._alignment };
+        if header.cmsg_len < header_len || header.cmsg_len > msg.msg_controllen {
+            return None;
+        }
+        if header.cmsg_level != libc::IPPROTO_UDP || header.cmsg_type != libc::UDP_GRO {
+            return Some(length.max(1));
+        }
+        if header.cmsg_len != unsafe { libc::CMSG_LEN(4) as usize } || length == 0 {
+            return None;
+        }
+        let size = i32::from_ne_bytes(
+            unsafe { &self.bytes[header_len..header_len + 4] }
+                .try_into()
+                .unwrap(),
+        );
+        (size > 0 && size <= u16::MAX as i32).then_some(size as usize)
+    }
+}
+
+/// Optional kernel optimization. A failed setsockopt leaves ordinary UDP
+/// delivery in place; both receive paths always understand ancillary metadata.
+pub(super) fn enable_gro(socket: &UdpSocket) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_UDP,
+            libc::UDP_GRO,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of_val(&one) as _,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) struct ReceiveBatch {
     buffers: [Box<[u8]>; BATCH],
     addresses: [libc::sockaddr_in; BATCH],
     lengths: [usize; BATCH],
+    segment_sizes: [Option<usize>; BATCH],
     limit: usize,
 }
 
@@ -31,18 +102,27 @@ impl ReceiveBatch {
             // All-zero sockaddr_in is valid storage for an output address.
             addresses: unsafe { std::mem::zeroed() },
             lengths: [0; BATCH],
+            segment_sizes: [None; BATCH],
             limit: BATCH,
         }
     }
 
-    pub fn single_buffer(&mut self) -> &mut [u8] {
-        &mut self.buffers[0]
+    pub fn receive(&mut self, socket: &UdpSocket, single: bool) -> io::Result<usize> {
+        if single {
+            self.receive_into::<1>(socket)
+        } else {
+            self.receive_into::<BATCH>(socket)
+        }
     }
 
-    pub fn receive(&mut self, socket: &UdpSocket) -> io::Result<usize> {
-        let mut iovecs: [libc::iovec; BATCH] = unsafe { std::mem::zeroed() };
-        let mut messages: [libc::mmsghdr; BATCH] = unsafe { std::mem::zeroed() };
-        for i in 0..self.limit {
+    fn receive_into<const N: usize>(&mut self, socket: &UdpSocket) -> io::Result<usize> {
+        let limit = self.limit.min(N);
+        let mut iovecs: [libc::iovec; N] = unsafe { std::mem::zeroed() };
+        let mut messages: [libc::mmsghdr; N] = unsafe { std::mem::zeroed() };
+        let mut controls: [ReceiveControl; N] = std::array::from_fn(|_| ReceiveControl {
+            bytes: [0; RECEIVE_CONTROL_SIZE],
+        });
+        for i in 0..limit {
             iovecs[i].iov_base = self.buffers[i].as_mut_ptr().cast();
             iovecs[i].iov_len = RECEIVE_SIZE;
             messages[i].msg_hdr.msg_name =
@@ -50,47 +130,65 @@ impl ReceiveBatch {
             messages[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
             messages[i].msg_hdr.msg_iov = &mut iovecs[i];
             messages[i].msg_hdr.msg_iovlen = 1;
+            messages[i].msg_hdr.msg_control = (&mut controls[i] as *mut ReceiveControl).cast();
+            messages[i].msg_hdr.msg_controllen = RECEIVE_CONTROL_SIZE;
         }
         // WAITFORONE blocks only for the first datagram (subject to SO_RCVTIMEO).
         // After that it drains what is available without waiting to fill a batch.
         // All buffers, addresses and iovecs remain live and exclusive for this call.
-        let count = unsafe {
-            libc::recvmmsg(
-                socket.as_raw_fd(),
-                messages.as_mut_ptr(),
-                self.limit as _,
-                libc::MSG_WAITFORONE,
-                std::ptr::null_mut(),
-            )
+        let count = if N == 1 {
+            // recv_from cannot recover GRO boundaries, even with only one peer.
+            let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut messages[0].msg_hdr, 0) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            messages[0].msg_len = n as _;
+            1
+        } else {
+            unsafe {
+                libc::recvmmsg(
+                    socket.as_raw_fd(),
+                    messages.as_mut_ptr(),
+                    limit as _,
+                    libc::MSG_WAITFORONE,
+                    std::ptr::null_mut(),
+                )
+            }
         };
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
         for (i, msg) in messages[..count as usize].iter().enumerate() {
-            // The endpoint only binds IPv4 sockets. Discard unexpected or truncated
-            // addresses/payloads rather than handing partial data to QUIC.
-            self.lengths[i] = if msg.msg_hdr.msg_flags & libc::MSG_TRUNC == 0
-                && msg.msg_hdr.msg_namelen as usize == std::mem::size_of::<libc::sockaddr_in>()
-                && self.addresses[i].sin_family == libc::AF_INET as _
-            {
-                msg.msg_len as usize
-            } else {
-                0
-            };
+            self.lengths[i] = msg.msg_len as usize;
+            self.segment_sizes[i] =
+                controls[i].segment_size(&msg.msg_hdr, self.lengths[i], &self.addresses[i]);
         }
         // Grow quickly when there is a backlog, but prepare only a small
         // prefix when the socket is keeping up with the clients.
-        self.limit = (count as usize * 2).clamp(2, BATCH);
+        if N != 1 {
+            self.limit = (count as usize * 2).clamp(2, BATCH);
+        }
         Ok(count as usize)
     }
 
-    pub fn datagram(&mut self, index: usize) -> (&mut [u8], SocketAddr) {
+    pub fn datagrams(&mut self, index: usize) -> (impl Iterator<Item = &mut [u8]>, SocketAddr) {
         let addr = self.addresses[index];
         let from = SocketAddrV4::new(
             addr.sin_addr.s_addr.to_ne_bytes().into(),
             u16::from_be(addr.sin_port),
         );
-        (&mut self.buffers[index][..self.lengths[index]], from.into())
+        let size = self.segment_sizes[index];
+        let mut remaining = size.map(|_| &mut self.buffers[index][..self.lengths[index]]);
+        let datagrams = std::iter::from_fn(move || {
+            let data = remaining.take()?;
+            let (head, tail) = data.split_at_mut(size.unwrap().min(data.len()));
+            if !tail.is_empty() {
+                remaining = Some(tail);
+            }
+            // An ordinary zero-length datagram is yielded exactly once.
+            Some(head)
+        });
+        (datagrams, from.into())
     }
 }
 
@@ -295,6 +393,243 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
         socket
+    }
+
+    #[test]
+    fn gro_metadata_checks_lengths_flags_and_addresses() {
+        let mut control = ReceiveControl {
+            bytes: [0; RECEIVE_CONTROL_SIZE],
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as _;
+        msg.msg_namelen = std::mem::size_of_val(&addr) as _;
+        assert_eq!(control.segment_size(&msg, 0, &addr), Some(1));
+        assert_eq!(control.segment_size(&msg, 65507, &addr), Some(65507));
+        msg.msg_controllen = RECEIVE_CONTROL_SIZE;
+        control._alignment = libc::cmsghdr {
+            cmsg_level: libc::IPPROTO_UDP,
+            cmsg_type: libc::UDP_GRO,
+            cmsg_len: unsafe { libc::CMSG_LEN(4) as _ },
+        };
+        let offset = unsafe { libc::CMSG_LEN(0) as usize };
+        for size in [1i32, 1200, 65535, 0, -1, 65536] {
+            unsafe {
+                control.bytes[offset..offset + 4].copy_from_slice(&size.to_ne_bytes());
+            }
+            assert_eq!(
+                control.segment_size(&msg, 2401, &addr),
+                (size > 0 && size <= 65535).then_some(size as usize)
+            );
+        }
+        unsafe {
+            control.bytes[offset..offset + 4].copy_from_slice(&1200i32.to_ne_bytes());
+        }
+        assert_eq!(control.segment_size(&msg, 0, &addr), None);
+        assert_eq!(control.segment_size(&msg, RECEIVE_SIZE + 1, &addr), None);
+        for flags in [
+            libc::MSG_TRUNC,
+            libc::MSG_CTRUNC,
+            libc::MSG_TRUNC | libc::MSG_CTRUNC,
+        ] {
+            msg.msg_flags = flags;
+            assert_eq!(control.segment_size(&msg, 2400, &addr), None);
+        }
+        msg.msg_flags = 0;
+        for len in [1, offset - 1, offset, offset + 3, RECEIVE_CONTROL_SIZE + 1] {
+            msg.msg_controllen = len;
+            assert_eq!(control.segment_size(&msg, 2400, &addr), None);
+        }
+        msg.msg_controllen = RECEIVE_CONTROL_SIZE;
+        for len in [0, offset - 1, offset + 2, RECEIVE_CONTROL_SIZE + 1] {
+            control._alignment.cmsg_len = len;
+            assert_eq!(control.segment_size(&msg, 2400, &addr), None);
+        }
+        control._alignment.cmsg_len = unsafe { libc::CMSG_LEN(4) as _ };
+        msg.msg_namelen -= 1;
+        assert_eq!(control.segment_size(&msg, 2400, &addr), None);
+        msg.msg_namelen += 1;
+        addr.sin_family = libc::AF_INET6 as _;
+        assert_eq!(control.segment_size(&msg, 2400, &addr), None);
+        addr.sin_family = libc::AF_INET as _;
+        assert_eq!(control.segment_size(&msg, 2400, &addr), Some(1200));
+    }
+
+    #[test]
+    fn maximum_gso_group_preserves_every_segment_and_short_tail() {
+        for gro in [false, true] {
+            let receiver = socket();
+            if gro {
+                enable_gro(&receiver).unwrap();
+            }
+            let sender = socket();
+            sender.connect(receiver.local_addr().unwrap()).unwrap();
+            let mut rx = ReceiveBatch::new();
+            for (single, last_size) in [(true, 1000), (false, 1), (true, 1000)] {
+                let expected: Vec<Vec<u8>> = (0..64)
+                    .map(|i| vec![i; if i == 63 { last_size } else { 1000 }])
+                    .collect();
+                let mut payload = expected.concat();
+                let mut iovec = libc::iovec {
+                    iov_base: payload.as_mut_ptr().cast(),
+                    iov_len: payload.len(),
+                };
+                let mut control = SegmentControl {
+                    bytes: [0; SEGMENT_CONTROL_SIZE],
+                };
+                control._alignment = libc::cmsghdr {
+                    cmsg_level: libc::IPPROTO_UDP,
+                    cmsg_type: libc::UDP_SEGMENT,
+                    cmsg_len: unsafe { libc::CMSG_LEN(2) as usize },
+                };
+                let offset = unsafe { libc::CMSG_LEN(0) as usize };
+                unsafe {
+                    control.bytes[offset..offset + 2].copy_from_slice(&1000u16.to_ne_bytes());
+                }
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_iov = &mut iovec;
+                msg.msg_iovlen = 1;
+                msg.msg_control = (&mut control as *mut SegmentControl).cast();
+                msg.msg_controllen = SEGMENT_CONTROL_SIZE;
+                assert_eq!(
+                    unsafe { libc::sendmsg(sender.as_raw_fd(), &msg, 0) },
+                    payload.len() as isize
+                );
+                let mut actual = Vec::new();
+                let mut messages = 0;
+                while actual.len() < 64 {
+                    let count = rx.receive(&receiver, single).unwrap();
+                    messages += count;
+                    for i in 0..count {
+                        let (parts, from) = rx.datagrams(i);
+                        assert_eq!(from, sender.local_addr().unwrap());
+                        actual.extend(parts.map(|part| part.to_vec()));
+                    }
+                }
+                assert_eq!(actual, expected);
+                assert_eq!(messages, if gro { 1 } else { 64 });
+                sender.send(&[]).unwrap();
+                assert_eq!(rx.receive(&receiver, single).unwrap(), 1);
+                assert_eq!(rx.datagrams(0).0.map(|d| d.len()).collect::<Vec<_>>(), [0]);
+                assert_eq!(
+                    rx.receive(&receiver, single).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gro_splitting_preserves_tail_empty_and_mutable_payload_boundaries() {
+        let mut rx = ReceiveBatch::new();
+        for (len, size, expected) in [
+            (0, Some(1), vec![0]),
+            (1, Some(3), vec![1]),
+            (6, Some(3), vec![3, 3]),
+            (7, Some(3), vec![3, 3, 1]),
+            (65536, Some(32768), vec![32768, 32768]),
+            (usize::MAX, None, vec![]),
+        ] {
+            rx.lengths[0] = len;
+            rx.segment_sizes[0] = size;
+            let mut lengths = Vec::new();
+            for (i, datagram) in rx.datagrams(0).0.enumerate() {
+                lengths.push(datagram.len());
+                datagram.fill(i as u8);
+            }
+            assert_eq!(lengths, expected);
+            let mut offset = 0;
+            for (i, n) in lengths.into_iter().enumerate() {
+                assert_eq!(&rx.buffers[0][offset..offset + n], vec![i as u8; n]);
+                offset += n;
+            }
+        }
+    }
+
+    #[test]
+    fn gro_rejects_kernel_control_truncation_then_reuses_the_receive_slot() {
+        let receiver = socket();
+        enable_gro(&receiver).unwrap();
+        let sender = socket();
+        let mut rx = ReceiveBatch::new();
+        for single in [true, false, true] {
+            let timestamp = |enabled: libc::c_int| {
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            receiver.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_TIMESTAMPNS,
+                            (&enabled as *const libc::c_int).cast(),
+                            std::mem::size_of_val(&enabled) as _,
+                        )
+                    },
+                    0
+                );
+            };
+            timestamp(1);
+            sender
+                .send_to(b"discard", receiver.local_addr().unwrap())
+                .unwrap();
+            assert_eq!(rx.receive(&receiver, single).unwrap(), 1);
+            assert_eq!(rx.lengths[0], 7);
+            assert_eq!(rx.segment_sizes[0], None);
+            assert_eq!(rx.datagrams(0).0.count(), 0);
+            timestamp(0);
+            // EAGAIN must not make stale metadata observable on the next receive.
+            assert_eq!(
+                rx.receive(&receiver, single).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            sender
+                .send_to(b"plain", receiver.local_addr().unwrap())
+                .unwrap();
+            assert_eq!(rx.receive(&receiver, single).unwrap(), 1);
+            let (datagrams, from) = rx.datagrams(0);
+            assert_eq!(from, sender.local_addr().unwrap());
+            assert_eq!(datagrams.collect::<Vec<_>>(), [b"plain".as_slice()]);
+        }
+    }
+
+    #[test]
+    fn gro_and_plain_receives_preserve_peers_payloads_and_buffer_reuse() {
+        for gro in [false, true] {
+            let receiver = socket();
+            if gro {
+                enable_gro(&receiver).unwrap();
+            }
+            let senders = [socket(), socket()];
+            let mut rx = ReceiveBatch::new();
+            let mut tx = SendBatch::new();
+            for single in [true, false, true] {
+                let mut expected = Vec::new();
+                // Different peers, a shorter final segment, then an empty
+                // ordinary packet. A later round reuses all the same storage.
+                for sender in &senders {
+                    for data in [b"aaa".as_slice(), b"bbb", b"c"] {
+                        tx.buffer().extend_from_slice(data);
+                        tx.push(receiver.local_addr().unwrap(), sender).unwrap();
+                        expected.push((data.to_vec(), sender.local_addr().unwrap()));
+                    }
+                    tx.flush(sender).unwrap();
+                    sender.send_to(&[], receiver.local_addr().unwrap()).unwrap();
+                    expected.push((vec![], sender.local_addr().unwrap()));
+                }
+                let mut actual = Vec::new();
+                let mut messages = 0;
+                while actual.len() < expected.len() {
+                    let count = rx.receive(&receiver, single).unwrap();
+                    messages += count;
+                    for i in 0..count {
+                        let (datagrams, from) = rx.datagrams(i);
+                        actual.extend(datagrams.map(|data| (data.to_vec(), from)));
+                    }
+                }
+                assert_eq!(actual, expected);
+                assert_eq!(messages, if gro { 4 } else { 8 });
+                assert!(rx.receive(&receiver, single).is_err());
+            }
+        }
     }
 
     fn batch(spec: &[(usize, u16)]) -> SendBatch {
@@ -609,9 +944,11 @@ mod tests {
             for (which, receiver) in receivers.iter().enumerate() {
                 let mut expected = which;
                 while expected < BATCH + 3 {
-                    let count = rx.receive(receiver).unwrap();
+                    let count = rx.receive(receiver, false).unwrap();
                     for i in 0..count {
-                        let (data, from) = rx.datagram(i);
+                        let (mut datagrams, from) = rx.datagrams(i);
+                        let data = datagrams.next().unwrap();
+                        assert!(datagrams.next().is_none());
                         assert_eq!(data, &[round, expected as u8]);
                         assert_eq!(from, sender.local_addr().unwrap());
                         expected += 2;
@@ -653,15 +990,15 @@ mod tests {
         for i in 0..BATCH {
             sender.send_to(&[i as u8], to).unwrap();
         }
-        assert_eq!(rx.receive(&receiver).unwrap(), BATCH);
+        assert_eq!(rx.receive(&receiver, false).unwrap(), BATCH);
         for i in 0..BATCH {
-            assert_eq!(rx.datagram(i).0, &[i as u8]);
+            assert_eq!(rx.datagrams(i).0.next().unwrap(), &[i as u8]);
         }
         sender.send_to(&[], to).unwrap();
         sender.send_to(&vec![7; 65000], to).unwrap();
-        assert_eq!(rx.receive(&receiver).unwrap(), 2);
-        assert!(rx.datagram(0).0.is_empty());
-        assert_eq!(rx.datagram(1).0, &[7; 65000]);
+        assert_eq!(rx.receive(&receiver, false).unwrap(), 2);
+        assert!(rx.datagrams(0).0.next().unwrap().is_empty());
+        assert_eq!(rx.datagrams(1).0.next().unwrap(), &[7; 65000]);
     }
 
     #[test]
@@ -672,10 +1009,10 @@ mod tests {
         sender
             .send_to(b"one", receiver.local_addr().unwrap())
             .unwrap();
-        assert_eq!(rx.receive(&receiver).unwrap(), 1);
-        assert_eq!(rx.datagram(0).0, b"one");
+        assert_eq!(rx.receive(&receiver, false).unwrap(), 1);
+        assert_eq!(rx.datagrams(0).0.next().unwrap(), b"one");
         let start = Instant::now();
-        let err = rx.receive(&receiver).unwrap_err();
+        let err = rx.receive(&receiver, false).unwrap_err();
         assert!(matches!(
             err.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
