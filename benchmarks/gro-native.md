@@ -59,6 +59,74 @@ measurements do not establish maximum server capacity. Ordinary fixed-shb
 serial and multiplexed throughput/CPU/all-latency guards remain necessary.
 The comparator rejects audit environment variables. Never time the interposer.
 
+## Concurrent native producers
+
+The optional coordinated mode supplies one or four independent native producers.
+Each process has one active and one quiet connection and one outstanding burst.
+The original positional peer command and `--client-cpu` comparator mode remain
+available for reproducing single-producer experiments. The builder also runs
+the worker command and four-worker response/fence oracle tests.
+
+`burst_workers.py` owns all namespace UDP and server/process CPU snapshots. After
+every worker completes handshake and warmup, it waits for all final ACKs to be
+consumed and checks every socket queue. It then releases one timed phase to all
+workers. At each phase boundary, all response bytes/FINs, contiguous packet
+numbers, stream IDs, exact replenished credit, authenticated fences and quiet
+connections must pass before it samples global counters once. Per-worker totals
+are summed; overlapping process or namespace measurements are never added.
+Workers retain their sockets until the controller finishes the last audit.
+
+The controller records warmup separately, the common wall interval, each worker's
+burst duration and response/delivery ledger, and server and per-worker user/system
+CPU time. The common interval includes command dispatch, report validation and
+final ACK/queue checks. `/proc` CPU accounting has clock-tick resolution, so short
+smoke phases must not be interpreted as performance measurements. Phases time out
+after 60 seconds; worker failure, partial output, missing/duplicate work or drops
+fail the entire run, retain logs and terminate the remaining processes.
+
+```sh
+python3 -m unittest discover -s benchmarks -p test_burst_workers.py -v
+unshare --user --map-root-user --net sh -c \
+  'ip link set lo up && exec "$@"' concurrent-smoke \
+  python3 benchmarks/burst-worker-check.py /immutable/hfast /new/peer/burst-peer \
+  /new/concurrent-smoke
+unshare --user --map-root-user --net sh -c \
+  'ip link set lo up && exec "$@"' producer-utilization \
+  python3 benchmarks/burst_workers.py /immutable/hfast /new/peer/burst-peer \
+  /new/four-producers --client-cpus 8,10,12,14 --batches 8192 --cycles 4
+```
+
+The bounded smoke covers one/four producers, one/eight request datagrams, native
+GRO and real ENOPROTOOPT fallback, plus the original peer mode. It may share
+client CPUs on small CI machines and explicitly labels results as smoke data.
+Performance runs require distinct client CPUs apart from server CPU 0. Compare
+utilization with a separate `--client-cpus 8` run using the same server. Different
+producer counts are different workloads, not evidence of an optimization gain.
+
+For future candidate comparisons, add `--producer-cpus 8,10,12,14` to
+`compare-bursts.py`. Both servers use GRO by default in this mode;
+`--baseline-without-gro` and `--candidate-without-gro` install the denial wrapper
+explicitly. Keep every workload setting fixed, alternate order and repeat with
+`--reverse`. Preserve the ordinary shb throughput, CPU and latency guards.
+Concurrent success does not establish general QUIC loss-recovery correctness or
+remove the existing WSL measurement uncertainty.
+
+A fixed-server check on 2026-10-15 used accepted hfast `d2de04a` (binary SHA256
+`bfe08e14e13415208af7e0fdd6bc600414a434adcbca10aa3a4613f9dcf663dc`), rustc
+1.98.0 and the pinned native transport above. With 32 requests/datagram, eight
+datagrams/burst, 256 warmup bursts and four phases of 8,192 bursts per producer,
+the order was one/four/four/one producers on CPU 8 or CPUs 8,10,12,14.
+
+| Producers | Measured requests/run | Requests/s in the two runs | Server cores |
+|---|---:|---:|---:|
+| 1 | 8,388,608 | 1,768,892 / 1,760,233 | 0.496 / 0.493 |
+| 4 | 33,554,432 | 5,851,952 / 5,850,994 | 0.996 / 0.992 |
+
+All 84,541,440 responses including warmups passed, with zero errors or pending
+work. Each producer used 0.985–0.999 cores. Four producers can keep the unchanged
+server worker busy under this workload. These are different offered loads, not a
+baseline/candidate optimization comparison or proof of an avoidable kernel cost.
+
 The audit interposer counts actual receive calls, entries, original datagrams,
 bytes and GSO sends. It runs baseline, candidate and denied-GRO candidate using
 immutable production binaries, and checks its counts against the native peer.
