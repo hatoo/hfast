@@ -29,6 +29,8 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     tar.extractall(source, filter='data')
 main = 'burst-peer-main.rs' if burst else 'sparse-ack-peer-main.rs'
 (source / 'src/main.rs').write_text((here / main).read_text())
+if burst:
+    shutil.copy2(here / 'burst-worker.rs', source / 'src/burst_worker.rs')
 conn = source / 'src/quic/conn.rs'
 conn.write_text(conn.read_text() + '\n' + (here / 'sparse-ack-peer-methods.rs').read_text())
 target = Path(os.environ.get('NATIVE_PEER_TARGET_DIR', output / 'target')).resolve()

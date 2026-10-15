@@ -9,6 +9,7 @@ import socket
 import statistics
 import subprocess
 import time
+import burst_workers
 
 
 def sha(path):
@@ -17,6 +18,13 @@ def sha(path):
 
 def run(args, variant, pair):
     stem = args.output / f'{pair}-{variant}'
+    if args.producer_cpus:
+        gro = not (args.baseline_without_gro if variant == 'baseline' else args.candidate_without_gro)
+        result = burst_workers.run(getattr(args, variant), args.peer, stem, args.producer_cpus,
+                                  batch=args.batch, datagrams=args.datagrams, batches=args.batches,
+                                  cycles=args.cycles, warmup=args.warmup, gro=gro)
+        result.update(variant=variant, pair=pair)
+        return result
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
@@ -98,6 +106,7 @@ def main(args):
                            cpu_percent=((c['cpu_ns_per_request']/b['cpu_ns_per_request']-1)*100 if b['cpu_ns_per_request'] else None)))
     assert inputs == {name: sha(getattr(args, name)) for name in inputs}
     summary = dict(inputs=inputs, batch=args.batch, datagrams=args.datagrams, batches=args.batches,
+                   producer_cpus=args.producer_cpus, warmup=args.warmup,
                    cycles=args.cycles, pairs=paired, completed=sum(x['completed'] for x in rows),
                    sent_datagrams=sum(x['sent_datagrams'] for x in rows), errors=0, reverse=args.reverse,
                    median_rps_percent=statistics.median(x['rps_percent'] for x in paired),
@@ -118,8 +127,13 @@ if __name__ == '__main__':
     parser.add_argument('--warmup', type=int, default=256)
     parser.add_argument('--pairs', type=int, default=3)
     parser.add_argument('--client-cpu', type=int, default=8)
+    parser.add_argument('--producer-cpus', type=lambda s: list(map(int, s.split(','))),
+                        help='coordinated mode: one or four CPUs; both servers default to GRO')
+    parser.add_argument('--baseline-without-gro', action='store_true',
+                        help='deny baseline UDP_GRO in coordinated mode')
     parser.add_argument('--reverse', action='store_true')
     parser.add_argument('--candidate-without-gro', action='store_true', help='require baseline delivery semantics for a forced-ENOPROTOOPT candidate')
     args = parser.parse_args()
     assert args.pairs > 0 and args.cycles > 0
+    assert not args.baseline_without_gro or args.producer_cpus
     main(args)

@@ -4,6 +4,7 @@
 mod clock;
 mod quic;
 mod tls;
+mod burst_worker;
 #[cfg(test)]
 mod http3 {
     pub mod proto;
@@ -634,6 +635,9 @@ impl Peer {
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--worker") {
+        return burst_worker::main(&args[2..]);
+    }
     ensure!(
         args.len() == 9,
         "usage: peer PORT PID BATCH DATAGRAMS BATCHES CYCLES WARMUP GRO(0|1)"
