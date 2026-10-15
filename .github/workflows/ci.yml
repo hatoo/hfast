@@ -13,7 +13,7 @@ jobs:
   correctness:
     name: ci
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -113,3 +113,23 @@ jobs:
             "$(command -v python)" benchmarks/burst-worker-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
             "$RUNNER_TEMP/concurrent-producer-smoke"
+      - name: Fixed CRYPTO churn transport
+        uses: actions/checkout@v5
+        with:
+          repository: hatoo/shb
+          ref: 12e95af17ef6015020776ab65996bef9531099e0
+          path: .crypto-churn-shb
+          persist-credentials: false
+      - name: Native CRYPTO schedule and TLS/HTTP failure oracles
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: |
+          python benchmarks/build-crypto-churn-peer.py .crypto-churn-shb "$RUNNER_TEMP/crypto-churn-peer"
+          python -m unittest discover -s benchmarks -p test_crypto_churn.py -v
+          python benchmarks/crypto-churn-interop.py "$RUNNER_TEMP/crypto-churn-peer/crypto-churn-peer" "$RUNNER_TEMP/crypto-churn-interop"
+      - name: Native CRYPTO churn with GRO and fallback delivery
+        run: |
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' crypto-churn \
+            "$(command -v python)" benchmarks/crypto-churn-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/crypto-churn-peer/crypto-churn-peer" \
+            "$RUNNER_TEMP/crypto-churn-smoke"
