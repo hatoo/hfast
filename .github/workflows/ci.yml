@@ -89,6 +89,26 @@ jobs:
         run: |
           python benchmarks/build-sparse-ack-peer.py .native-peer-shb "$RUNNER_TEMP/sparse-ack-peer"
           python benchmarks/compare-sparse-acks.py target/release/hfast target/release/hfast "$RUNNER_TEMP/sparse-ack-peer/sparse-ack-peer" "$RUNNER_TEMP/sparse-ack-smoke" --window 1024 --ranges 64 --batch 8 --cycles 1 --pairs 1 --client-cpu 1
+      - name: Native cancellation accounting and failure oracles
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: |
+          python benchmarks/build-stop-batch-peer.py .native-peer-shb "$RUNNER_TEMP/stop-peer"
+          python -m unittest discover -s benchmarks -p test_stop_batch.py -v
+      - name: Native sparse cancellations, reset ACKs and independent wire checks
+        run: |
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' stop-smoke \
+            "$(command -v python)" benchmarks/stop-batch-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/stop-peer/stop-batch-peer" \
+            "$RUNNER_TEMP/stop-smoke" --client-cpu 1
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' stop-wire \
+            "$(command -v python)" benchmarks/stop-batch-wire-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/stop-peer/stop-batch-peer" \
+            "$RUNNER_TEMP/stop-wire" --client-cpu 1
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' stop-faults \
+            "$(command -v python)" benchmarks/stop-batch-fault-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/stop-peer/stop-batch-peer" \
+            "$RUNNER_TEMP/stop-faults" --client-cpu 1
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
