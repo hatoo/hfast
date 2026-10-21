@@ -22,6 +22,7 @@ const WINDOW_UPDATE: u8 = 0x8;
 const CONTINUATION: u8 = 0x9;
 
 const INITIAL_WINDOW: u32 = 65_535;
+const RECEIVE_CREDIT_BATCH: u32 = 32_768;
 const MAX_WINDOW: u32 = 0x7fff_ffff;
 const PROTOCOL_ERROR: u32 = 1;
 const FLOW_CONTROL_ERROR: u32 = 3;
@@ -55,6 +56,11 @@ pub struct Conn {
     header_stream: u32,
     header_is_request: bool,
     closing: bool,
+    /// Consumed DATA payload not yet returned as connection credit. Always
+    /// below RECEIVE_CREDIT_BATCH, so it fits beside the two boolean fields.
+    /// The remaining receive window is INITIAL_WINDOW minus this value;
+    /// response send windows and peer SETTINGS are entirely independent.
+    receive_uncredited: u16,
     last_stream: u32,
     send_window: u32,
     initial_window: u32,
@@ -84,6 +90,7 @@ impl Conn {
             header_stream: 0,
             header_is_request: false,
             closing: false,
+            receive_uncredited: 0,
             last_stream: 0,
             send_window: INITIAL_WINDOW,
             initial_window: INITIAL_WINDOW,
@@ -126,6 +133,35 @@ impl Conn {
                 return None;
             }
             match kind {
+                DATA => {
+                    if stream == 0 || stream & 1 == 0 || stream > self.last_stream {
+                        return self.fail(out, buf.len(), PROTOCOL_ERROR);
+                    }
+                    // Validate only once the entire frame is available, just
+                    // like the other frame handlers and interleaving checks.
+                    if flags & 0x8 != 0 {
+                        let Some(&padding) = payload.first() else {
+                            return self.fail(out, buf.len(), FRAME_SIZE_ERROR);
+                        };
+                        if padding as usize >= len {
+                            return self.fail(out, buf.len(), PROTOCOL_ERROR);
+                        }
+                    }
+                    // RFC 9113 6.1: padding and the pad-length byte also use
+                    // credit. Even discarded DATA on a reset stream consumes
+                    // connection credit, independently of per-stream receive limits.
+                    let consumed = u32::from(self.receive_uncredited) + len as u32;
+                    if consumed > INITIAL_WINDOW {
+                        return self.fail(out, buf.len(), FLOW_CONTROL_ERROR);
+                    }
+                    if consumed >= RECEIVE_CREDIT_BATCH {
+                        out.extend_from_slice(&[0, 0, 4, WINDOW_UPDATE, 0, 0, 0, 0, 0]);
+                        out.extend_from_slice(&consumed.to_be_bytes());
+                        self.receive_uncredited = 0;
+                    } else {
+                        self.receive_uncredited = consumed as u16;
+                    }
+                }
                 // Every request is the same request; the only thing worth
                 // reading out of one is which stream to answer on.
                 HEADERS => {
@@ -267,7 +303,7 @@ impl Conn {
                     }
                 }
                 GOAWAY => return None,
-                // Request DATA and PRIORITY need no response here.
+                // PRIORITY and unknown extension frames need no response here.
                 _ => {}
             }
             at += end;
@@ -483,6 +519,9 @@ mod continuation_tests;
 
 #[cfg(test)]
 mod flow_control_tests;
+
+#[cfg(test)]
+mod receive_credit_tests;
 
 #[cfg(test)]
 mod tests {

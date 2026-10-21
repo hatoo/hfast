@@ -60,6 +60,10 @@ jobs:
         run: |
           python benchmarks/h2-data-check.py target/release/hfast
           python benchmarks/h2-data-check.py target/release/hfast --threads 2
+      - name: HTTP/2 batched request credit and sustained uploads
+        run: |
+          python benchmarks/h2-upload-credit-check.py target/release/hfast
+          python benchmarks/h2-upload-credit-check.py target/release/hfast --threads 2
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
       - name: QUIC control recovery with repeated packet loss
