@@ -17,6 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -64,6 +66,15 @@ jobs:
         run: |
           python benchmarks/h2-upload-credit-check.py target/release/hfast
           python benchmarks/h2-upload-credit-check.py target/release/hfast --threads 2
+      - name: Native HTTP/2 upload accounting and fault oracles
+        run: |
+          rustfmt --edition 2024 --check benchmarks/h2-upload-peer.rs
+          rustc --edition=2024 --test benchmarks/h2-upload-peer.rs -o /tmp/h2-upload-tests
+          /tmp/h2-upload-tests
+          rustc --edition=2024 --test -O benchmarks/h2-upload-peer.rs -o /tmp/h2-upload-tests-release
+          /tmp/h2-upload-tests-release
+          rustc --edition=2024 -O -C lto=fat -C codegen-units=1 benchmarks/h2-upload-peer.rs -o /tmp/h2-upload-peer
+          python benchmarks/h2-upload-oracle-check.py /tmp/h2-upload-peer --server target/release/hfast
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
       - name: QUIC control recovery with repeated packet loss
