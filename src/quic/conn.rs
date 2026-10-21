@@ -1535,6 +1535,7 @@ mod tests {
     mod send_credit;
     mod stream_credit;
     mod stream_table;
+    mod tls_tickets;
 
     fn connection() -> Connection {
         connection_and_client().0

@@ -223,7 +223,7 @@ pub fn serve(port: u16, threads: usize, max_streams: u32) {
 }
 
 /// A self-signed certificate, generated at startup, and ALPN naming HTTP/3
-fn tls_config() -> rustls::ServerConfig {
+pub(super) fn tls_config() -> rustls::ServerConfig {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed");
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -235,6 +235,12 @@ fn tls_config() -> rustls::ServerConfig {
     .with_single_cert(vec![cert.cert.der().clone()], key)
     .expect("certificate");
     tls.alpn_protocols = vec![b"h3".to_vec()];
+    // This transport does not send post-handshake CRYPTO: pump_tls queues
+    // tickets in Handshake, which recv retires immediately after Finished.
+    // Avoid deriving and caching resumption state that no client can use.
+    tls.send_tls13_tickets = 0;
+    tls.max_tls13_tickets = 0;
+    tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     tls
 }
 
