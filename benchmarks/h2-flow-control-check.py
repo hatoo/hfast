@@ -40,6 +40,7 @@ class Peer:
         self.states = {}
         self.sequence = 0
         self.settings_acks = 0
+        self.window_updates = []
         self.client.initiate_connection()
         self.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: initial})
         self.exchange()
@@ -106,6 +107,8 @@ class Peer:
                     state["ended"] = True
                 elif isinstance(event, h2.events.SettingsAcknowledged):
                     self.settings_acks += 1
+                elif isinstance(event, h2.events.WindowUpdated):
+                    self.window_updates.append((event.stream_id, event.delta))
                 elif isinstance(event, h2.events.StreamReset):
                     self.states[event.stream_id]["reset"] = int(event.error_code)
                 elif isinstance(event, h2.events.ConnectionTerminated):
