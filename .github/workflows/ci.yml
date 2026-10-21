@@ -77,6 +77,8 @@ jobs:
           python benchmarks/h2-upload-oracle-check.py /tmp/h2-upload-peer --server target/release/hfast
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
+      - name: QUIC full handshakes without unused session tickets
+        run: python benchmarks/tls-ticket-check.py target/release/hfast
       - name: QUIC control recovery with repeated packet loss
         run: python benchmarks/control-recovery-check.py target/release/hfast
       - name: QUIC request recovery with reordering and loss
