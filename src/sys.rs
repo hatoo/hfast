@@ -4,7 +4,12 @@
 //! each with its own `SO_REUSEPORT` listener and its own io_uring, so
 //! nothing is shared and nothing needs locking.
 
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+
+// Linux doubles this request for bookkeeping, so the queue is at most 8 MiB
+// per worker unless the host already supplies a larger default. This is a
+// limit on queued packets, not an up-front allocation. Respect rmem_max.
+pub const MAX_UDP_RECEIVE_BUFFER: libc::c_int = 4 * 1024 * 1024;
 
 pub fn tcp_listener(port: u16) -> RawFd {
     unsafe {
@@ -36,15 +41,89 @@ unsafe fn set_opt(fd: RawFd, level: libc::c_int, name: libc::c_int) {
 /// clients across them by their address. QUIC connections are identified by
 /// address here, not by connection id, which is fine for a client that does not
 /// migrate mid-run - and a load generator does not.
-pub fn udp_listener(port: u16) -> std::net::UdpSocket {
-    use std::os::fd::FromRawFd;
+pub fn udp_listener(port: u16, receive_buffer: libc::c_int) -> std::net::UdpSocket {
+    let socket = udp_socket_with_buffer(receive_buffer);
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let fd = socket.as_raw_fd();
         set_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR);
         set_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT);
         bind(fd, port);
-        std::net::UdpSocket::from_raw_fd(fd)
+    }
+    socket
+}
+
+fn new_udp_socket() -> std::net::UdpSocket {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+    unsafe { std::net::UdpSocket::from_raw_fd(fd) }
+}
+
+fn receive_buffer(fd: RawFd) -> std::io::Result<libc::c_int> {
+    let mut bytes: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&bytes) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut bytes as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(bytes)
+}
+
+fn udp_socket_with_buffer(requested: libc::c_int) -> std::net::UdpSocket {
+    let socket = new_udp_socket();
+    if requested == 0 {
+        return socket;
+    }
+    let before = match receive_buffer(socket.as_raw_fd()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("hfast: could not read UDP receive buffer: {error}; using default");
+            return socket;
+        }
+    };
+    // Do not shrink a larger system default.
+    if before >= requested.saturating_mul(2) {
+        return socket;
+    }
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &requested as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&requested) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        eprintln!(
+            "hfast: could not enlarge UDP receive buffer: {}; using default {before} bytes",
+            std::io::Error::last_os_error()
+        );
+        return socket;
+    }
+    match receive_buffer(socket.as_raw_fd()) {
+        Ok(bytes) if bytes >= before => {
+            if bytes < requested.saturating_mul(2) {
+                eprintln!("hfast: UDP receive buffer capped at {bytes} bytes by the host");
+            }
+            socket
+        }
+        result => {
+            // rmem_max can be below rmem_default. Setting the old value again
+            // would also be capped. Recreate this still-unbound socket instead.
+            eprintln!(
+                "hfast: UDP receive buffer did not grow ({result:?}); using default {before} bytes"
+            );
+            drop(socket);
+            new_udp_socket()
+        }
     }
 }
 
@@ -170,4 +249,75 @@ pub fn accept(listener: RawFd) -> RawFd {
 
 pub fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+
+    #[test]
+    fn udp_receive_buffer_is_bounded_without_shrinking_the_default() {
+        let default = receive_buffer(new_udp_socket().as_raw_fd()).unwrap();
+        let socket = udp_listener(0, MAX_UDP_RECEIVE_BUFFER);
+        let actual = receive_buffer(socket.as_raw_fd()).unwrap();
+        assert!(actual >= default);
+        assert!(actual <= default.max(MAX_UDP_RECEIVE_BUFFER * 2));
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+    }
+
+    #[test]
+    fn smaller_receive_buffer_request_keeps_the_system_default() {
+        let default = receive_buffer(new_udp_socket().as_raw_fd()).unwrap();
+        for requested in [0, 1] {
+            let socket = udp_socket_with_buffer(requested);
+            assert_eq!(receive_buffer(socket.as_raw_fd()).unwrap(), default);
+            assert_eq!(socket.local_addr().unwrap().port(), 0);
+        }
+    }
+
+    #[test]
+    fn receive_buffer_reports_socket_errors() {
+        assert_eq!(
+            receive_buffer(-1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn udp_workers_share_a_port_and_preserve_every_datagram() {
+        let mut workers = vec![udp_listener(0, MAX_UDP_RECEIVE_BUFFER)];
+        let port = workers[0].local_addr().unwrap().port();
+        for _ in 1..4 {
+            workers.push(udp_listener(port, MAX_UDP_RECEIVE_BUFFER));
+        }
+        let mut peers = Vec::new();
+        for number in 0..64u8 {
+            let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            peer.send_to(&[number], (std::net::Ipv4Addr::LOCALHOST, port))
+                .unwrap();
+            peers.push(peer);
+        }
+        let mut seen = [false; 64];
+        for worker in workers {
+            worker.set_nonblocking(true).unwrap();
+            loop {
+                let mut buf = [0; 2];
+                match worker.recv_from(&mut buf) {
+                    Ok((len, addr)) => {
+                        assert_eq!(len, 1);
+                        let number = buf[0] as usize;
+                        assert!(!seen[number]);
+                        assert_eq!(addr, peers[number].local_addr().unwrap());
+                        seen[number] = true;
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|value| value));
+    }
 }

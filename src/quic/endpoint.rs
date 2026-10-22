@@ -206,9 +206,11 @@ impl Endpoint {
     }
 }
 
-pub fn serve(port: u16, threads: usize, max_streams: u32) {
+pub fn serve(port: u16, threads: usize, max_streams: u32, receive_buffer: libc::c_int) {
     let config = Arc::new(tls_config());
-    let sockets: Vec<_> = (0..threads).map(|_| sys::udp_listener(port)).collect();
+    let sockets: Vec<_> = (0..threads)
+        .map(|_| sys::udp_listener(port, receive_buffer))
+        .collect();
     let mut running = Vec::new();
     for (cpu, socket) in sockets.into_iter().enumerate() {
         let config = config.clone();

@@ -22,6 +22,7 @@ fn main() {
     let mut quic_port = DEFAULT_QUIC;
     let mut threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut max_streams = DEFAULT_MAX_STREAMS;
+    let mut udp_receive_buffer = 0;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -35,6 +36,12 @@ fn main() {
             "--quic" => quic_port = value() as u16,
             "--threads" => threads = value(),
             "--max-streams" => max_streams = value() as u32,
+            "--udp-receive-buffer" => {
+                udp_receive_buffer = value();
+                if udp_receive_buffer > sys::MAX_UDP_RECEIVE_BUFFER as usize {
+                    usage();
+                }
+            }
             _ => usage(),
         }
     }
@@ -46,7 +53,12 @@ fn main() {
     if quic_port != 0 {
         eprintln!("hfast: HTTP/3 on udp/{quic_port}, {threads} threads");
         running.push(std::thread::spawn(move || {
-            quic::endpoint::serve(quic_port, threads, max_streams)
+            quic::endpoint::serve(
+                quic_port,
+                threads,
+                max_streams,
+                udp_receive_buffer as libc::c_int,
+            )
         }));
     }
     if tcp_port != 0 {
@@ -72,6 +84,7 @@ fn main() {
 fn usage() -> ! {
     eprintln!(
         "usage: hfast [--tcp PORT] [--quic PORT] [--threads N] [--max-streams N]\n\
+         [--udp-receive-buffer BYTES]\n\
          \n\
          HTTP/1.1 and HTTP/2 (cleartext, told apart by the client's first\n\
          bytes) share the TCP port; HTTP/3 has the UDP one. A port of 0\n\
@@ -83,8 +96,13 @@ fn usage() -> ! {
          what the load generator actually asks for; leaving it below that\n\
          measures this limit instead.\n\
          \n\
+         --udp-receive-buffer requests up to 4194304 bytes per QUIC worker;\n\
+         0 keeps the host default. Linux doubles the request and may cap it.\n\
+         Larger queues can prevent burst loss but increase queueing latency\n\
+         and kernel memory use.\n\
+         \n\
          defaults: --tcp {DEFAULT_TCP}  --quic {DEFAULT_QUIC}  --threads <cores>  \
-         --max-streams {DEFAULT_MAX_STREAMS}"
+         --max-streams {DEFAULT_MAX_STREAMS} --udp-receive-buffer 0"
     );
     std::process::exit(2)
 }
