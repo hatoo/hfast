@@ -13,7 +13,7 @@ jobs:
   correctness:
     name: ci
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -176,3 +176,17 @@ jobs:
             "$(command -v python)" benchmarks/crypto-churn-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/crypto-churn-peer/crypto-churn-peer" \
             "$RUNNER_TEMP/crypto-churn-smoke"
+      - name: Persistent native peer accounting and independent failure oracles
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: |
+          rustfmt --edition 2024 --config skip_children=true --check benchmarks/persistent-peer-main.rs
+          python benchmarks/build-crypto-churn-peer.py .crypto-churn-shb "$RUNNER_TEMP/persistent-peer" --persistent
+          python -m unittest discover -s benchmarks -p test_persistent_peers.py -v
+          python benchmarks/persistent-peer-interop.py "$RUNNER_TEMP/persistent-peer/persistent-peer" "$RUNNER_TEMP/persistent-interop"
+      - name: Persistent native peers with GRO and fallback delivery
+        run: |
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' persistent-peers \
+            "$(command -v python)" benchmarks/persistent-peer-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/persistent-peer/persistent-peer" \
+            "$RUNNER_TEMP/persistent-smoke"

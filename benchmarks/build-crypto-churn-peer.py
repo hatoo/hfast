@@ -13,7 +13,7 @@ import tarfile
 REVISION = '12e95af17ef6015020776ab65996bef9531099e0'
 
 
-def main(repo, output):
+def main(repo, output, *, persistent=False):
     output.mkdir(parents=True)
     source = output / 'source'
     source.mkdir()
@@ -21,7 +21,8 @@ def main(repo, output):
     archive = subprocess.check_output(['git', '-C', str(repo), 'archive', REVISION])
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(source, filter='data')
-    for name, target in [('crypto-churn-peer-main.rs', 'main.rs'),
+    main_source = 'persistent-peer-main.rs' if persistent else 'crypto-churn-peer-main.rs'
+    for name, target in [(main_source, 'main.rs'),
                          ('crypto-churn-schedule.rs', 'crypto_schedule.rs')]:
         shutil.copy2(here / name, source / 'src' / target)
     conn = source / 'src/quic/conn.rs'
@@ -57,11 +58,11 @@ def main(repo, output):
                 ['cargo', 'build', '--release', '--locked', '--bin', 'shb']]
     for command in commands:
         subprocess.run(command, cwd=source, env=env, check=True)
-    binary = output / 'crypto-churn-peer'
+    binary = output / ('persistent-peer' if persistent else 'crypto-churn-peer')
     shutil.copy2(target / 'release/shb', binary)
     binary.chmod(0o555)
     (output / 'manifest.json').write_text(json.dumps(dict(
-        revision=REVISION, commands=commands,
+        revision=REVISION, commands=commands, workload=main_source,
         sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
         rustc=subprocess.check_output(['rustc', '-Vv'], text=True),
         source_sha256={str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -71,4 +72,7 @@ def main(repo, output):
 
 
 if __name__ == '__main__':
-    main(*(Path(p).resolve() for p in sys.argv[1:]))
+    persistent = len(sys.argv) == 4 and sys.argv[3] == '--persistent'
+    if len(sys.argv) != 3 and not persistent:
+        raise SystemExit('usage: builder SHB OUTPUT [--persistent]')
+    main(*(Path(p).resolve() for p in sys.argv[1:3]), persistent=persistent)
