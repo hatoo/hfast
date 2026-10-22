@@ -562,4 +562,151 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
     }
+
+    fn receive_ack(client: &UdpSocket, pn: u64) -> Vec<(u64, u64)> {
+        let mut buf = [0; 2048];
+        let n = client.recv(&mut buf).unwrap();
+        let packet = &mut buf[..n];
+        let header = packet::parse(packet, 0).unwrap();
+        let keys = client_keys();
+        let (_, pn_len) =
+            wire::unprotect_header(keys.remote.header.as_ref(), packet, header.pn_offset).unwrap();
+        let (head, body) = packet.split_at_mut(header.pn_offset + pn_len);
+        let plain = keys.remote.packet.decrypt_in_place(pn, head, body).unwrap();
+        let frames = frame::Frames::new(plain)
+            .collect::<wire::Result<Vec<_>>>()
+            .unwrap();
+        let [
+            frame::Frame::Ack {
+                largest,
+                first_range,
+                rest,
+                ..
+            },
+        ] = frames.as_slice()
+        else {
+            panic!("expected exactly one ACK, got {frames:?}");
+        };
+        frame::AckRanges::new(*largest, *first_range, rest).collect()
+    }
+
+    #[test]
+    fn table_growth_preserves_peer_routing_replay_history_and_queued_output() {
+        let (mut ep, first) = endpoint();
+        let mut clients = vec![first];
+        let mut growths = 0;
+        let mut capacity = ep.conns.capacity();
+        let ping = [frame::PING as u8];
+        // Cross several actual capacity boundaries with live authenticated peers.
+        for index in 0..129 {
+            if index != 0 {
+                let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+                client.set_nonblocking(true).unwrap();
+                clients.push(client);
+            }
+            let addr = clients[index].local_addr().unwrap();
+            ep.datagram(&mut initial(0, &ping), addr);
+            ep.datagram(&mut initial(4, &ping), addr);
+            if ep.conns.capacity() != capacity {
+                growths += 1;
+                capacity = ep.conns.capacity();
+            }
+        }
+        assert!(growths >= 6);
+        for client in clients.iter().rev() {
+            let addr = client.local_addr().unwrap();
+            for pn in [2, 4, 1] {
+                ep.datagram(&mut initial(pn, &ping), addr);
+            }
+            assert!(ep.conns[&addr].2);
+        }
+        assert_eq!(ep.conns.len(), clients.len());
+        assert_eq!(ep.ready.len(), clients.len());
+        ep.flush_ready();
+        ep.out.flush(&ep.socket).unwrap();
+        assert!(ep.ready.is_empty());
+        for client in &clients {
+            assert_eq!(receive_ack(client, 0), [(4, 4), (0, 2)]);
+            assert!(!ep.conns[&client.local_addr().unwrap()].2);
+            assert_eq!(
+                client.recv(&mut [0; 2048]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        // A subsequent batch routes to the original state, with its next PN.
+        for client in &clients {
+            ep.datagram(&mut initial(3, &ping), client.local_addr().unwrap());
+        }
+        ep.flush_ready();
+        ep.out.flush(&ep.socket).unwrap();
+        for client in &clients {
+            assert_eq!(receive_ack(client, 1), [(0, 4)]);
+        }
+    }
+
+    #[test]
+    fn close_and_reinsert_at_same_address_ignores_stale_ready_entry() {
+        let (mut ep, client) = endpoint();
+        let addr = client.local_addr().unwrap();
+        let owners = Arc::strong_count(&ep.config);
+        ep.datagram(&mut initial(4, &[frame::PING as u8]), addr);
+        let old_cid = ep.conns[&addr].0.local_cid;
+        assert!(Arc::strong_count(&ep.config) > owners);
+        ep.datagram(
+            &mut initial(5, &[frame::CONNECTION_CLOSE as u8, 0, 0, 0]),
+            addr,
+        );
+        assert!(ep.conns.is_empty());
+        assert_eq!(Arc::strong_count(&ep.config), owners);
+        assert_eq!(ep.ready, [addr]);
+        ep.datagram(&mut initial(0, &[frame::PING as u8]), addr);
+        assert_ne!(ep.conns[&addr].0.local_cid, old_cid);
+        assert_eq!(ep.ready, [addr, addr]);
+        ep.flush_ready();
+        ep.out.flush(&ep.socket).unwrap();
+        assert_eq!(receive_ack(&client, 0), [(0, 0)]);
+        assert_eq!(
+            client.recv(&mut [0; 2048]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        ep.datagram(&mut initial(1, &[frame::PING as u8]), addr);
+        assert_eq!(ep.ready, [addr]);
+        ep.flush_ready();
+        ep.out.flush(&ep.socket).unwrap();
+        assert_eq!(receive_ack(&client, 1), [(0, 1)]);
+        ep.conns.clear();
+        assert_eq!(Arc::strong_count(&ep.config), owners);
+    }
+
+    #[test]
+    fn idle_expiry_drops_only_expired_state_with_pending_output() {
+        let (mut ep, idle) = endpoint();
+        let active = UdpSocket::bind("127.0.0.1:0").unwrap();
+        active.set_nonblocking(true).unwrap();
+        let idle_addr = idle.local_addr().unwrap();
+        let active_addr = active.local_addr().unwrap();
+        let owners = Arc::strong_count(&ep.config);
+        for addr in [idle_addr, active_addr] {
+            ep.datagram(&mut initial(0, &[frame::PING as u8]), addr);
+        }
+        let with_two = Arc::strong_count(&ep.config);
+        ep.conns.get_mut(&idle_addr).unwrap().1 =
+            Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        ep.tick();
+        assert!(!ep.conns.contains_key(&idle_addr));
+        assert!(ep.conns.contains_key(&active_addr));
+        assert!(Arc::strong_count(&ep.config) < with_two);
+        ep.flush_ready();
+        ep.out.flush(&ep.socket).unwrap();
+        assert_eq!(receive_ack(&active, 0), [(0, 0)]);
+        assert_eq!(
+            idle.recv(&mut [0; 2048]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        ep.conns.get_mut(&active_addr).unwrap().1 =
+            Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        ep.tick();
+        assert!(ep.conns.is_empty());
+        assert_eq!(Arc::strong_count(&ep.config), owners);
+    }
 }
