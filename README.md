@@ -14,6 +14,14 @@ preface that no HTTP/1.1 request line can begin with, so which one a connection
 is speaking is decided by its first bytes and nothing has to be negotiated.
 Each side takes a full set of threads, so turn off the one not being measured.
 
+For bursts of simultaneous QUIC connections, `--udp-receive-buffer 4194304`
+requests a larger receive queue on each worker. Values from 0 to 4194304 are
+accepted; 0 (the default) keeps the host setting. Linux doubles the request for
+bookkeeping and caps it at the host's limit. Existing larger defaults are kept.
+Larger queues can prevent burst loss and retransmission, but can increase
+queueing latency, CPU cost under sustained load, and kernel memory use. See the
+[receive-buffer measurements](benchmarks/udp-receive-buffer.md) before tuning it.
+
 ## Measured against nginx
 
 Serving the same 13-byte body, on 16 cores of a Ryzen 9 3950X, driven by
