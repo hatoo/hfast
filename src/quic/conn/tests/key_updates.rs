@@ -54,7 +54,14 @@ impl Peer {
 }
 
 fn pair(finish: bool) -> (Connection, Peer, Vec<u8>) {
-    let (mut conn, mut client) = connection_and_client();
+    pair_with_provider(finish, rustls::crypto::ring::default_provider())
+}
+
+fn pair_with_provider(
+    finish: bool,
+    provider: rustls::crypto::CryptoProvider,
+) -> (Connection, Peer, Vec<u8>) {
+    let (mut conn, mut client) = connection_and_client_with_provider(provider);
     let mut bytes = Vec::new();
     assert!(client.write_hs(&mut bytes).is_none());
     conn.tls.read_hs(&bytes).unwrap();
@@ -81,6 +88,137 @@ fn pair(finish: bool) -> (Connection, Peer, Vec<u8>) {
     (conn, peer.unwrap(), bytes)
 }
 
+fn providers() -> impl Iterator<Item = rustls::crypto::CryptoProvider> {
+    use rustls::crypto::ring::cipher_suite::*;
+    [
+        TLS13_AES_128_GCM_SHA256,
+        TLS13_AES_256_GCM_SHA384,
+        TLS13_CHACHA20_POLY1305_SHA256,
+    ]
+    .into_iter()
+    .map(|suite| rustls::crypto::CryptoProvider {
+        cipher_suites: vec![suite],
+        ..rustls::crypto::ring::default_provider()
+    })
+}
+
+fn preparations(conn: &Connection) -> u64 {
+    conn.key_updates.as_ref().unwrap().preparations
+}
+
+#[test]
+fn unchanged_phase_does_not_prepare_unused_keys_for_any_aead() {
+    for provider in providers() {
+        let (mut conn, peer, _) = pair_with_provider(true, provider);
+        assert_eq!(preparations(&conn), 0);
+        for i in 0..32 {
+            conn.recv(&mut peer.packet(&conn, 2 * i, &request(u64::from(i) * 4)))
+                .unwrap();
+            let (sent, reply) = peer.receive(&mut conn);
+            assert_reply(&reply, u64::from(i) * 4);
+            let mut ack = Vec::new();
+            frame::put_ack(&mut ack, &[(sent, sent)], 0);
+            conn.recv(&mut peer.packet(&conn, 2 * i + 1, &ack)).unwrap();
+            assert_eq!(conn.finished, u64::from(i + 1));
+            assert!(conn.unacked.is_empty());
+        }
+        assert_eq!(preparations(&conn), 0);
+    }
+}
+
+#[test]
+fn failed_phase_changes_prepare_once_then_genuine_updates_consume_for_all_aeads() {
+    for provider in providers() {
+        let (mut conn, mut peer, _) = pair_with_provider(true, provider);
+        for generation in 0..6 {
+            let pn = 10 + generation * 3;
+            let mut current_forgery = peer.packet(&conn, pn, &[1]);
+            *current_forgery.last_mut().unwrap() ^= 1;
+            let before = snapshot(&conn);
+            conn.recv(&mut current_forgery).unwrap();
+            assert_eq!(preparations(&conn), u64::from(generation));
+            peer.update();
+            let valid = peer.packet(&conn, pn, &request(u64::from(generation) * 4));
+            let mut forged = valid.clone();
+            *forged.last_mut().unwrap() ^= 1;
+            for _ in 0..128 {
+                conn.recv(&mut forged.clone()).unwrap();
+                assert_eq!(preparations(&conn), u64::from(generation + 1));
+                assert_eq!(snapshot(&conn), before);
+            }
+            conn.recv(&mut valid.clone()).unwrap();
+            assert_eq!(preparations(&conn), u64::from(generation + 1));
+            let (sent, reply) = peer.receive(&mut conn);
+            assert_reply(&reply, u64::from(generation) * 4);
+            let mut ack = Vec::new();
+            frame::put_ack(&mut ack, &[(sent, sent)], 0);
+            conn.recv(&mut peer.packet(&conn, pn + 1, &ack)).unwrap();
+            assert_eq!(conn.finished, u64::from(generation + 1));
+            assert!(conn.unacked.is_empty());
+            assert_eq!(
+                conn.key_updates.as_ref().unwrap().failed_decryptions,
+                u64::from(generation + 1) * 129
+            );
+        }
+    }
+}
+
+#[test]
+fn reordered_old_keys_avoid_preparation_and_expired_keys_cache_one_fallback() {
+    for provider in providers() {
+        let (mut conn, mut peer, _) = pair_with_provider(true, provider);
+        let old = peer.packet(&conn, 1, &[1]);
+        peer.update();
+        conn.recv(&mut peer.packet(&conn, 2, &[1])).unwrap();
+        assert_eq!(preparations(&conn), 1);
+        for _ in 0..8 {
+            conn.recv(&mut old.clone()).unwrap();
+            assert_eq!(preparations(&conn), 1);
+        }
+        let (_, deadline) = conn
+            .key_updates
+            .as_ref()
+            .unwrap()
+            .previous
+            .as_ref()
+            .unwrap();
+        conn.on_timeout(*deadline);
+        let before = snapshot(&conn);
+        for _ in 0..128 {
+            conn.recv(&mut old.clone()).unwrap();
+            assert_eq!(preparations(&conn), 2);
+            assert_eq!(snapshot(&conn), before);
+        }
+        peer.update();
+        conn.recv(&mut peer.packet(&conn, 3, &request(0))).unwrap();
+        assert_eq!(preparations(&conn), 2);
+        assert_reply(&peer.receive(&mut conn).1, 0);
+    }
+}
+
+#[test]
+fn changed_phase_failures_keep_integrity_limit_for_every_aead() {
+    for provider in providers() {
+        let (mut conn, mut peer, _) = pair_with_provider(true, provider);
+        let limit = conn
+            .one_rtt_remote
+            .as_ref()
+            .unwrap()
+            .packet
+            .integrity_limit();
+        conn.key_updates.as_mut().unwrap().failed_decryptions = limit - 2;
+        peer.update();
+        let mut forged = peer.packet(&conn, 1, &[1]);
+        *forged.last_mut().unwrap() ^= 1;
+        let before = snapshot(&conn);
+        conn.recv(&mut forged.clone()).unwrap();
+        assert!(conn.recv(&mut forged).is_err());
+        assert_eq!(snapshot(&conn), before);
+        assert_eq!(preparations(&conn), 1);
+        assert_eq!(conn.key_updates.as_ref().unwrap().failed_decryptions, limit);
+    }
+}
+
 fn request(id: u64) -> Vec<u8> {
     let mut body = Vec::new();
     frame::put_stream(&mut body, id, 0, true, b"request");
@@ -97,7 +235,8 @@ fn assert_reply(body: &[u8], id: u64) {
         }));
 }
 
-// Excludes only the failure counter, which must advance on an AEAD failure.
+// Active protocol state only: an AEAD failure increments its counter and may
+// cache future keys, but must not activate them or affect packet accounting.
 fn snapshot(conn: &Connection) -> String {
     let keys = conn.key_updates.as_ref().unwrap();
     format!(
@@ -298,6 +437,7 @@ fn data_and_key_updates_wait_for_the_finished_message() {
     assert_eq!(conn.finished, 0);
     assert!(conn.spaces[2].ack.ranges.is_empty());
     assert_eq!(conn.key_updates.as_ref().unwrap().first, None);
+    assert_eq!(preparations(&conn), 0);
     let (mut conn, mut peer, finished) = pair(false);
     peer.update();
     let packet = peer.packet(&conn, 1, &request(0));

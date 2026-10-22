@@ -296,7 +296,9 @@ impl SpaceState {
 /// Section 6). Retained secrets and extra keys live outside the inline stream state.
 struct KeyUpdates {
     secrets: Secrets,
-    next: PacketKeySet,
+    // Prepared only when a changed phase needs it; failed authentication keeps
+    // this pair so repeated forgeries cannot repeatedly derive keys.
+    next: Option<PacketKeySet>,
     previous: Option<(Box<dyn PacketKey>, Instant)>,
     phase: bool,
     /// Lowest authenticated packet number in the current generation.
@@ -304,20 +306,22 @@ struct KeyUpdates {
     /// Highest authenticated packet number in the previous generation.
     previous_largest: Option<u64>,
     failed_decryptions: u64,
+    #[cfg(test)]
+    preparations: u64,
 }
 
 impl KeyUpdates {
-    fn new(mut secrets: Secrets) -> Self {
-        // Preparing these here avoids deriving keys in response to forgery.
-        let next = secrets.next_packet_keys();
+    fn new(secrets: Secrets) -> Self {
         Self {
             secrets,
-            next,
+            next: None,
             previous: None,
             phase: false,
             first: None,
             previous_largest: None,
             failed_decryptions: 0,
+            #[cfg(test)]
+            preparations: 0,
         }
     }
 }
@@ -643,7 +647,7 @@ impl Connection {
         Ok(true)
     }
 
-    /// Select one prepared receive key by phase and packet number. No keys,
+    /// Select one receive key by phase and packet number. No active keys,
     /// ACKs, packet numbers or stream state advance until AEAD authenticates.
     fn decrypt_data(
         &mut self,
@@ -667,10 +671,21 @@ impl Connection {
         };
         let key = if !changed {
             current.packet.as_ref()
+        } else if let Some((key, _)) = retained {
+            key.as_ref()
         } else {
             // Expired/missing old keys still perform one AEAD attempt with a
-            // prepared key, avoiding a cheap oracle for the protected phase.
-            retained.map_or(updates.next.remote.as_ref(), |(key, _)| key.as_ref())
+            // next-generation key, avoiding a cheap oracle for the protected
+            // phase. Prepare at most once until an authenticated transition
+            // consumes the pair. Secrets advance exactly with preparation.
+            let next = updates.next.get_or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    updates.preparations += 1;
+                }
+                updates.secrets.next_packet_keys()
+            });
+            next.remote.as_ref()
         };
         let plain_len = match key.decrypt_in_place(pn, header, payload) {
             Ok(plain) => plain.len(),
@@ -693,7 +708,7 @@ impl Connection {
             if updates.first.is_some() && pn <= largest {
                 return Err(Error);
             }
-            let next = std::mem::replace(&mut updates.next, updates.secrets.next_packet_keys());
+            let next = updates.next.take().ok_or(Error)?;
             let old = std::mem::replace(&mut current.packet, next.remote);
             self.one_rtt_local.as_mut().ok_or(Error)?.packet = next.local;
             let pto = self.srtt
@@ -1542,25 +1557,28 @@ mod tests {
     }
 
     fn connection_and_client() -> (Connection, rustls::quic::ClientConnection) {
+        connection_and_client_with_provider(rustls::crypto::ring::default_provider())
+    }
+
+    fn connection_and_client_with_provider(
+        provider: rustls::crypto::CryptoProvider,
+    ) -> (Connection, rustls::quic::ClientConnection) {
+        let provider = Arc::new(provider);
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.cert.der().clone()], key)
-        .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         let mut params = Vec::new();
         for (id, value) in [
             (4, 1 << 30),
