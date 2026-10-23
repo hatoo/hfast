@@ -58,6 +58,15 @@ jobs:
           python benchmarks/tcp-mixed-receive-check.py target/release/hfast --threads 2
       - name: HTTP/2 request header continuations
         run: python benchmarks/h2-continuation-check.py target/release/hfast
+      - name: HTTP/2 field blocks, pipelined native accounting and failure oracles
+        run: |
+          rustfmt --edition 2024 --check benchmarks/h2-field-peer.rs
+          rustc --edition=2024 -D warnings --test benchmarks/h2-field-peer.rs -o /tmp/h2-field-tests
+          /tmp/h2-field-tests
+          rustc --edition=2024 -D warnings --test -O benchmarks/h2-field-peer.rs -o /tmp/h2-field-tests-release
+          /tmp/h2-field-tests-release
+          rustc --edition=2024 -D warnings -O -C lto=fat -C codegen-units=1 benchmarks/h2-field-peer.rs -o /tmp/h2-field-peer
+          python benchmarks/h2-field-check.py target/release/hfast --peer /tmp/h2-field-peer
       - name: HTTP/2 response credit and backpressure
         run: python benchmarks/h2-flow-control-check.py target/release/hfast
       - name: HTTP/2 upload fragments, delayed errors and partial-body EOF

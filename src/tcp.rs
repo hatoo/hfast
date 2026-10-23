@@ -424,3 +424,6 @@ mod tests {
         assert_eq!(settle(b"PRINT / HTTP/1.1\r\n"), Which::H1);
     }
 }
+
+#[cfg(test)]
+mod h2_field_tests;
