@@ -510,3 +510,81 @@ fn interrupted_receive_wait_preserves_buffer_ownership() {
     });
     assert_eq!(SIGNALS.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn read_eof_preserves_partial_sends_and_discards_an_incomplete_field_block() {
+    let mut worker = Worker::new(ring(2));
+    let (key, mut peer) = pair(&mut worker);
+    let fd = worker.socket(key).unwrap().fd.as_raw_fd();
+    let size: libc::c_int = 4096;
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                size_of_val(&size) as _,
+            )
+        },
+        0
+    );
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut wire = ((payload.len() as u32) << 8 | u32::from(kind))
+            .to_be_bytes()
+            .to_vec();
+        wire.push(flags);
+        wire.extend_from_slice(&stream.to_be_bytes());
+        wire.extend_from_slice(payload);
+        wire
+    }
+    let mut requests = crate::h2::PREFACE.to_vec();
+    let mut expected = vec![
+        0, 0, 12, 4, 0, 0, 0, 0, 0, 0, 3, 127, 255, 255, 255, 0, 4, 127, 255, 255, 255,
+    ];
+    for stream in (1..2000).step_by(2) {
+        requests.extend_from_slice(&frame(1, 5, stream, b"\x82\x86\x84"));
+        expected.extend_from_slice(&frame(
+            1,
+            4,
+            stream,
+            b"\x88\x0f\x10\x0atext/plain\x0f\x0d\x02\x31\x33",
+        ));
+        expected.extend_from_slice(&frame(0, 1, stream, b"Hello, World!"));
+    }
+    requests.extend_from_slice(&frame(1, 1, 2001, b"start"));
+    let unfinished = frame(9, 4, 2001, &[b'x'; 16_384]);
+    requests.extend_from_slice(&unfinished[..unfinished.len() - 1]);
+    peer.write_all(&requests).unwrap();
+    peer.shutdown(std::net::Shutdown::Write).unwrap();
+    until(&mut worker, |w| w.sockets.get(key).unwrap().conn.read_eof);
+    let socket = worker.socket(key).unwrap();
+    assert!(socket.closing());
+    assert!(!socket.recv_active && !socket.starved);
+    assert!(socket.poll_active);
+    assert!(socket.conn.out_off > 0 && socket.conn.out_off < socket.conn.outbuf.len());
+    assert!(matches!(socket.conn.proto, Proto::H2(_)));
+    assert_eq!(socket.conn.outbuf, expected);
+    let receive_epoch = socket.recv_epoch;
+    peer.set_nonblocking(true).unwrap();
+    let mut observed = Vec::new();
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        worker.step(-1, false);
+        if let Some(socket) = worker.socket(key) {
+            assert!(socket.conn.read_eof && !socket.recv_active);
+            assert_eq!(socket.recv_epoch, receive_epoch, "EOF must not rearm input");
+        }
+        let mut bytes = [0; 16384];
+        match peer.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(n) => observed.extend_from_slice(&bytes[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            result => panic!("unexpected read {result:?}"),
+        }
+        assert!(Instant::now() < end, "EOF output drain deadline");
+    }
+    assert_eq!(observed, expected);
+    assert!(worker.sockets.get(key).is_none());
+    assert!(worker.io.pool.owned.iter().all(|&b| !b));
+}
