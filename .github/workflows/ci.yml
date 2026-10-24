@@ -88,6 +88,12 @@ jobs:
           python benchmarks/h2-upload-oracle-check.py /tmp/h2-upload-peer --server target/release/hfast
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
+      - name: QUIC recovery oracle, deterministic impairments and failure controls
+        run: |
+          python -m unittest discover -s benchmarks -p test_quic_recovery.py -v
+          python benchmarks/quic-loss-check.py target/release/hfast --output "$RUNNER_TEMP/quic-recovery"
+          python benchmarks/quic-loss-check.py target/release/hfast --threads 2 --output "$RUNNER_TEMP/quic-recovery-t2"
+          HFAST_GRO_BINARY="$PWD/target/release/hfast" python benchmarks/quic-loss-check.py benchmarks/without-udp-gro.py --threads 2 --output "$RUNNER_TEMP/quic-recovery-denied-t2"
       - name: QUIC full handshakes without unused session tickets
         run: python benchmarks/tls-ticket-check.py target/release/hfast
       - name: QUIC control recovery with repeated packet loss

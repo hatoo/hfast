@@ -131,6 +131,12 @@ and enough loss recovery to get through a path that drops things. Against a
 relay dropping 5% each way, 3000 requests all arrive at 3,922 a second, where
 the former quinn implementation managed 3,960.
 
+The [independent recovery oracle](benchmarks/quic-recovery.md) checks named loss,
+reordering and duplication schedules with exact per-stream response accounting.
+It includes failure controls and runs in CI with normal and denied UDP_GRO.
+These bounded cases do not establish general loss recovery; seeded exploration
+is kept separate from the deterministic checks.
+
 Nothing in a request is read. A request's stream id is what says which stream
 to answer on and the end of the stream is what says to answer at all, so there
 is no reassembly and no allocation per request; the answer is a constant. That
