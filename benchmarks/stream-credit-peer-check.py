@@ -24,6 +24,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+from udp_accounting import (namespace_delta, namespace_snapshot, process_delta,
+                            process_snapshot, require_clean_peer, require_clean_run)
 
 RESPONSE = b'\x01\x08\x00\x00\xd9\xf5\x54\x02\x31\x33\x00\x0dHello, World!'
 
@@ -63,6 +65,7 @@ def validate(row, count, size):
         require(row['dropped_credit_packets'] == 2, 'loss schedule not reached')
     if row['mode'] == 'reorder':
         require(row['replayed'] and row['duplicate_packets'] >= 2, 'reorder/duplicate schedule not reached')
+    require_clean_peer(row['udp'])
 
 
 class Server(QuicConnectionProtocol):
@@ -186,6 +189,7 @@ async def independent(peer, output, mode, fault=None):
         (output / f'{name}.stderr').write_bytes(stderr)
         require(not failures, f'independent server failed: {failures}')
         row = json.loads(stdout)
+        require_clean_peer(row['udp'])
         require(len(protocols) == 1 and protocols[0].tls_done, 'wrong handshake count')
         protocol = protocols[0]
         if fault:
@@ -245,28 +249,48 @@ async def hfast_check(peer, binary, output, mode, count, size, threads):
         server = subprocess.Popen([str(binary), '--threads', str(threads), '--tcp', '0', '--quic', str(port)],
                                   stdout=log, stderr=subprocess.STDOUT)
         process = None
+        before = net_before = evidence = None
+
+        def capture_udp():
+            after = process_snapshot(server.pid, port, threads)
+            net_after = namespace_snapshot()
+            record = dict(server_before=before, server_after=after,
+                          server_delta=process_delta(before, after),
+                          namespace_before=net_before, namespace_after=net_after,
+                          namespace_delta=namespace_delta(net_before, net_after))
+            (output / f'{name}.udp.json').write_text(json.dumps(record, indent=2) + '\n')
+            return record
+
         try:
             await asyncio.sleep(.2)
             require(server.poll() is None, 'hfast startup failed')
+            net_before = namespace_snapshot()
+            before = process_snapshot(server.pid, port, threads)
             process = await asyncio.create_subprocess_exec(str(peer), str(port), str(count), str(size), mode, '45',
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await asyncio.wait_for(process.communicate(), 55)
             (output / f'{name}.stdout').write_bytes(stdout)
             (output / f'{name}.stderr').write_bytes(stderr)
+            evidence = capture_udp()
             require(process.returncode == 0, stderr.decode())
             row = json.loads(stdout)
             validate(row, count, size)
+            require_clean_run(row['udp'], evidence['server_delta'], evidence['namespace_delta'])
             require(all(row['credit_frames_per_stream']), 'large upload did not exercise credit')
-            return dict(case=name, peer=row)
+            return dict(case=name, peer=row, udp=evidence)
         finally:
             if process and process.returncode is None:
                 process.kill()
                 await process.wait()
-            server.terminate()
-            try: server.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=5)
+            try:
+                if before is not None and evidence is None:
+                    capture_udp()
+            finally:
+                server.terminate()
+                try: server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=5)
 
 
 async def main(args):

@@ -138,16 +138,23 @@ jobs:
         env:
           NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
         run: |
-          rustfmt --edition 2024 --config skip_children=true --check benchmarks/stream-credit-peer-main.rs benchmarks/stream-credit-ledger.rs
+          rustfmt --edition 2024 --config skip_children=true --check benchmarks/stream-credit-peer-main.rs benchmarks/stream-credit-ledger.rs benchmarks/udp-socket-evidence.rs
           python benchmarks/build-stream-credit-peer.py .stream-credit-shb "$RUNNER_TEMP/stream-credit-peer"
-          python benchmarks/stream-credit-peer-check.py "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-check" --server target/release/hfast
-          python benchmarks/stream-credit-peer-check.py "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-t2" --server target/release/hfast --only-server --threads 2 --streams 8 --mode sparse,pto
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' credit-peer \
+            "$(command -v python)" benchmarks/stream-credit-peer-check.py \
+            "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-check" --server target/release/hfast
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' credit-peer-t2 \
+            "$(command -v python)" benchmarks/stream-credit-peer-check.py \
+            "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-t2" --server target/release/hfast --only-server --threads 2 --streams 8 --mode sparse,pto
+          STREAM_CREDIT_VALID_ROW="$RUNNER_TEMP/stream-credit-check/ordinary.stdout" python -m unittest discover -s benchmarks -p test_udp_accounting.py -v
       - name: Preserve native upload failure ledgers
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: stream-credit-failure
-          path: ${{ runner.temp }}/stream-credit-check
+          path: |
+            ${{ runner.temp }}/stream-credit-check
+            ${{ runner.temp }}/stream-credit-t2
           retention-days: 7
       - name: Native cancellation accounting and failure oracles
         env:

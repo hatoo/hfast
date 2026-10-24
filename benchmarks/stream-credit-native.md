@@ -41,6 +41,39 @@ limits, packet counts and latency, plus all intended and deliberately suppressed
 ACK intervals. Handshake and close are outside request latency. The elapsed
 batch duration includes the configured credit/recovery schedule and control work.
 
+UDP evidence is collected before traffic and after completion, with the peer's
+elapsed duration frozen before end diagnostics. No diagnostic read is added to
+the upload I/O loop. The peer reports its live socket inode, effective SO_RCVBUF,
+and before/after `/proc/self/net/udp` drop counts (including the handshake).
+The harness matches every server worker's `/proc/PID/fd` socket inode against
+`udp`/`udp6`. Linux [SOCK_DIAG](https://man7.org/linux/man-pages/man7/sock_diag.7.html)
+adds each socket's identity cookie and actual receive capacity; cookies prevent
+an inode reused by a replacement socket from appearing to be a clean interval.
+Per-socket deltas and namespace UDP counter deltas are saved in `*.udp.json`
+before terminating the server, including on failure. Multiple workers sharing a
+port are counted separately; other processes on that port are excluded.
+
+Counters unavailable due to permissions, unsupported diagnostics, disappearance,
+counter reset/wrap or a changed socket set are explicitly `unavailable`, never
+zero. This invalidates a clean benchmark result. Recovered uploads with kernel
+drops retain their completed counts and latency samples but also fail validation.
+Intentional protocol loss schedules remain separate from unexpected kernel loss.
+Namespace totals may include unrelated traffic: use a private network namespace
+for attribution experiments. Snapshots are not atomic; inconsistent evidence is
+rejected. Socket drops alone do not identify the kernel's reason for every drop
+or establish a throughput gain.
+
+The independent tests force overflow by filling an undrained small UDP receive
+buffer, reconcile every sent datagram with delivery or loss, and identify the
+dropping socket among reuseport workers. They also cover IPv4/IPv6, process
+ownership, missing evidence and hostile parser inputs. Run them after the wire
+checks to include the real successful-ledger mutation oracle:
+
+```sh
+STREAM_CREDIT_VALID_ROW=/tmp/credit-check/ordinary.stdout \
+  python3 -m unittest discover -s benchmarks -p test_udp_accounting.py -v
+```
+
 ACKs use checked [RFC 9000 range arithmetic](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.3.1).
 The encoder partitions the entire intended range set into packet budgets without
 bridging gaps or dropping ranges. Live ACK payloads are at most 500 bytes;
