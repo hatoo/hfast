@@ -66,10 +66,11 @@ def validate(row, count, size):
 
 
 class Server(QuicConnectionProtocol):
-    def __init__(self, *args, size, fault, failures, **kwargs):
+    def __init__(self, *args, size, count, fault, failures, **kwargs):
         super().__init__(*args, **kwargs)
         self.http = H3Connection(self._quic)
-        self.size, self.fault, self.failures = size, fault, failures
+        self.size, self.count, self.fault, self.failures = size, count, fault, failures
+        self.unacked_fin_stream = None
         self.tls_done = False
         self.headers = set()
         self.bodies = {}
@@ -97,7 +98,7 @@ class Server(QuicConnectionProtocol):
 
         def ack(builder, space, now):
             if ((self.fault == 'missing-body-ack' and self.bodies)
-                    or (self.fault == 'missing-fin-ack' and self.fins)):
+                    or (self.fault == 'missing-fin-ack' and self.unacked_fin_stream is not None)):
                 space.ack_at = None
                 return
             return original_ack(builder, space, now)
@@ -126,6 +127,10 @@ class Server(QuicConnectionProtocol):
                     if ev.stream_ended:
                         require(self.bodies[ev.stream_id] == self.size, 'early request FIN')
                         self.fins.add(ev.stream_id)
+                        # Do not suppress other streams' body ACKs. The native peer
+                        # sends each FIN only after that stream's complete body ACK.
+                        if self.fault == 'missing-fin-ack' and len(self.fins) == self.count:
+                            self.unacked_fin_stream = ev.stream_id
                         if self.fault in ('missing-response', 'early-response'):
                             continue
                         data = RESPONSE
@@ -162,7 +167,7 @@ async def independent(peer, output, mode, fault=None):
     protocols, failures = [], []
 
     def factory(*args, **kwargs):
-        protocol = Server(*args, size=size, fault=fault, failures=failures, **kwargs)
+        protocol = Server(*args, size=size, count=count, fault=fault, failures=failures, **kwargs)
         protocols.append(protocol)
         return protocol
 
@@ -174,6 +179,7 @@ async def independent(peer, output, mode, fault=None):
     process = await asyncio.create_subprocess_exec(str(peer), str(port), str(count), str(size), mode, '3',
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     name = fault or mode
+    print(json.dumps({'case': name, 'event': 'start'}), flush=True)
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), 12)
         (output / f'{name}.stdout').write_bytes(stdout)
@@ -201,7 +207,10 @@ async def independent(peer, output, mode, fault=None):
             if fault in ('missing-fin-ack', 'missing-response', 'missing-response-fin'):
                 require(all(s['body_acked'] == size and s['fin_sent'] for s in row['streams']), 'fault before complete body/FIN')
             if fault == 'missing-fin-ack':
-                require(all(not s['fin_acked'] and s['response_fin'] for s in row['streams']), 'invented FIN ACK or missing response')
+                require(len(protocol.fins) == count and protocol.unacked_fin_stream is not None,
+                        'FIN ACK fault activated before all uploads finished')
+                target = row['streams'][protocol.unacked_fin_stream // 4]
+                require(not target['fin_acked'] and target['response_fin'], 'invented final FIN ACK or missing response')
             if fault in ('missing-response', 'missing-response-fin'):
                 require(all(s['fin_acked'] and not s['response_fin'] for s in row['streams']), 'request FIN not ACKed or invented response FIN')
             if fault == 'missing-response-fin':
@@ -217,7 +226,8 @@ async def independent(peer, output, mode, fault=None):
             require(row['connection_blocked_observations'] > 0 and row['stream_blocked_observations'] > 0,
                     'flow blocking/resumption not exercised')
         return dict(case=name, expected_failure=bool(fault), peer=row, wire_body_bytes=protocol.bodies,
-                    wire_acks=protocol.ack_frames, wire_max_ack_ranges=protocol.ack_max_ranges)
+                    wire_acks=protocol.ack_frames, wire_max_ack_ranges=protocol.ack_max_ranges,
+                    unacked_fin_stream=protocol.unacked_fin_stream)
     finally:
         if process.returncode is None:
             process.kill()

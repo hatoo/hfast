@@ -142,6 +142,13 @@ jobs:
           python benchmarks/build-stream-credit-peer.py .stream-credit-shb "$RUNNER_TEMP/stream-credit-peer"
           python benchmarks/stream-credit-peer-check.py "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-check" --server target/release/hfast
           python benchmarks/stream-credit-peer-check.py "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-t2" --server target/release/hfast --only-server --threads 2 --streams 8 --mode sparse,pto
+      - name: Preserve native upload failure ledgers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-credit-failure
+          path: ${{ runner.temp }}/stream-credit-check
+          retention-days: 7
       - name: Native cancellation accounting and failure oracles
         env:
           NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
