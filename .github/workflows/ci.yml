@@ -127,6 +127,28 @@ jobs:
         run: |
           python benchmarks/build-sparse-ack-peer.py .native-peer-shb "$RUNNER_TEMP/sparse-ack-peer"
           python benchmarks/compare-sparse-acks.py target/release/hfast target/release/hfast "$RUNNER_TEMP/sparse-ack-peer/sparse-ack-peer" "$RUNNER_TEMP/sparse-ack-smoke" --window 1024 --ranges 64 --batch 8 --cycles 1 --pairs 1 --client-cpu 1
+      - name: Fixed native complete-upload transport
+        uses: actions/checkout@v5
+        with:
+          repository: hatoo/shb
+          ref: eabad04e72a0d684da06e096077cc47aca595bbc
+          path: .stream-credit-shb
+          persist-credentials: false
+      - name: Native QUIC uploads, bounded ACKs and failure oracles
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: |
+          rustfmt --edition 2024 --config skip_children=true --check benchmarks/stream-credit-peer-main.rs benchmarks/stream-credit-ledger.rs
+          python benchmarks/build-stream-credit-peer.py .stream-credit-shb "$RUNNER_TEMP/stream-credit-peer"
+          python benchmarks/stream-credit-peer-check.py "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-check" --server target/release/hfast
+          python benchmarks/stream-credit-peer-check.py "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-t2" --server target/release/hfast --only-server --threads 2 --streams 8 --mode sparse,pto
+      - name: Preserve native upload failure ledgers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-credit-failure
+          path: ${{ runner.temp }}/stream-credit-check
+          retention-days: 7
       - name: Native cancellation accounting and failure oracles
         env:
           NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
