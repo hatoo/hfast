@@ -20,7 +20,8 @@ here = Path(__file__).resolve().parent
 archive = subprocess.check_output(['git', '-C', str(repo), 'archive', REVISION])
 with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     tar.extractall(source, filter='data')
-for src, dest in [('stream-credit-peer-main.rs', 'main.rs'), ('stream-credit-ledger.rs', 'credit_ledger.rs')]:
+for src, dest in [('stream-credit-peer-main.rs', 'main.rs'), ('stream-credit-ledger.rs', 'credit_ledger.rs'),
+                  ('udp-socket-evidence.rs', 'udp_evidence.rs')]:
     shutil.copy2(here / src, source / 'src' / dest)
 conn = source / 'src/quic/conn.rs'
 conn.write_text(conn.read_text() + '\n' + (here / 'sparse-ack-peer-methods.rs').read_text() + '''

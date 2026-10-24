@@ -4,6 +4,7 @@ mod clock;
 mod credit_ledger;
 mod quic;
 mod tls;
+mod udp_evidence;
 #[cfg(test)]
 mod http3 {
     pub mod proto;
@@ -58,6 +59,7 @@ struct Flight {
 
 struct Peer {
     socket: UdpSocket,
+    udp_before: Value,
     conn: Connection,
     wire: Vec<u8>,
     prefix: Vec<u8>,
@@ -110,6 +112,7 @@ impl Peer {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.connect(("127.0.0.1", port))?;
         socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+        let udp_before = udp_evidence::snapshot(&socket);
         let mut conn = Connection::connect(
             tls::client_config(b"h3")?,
             "localhost",
@@ -169,6 +172,7 @@ impl Peer {
         let end = prefix.len() as u64 + size;
         Ok(Self {
             socket,
+            udp_before,
             conn,
             wire,
             prefix,
@@ -572,10 +576,14 @@ impl Peer {
         Ok(())
     }
     fn report(&self, error: Option<String>) -> Value {
+        // Freeze duration before any procfs/getsockopt diagnostics. Per-request
+        // latency samples were already frozen at completion in the I/O loop.
+        let elapsed_ns = self.started.elapsed().as_nanos() as u64;
+        let udp = udp_evidence::interval(&self.udp_before, &self.socket);
         let prefix = self.prefix.len() as u64;
         json!({"phase": if error.is_some() {"failed"} else {"done"}, "error": error,
             "mode": self.mode, "body_bytes_per_stream": self.body_size,
-            "elapsed_ns": self.started.elapsed().as_nanos() as u64,
+            "elapsed_ns": elapsed_ns, "udp": udp,
             "completed": self.uploads.iter().filter(|u| u.complete()).count(),
             "latencies_ns": self.uploads.iter().filter_map(|u| u.completed_ns).collect::<Vec<_>>(),
             "streams": self.uploads.iter().enumerate().map(|(i,u)| json!({"id": i * 4,
