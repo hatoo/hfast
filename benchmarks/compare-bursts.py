@@ -11,6 +11,7 @@ import subprocess
 import time
 import burst_workers
 import burst_buffer
+import burst_latency
 
 
 def sha(path):
@@ -25,7 +26,8 @@ def run(args, variant, pair):
         result = burst_workers.run(getattr(args, variant), args.peer, stem, args.producer_cpus,
                                   batch=args.batch, datagrams=args.datagrams, batches=args.batches,
                                   cycles=args.cycles, warmup=args.warmup, gro=gro,
-                                  udp_receive_buffer=args.udp_receive_buffer)
+                                  udp_receive_buffer=args.udp_receive_buffer,
+                                  latency=getattr(args, "latency", False))
         result.update(variant=variant, pair=pair)
         return result
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
@@ -94,6 +96,10 @@ def run(args, variant, pair):
 
 def main(args):
     burst_buffer.validate(args.udp_receive_buffer)
+    latency = getattr(args, 'latency', False)
+    if latency:
+        burst_latency.require(args.producer_cpus, '--latency requires --producer-cpus (one or four)')
+        burst_latency.limits(args.batch, args.datagrams, args.batches, args.cycles, args.warmup)
     assert not any(name in os.environ for name in (
         'LD_PRELOAD', 'GRO_AUDIT_COUNTERS', 'HFAST_GRO_PRELOAD', 'BURST_QUEUE_AUDIT'
     )), 'audit/instrumentation environment cannot be timed'
@@ -119,10 +125,11 @@ def main(args):
         b, c = runs['baseline'], runs['candidate']
         burst_buffer.require_equal(b['udp_receive_buffer'], c['udp_receive_buffer'])
         burst_buffer.require_equal(rows[0]['udp_receive_buffer'], c['udp_receive_buffer'])
+        tails = burst_latency.compare(b, c, latency)
         assert b['completed'] == c['completed'] and b['sent_datagrams'] == c['sent_datagrams']
         assert b['sent_messages'] == c['sent_messages']
         paired.append(dict(pair=pair, rps_percent=(c['requests_per_second']/b['requests_per_second']-1)*100,
-                           cpu_percent=((c['cpu_ns_per_request']/b['cpu_ns_per_request']-1)*100 if b['cpu_ns_per_request'] else None)))
+                           cpu_percent=((c['cpu_ns_per_request']/b['cpu_ns_per_request']-1)*100 if b['cpu_ns_per_request'] else None), **tails))
     assert inputs == {name: sha(getattr(args, name)) for name in inputs}
     summary = dict(inputs=inputs, batch=args.batch, datagrams=args.datagrams, batches=args.batches,
                    udp_receive_buffer_requested=args.udp_receive_buffer,
@@ -132,6 +139,12 @@ def main(args):
                    sent_datagrams=sum(x['sent_datagrams'] for x in rows), errors=0, reverse=args.reverse,
                    median_rps_percent=statistics.median(x['rps_percent'] for x in paired),
                    median_cpu_percent=(statistics.median(x['cpu_percent'] for x in paired if x['cpu_percent'] is not None) if any(x['cpu_percent'] is not None for x in paired) else None))
+    if latency:
+        summary['latency_interval'] = burst_latency.INTERVAL
+        summary['measured_samples'] = sum(r['latency']['measured']['count'] for r in rows)
+        summary['warmup_samples'] = sum(r['latency']['warmup']['count'] for r in rows)
+        for name in ('p50', 'p99', 'p99_9'):
+            summary['median_' + name + '_percent'] = statistics.median(p[name + '_percent'] for p in paired)
     for name, data in [('results', rows), ('summary', summary)]:
         with (args.output / f'{name}.json').open('x') as file:
             file.write(json.dumps(data, indent=2) + '\n')
@@ -151,6 +164,7 @@ if __name__ == '__main__':
     parser.add_argument('--client-cpu', type=int, default=8)
     parser.add_argument('--udp-receive-buffer', type=burst_buffer.argument, default=0,
                         help='identical server receive-buffer request in bytes for both variants')
+    parser.add_argument('--latency', action='store_true', help='exact per-request samples in coordinated mode')
     parser.add_argument('--producer-cpus', type=lambda s: list(map(int, s.split(','))),
                         help='coordinated mode: one or four CPUs; both servers default to GRO')
     parser.add_argument('--baseline-without-gro', action='store_true',

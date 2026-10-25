@@ -202,9 +202,10 @@ jobs:
         run: python benchmarks/build-sparse-ack-peer.py .native-peer-shb "$RUNNER_TEMP/gso-peer" --burst
       - name: Concurrent native producer accounting and failure oracles
         run: |
-          rustfmt --edition 2024 --config skip_children=true --check benchmarks/burst-worker.rs
+          rustfmt --edition 2024 --config skip_children=true --check benchmarks/burst-peer-main.rs benchmarks/burst-worker.rs benchmarks/burst-latency.rs
           python -m unittest discover -s benchmarks -p test_burst_workers.py -v
           python -m unittest discover -s benchmarks -p test_burst_buffer.py -v
+          python -m unittest discover -s benchmarks -p test_burst_latency.py -v
       - name: Concurrent native producers with GRO and fallback delivery
         run: |
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' native-producers \
@@ -221,6 +222,12 @@ jobs:
             "$(command -v python)" benchmarks/burst-worker-fault-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
             "$RUNNER_TEMP/burst-faults"
+      - name: Exact native burst latency, bounded exports and failure oracles
+        run: |
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' burst-latency \
+            "$(command -v python)" benchmarks/burst-latency-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
+            "$RUNNER_TEMP/burst-latency"
       - name: Preserve native burst failure evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -230,6 +237,7 @@ jobs:
             ${{ runner.temp }}/burst-faults
             ${{ runner.temp }}/concurrent-producer-smoke
             ${{ runner.temp }}/concurrent-producer-buffer-smoke
+            ${{ runner.temp }}/burst-latency
           retention-days: 7
       - name: Fixed CRYPTO churn transport
         uses: actions/checkout@v5

@@ -31,6 +31,7 @@ main = 'burst-peer-main.rs' if burst else 'sparse-ack-peer-main.rs'
 (source / 'src/main.rs').write_text((here / main).read_text())
 if burst:
     shutil.copy2(here / 'burst-worker.rs', source / 'src/burst_worker.rs')
+    shutil.copy2(here / 'burst-latency.rs', source / 'src/burst_latency.rs')
     shutil.copy2(here / 'udp-socket-evidence.rs', source / 'src/udp_socket_evidence.rs')
 conn = source / 'src/quic/conn.rs'
 conn.write_text(conn.read_text() + '\n' + (here / 'sparse-ack-peer-methods.rs').read_text())
@@ -38,11 +39,13 @@ target = Path(os.environ.get('NATIVE_PEER_TARGET_DIR', output / 'target')).resol
 env = dict(os.environ, CARGO_INCREMENTAL='0', CARGO_TARGET_DIR=str(target))
 command = ['cargo', 'build', '--release', '--locked', '--bin', 'shb']
 subprocess.run(command, cwd=source, env=env, check=True)
-subprocess.run(['cargo', 'test', '--release', '--locked', '--bin', 'shb', 'peer_tests'],
-               cwd=source, env=env, check=True)
 if burst:
-    subprocess.run(['cargo', 'test', '--release', '--locked', '--bin', 'shb',
-                    'burst_worker::udp_socket_evidence'], cwd=source, env=env, check=True)
+    for profile in ([], ['--release']):
+        subprocess.run(['cargo', 'test', *profile, '--locked', '--bin', 'shb'],
+                       cwd=source, env=env, check=True)
+else:
+    subprocess.run(['cargo', 'test', '--release', '--locked', '--bin', 'shb', 'peer_tests'],
+                   cwd=source, env=env, check=True)
 binary = output / ('burst-peer' if burst else 'sparse-ack-peer')
 shutil.copy2(target / 'release/shb', binary)
 binary.chmod(0o555)
