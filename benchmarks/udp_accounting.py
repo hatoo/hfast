@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import time
 
 
 def require(condition, message):
@@ -84,7 +85,7 @@ def diag_messages(data, seq):
     return rows, done
 
 
-def socket_diagnostics(families):
+def socket_diagnostics(families, *, deadline=None):
     rows = {}
     with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4) as netlink:
         netlink.settimeout(2)
@@ -95,6 +96,10 @@ def socket_diagnostics(families):
             netlink.sendto(header + request, (0, 0))
             done = False
             while not done:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    require(remaining > 0, 'socket diagnostic deadline expired')
+                    netlink.settimeout(min(2, remaining))
                 data, _, flags, sender = netlink.recvmsg(1 << 20)
                 require(sender[0] == 0 and not flags & socket.MSG_TRUNC,
                         'untrusted/truncated socket diagnostic dump')

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Negative accounting oracles and bounded controller/process failure tests."""
 from copy import deepcopy
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -8,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import burst_workers as b
 
@@ -172,6 +173,18 @@ input()
         with self.assertRaisesRegex(RuntimeError, 'phase'):
             b.collect(self.workers, 0, 2)
 
+    def test_cleanup_io_error_cannot_skip_sibling_processes(self):
+        for _ in range(4):
+            self.spawn('input()')
+        real = self.workers[0]['stdout']
+        broken = Mock(wraps=real)
+        broken.flush.side_effect = OSError('failed stdout flush')
+        self.workers[0]['stdout'] = broken
+        errors = b.failure.cleanup(self.workers)
+        self.assertTrue(any('failed stdout flush' in error for error in errors))
+        self.assertTrue(all(w['process'].poll() is not None for w in self.workers))
+        self.assertTrue(all(w['process'].stdout.closed for w in self.workers))
+
     def test_mid_phase_failure_cancels_all_other_workers(self):
         created = []
         popen = subprocess.Popen
@@ -194,6 +207,12 @@ input()
         self.assertEqual(len(created), 4)
         self.assertTrue(all(process.poll() is not None for process in created))
         self.assertIn('phase 1', (Path(self.temp.name) / 'failure.txt').read_text())
+        evidence = json.loads((Path(self.temp.name) / 'failure.json').read_text())
+        self.assertEqual(evidence['phase'], 1)
+        self.assertEqual(evidence['last_success']['phase'], 0)
+        self.assertEqual(evidence['last_success']['reports'], [fixture()] * 4)
+        self.assertEqual(len(evidence['workers']), 4)
+        self.assertFalse(evidence['timing_evidence'])
 
     def test_report_after_final_phase_cannot_escape_validation(self):
         popen = subprocess.Popen
@@ -214,6 +233,271 @@ input()
             with self.assertRaisesRegex(RuntimeError, 'after STOP'):
                 b.coordinate(Path('/unused'), os.getpid(), 1234, Path(self.temp.name),
                              [0], 32, 8, 3, 1, 2, True, timeout=2)
+
+
+class FailureEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.output = Path(self.temp.name)
+        self.created = []
+
+    def tearDown(self):
+        # Assert that the controller, not the test, reaped every process.
+        try:
+            for process in self.created:
+                self.assertIsNotNone(process.poll())
+                self.assertTrue(process.stdin.closed and process.stdout.closed)
+        finally:
+            for process in self.created:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=2)
+            self.temp.cleanup()
+
+    def coordinate(self, codes, timeout=.4, patches=()):
+        popen = subprocess.Popen
+
+        def spawn(_command, **kwargs):
+            code = codes[len(self.created)]
+            process = popen([sys.executable, '-c', code], **kwargs)
+            self.created.append(process)
+            return process
+
+        counters = {k: 0 for k in (*b.ERROR_COUNTERS, 'InDatagrams', 'OutDatagrams')}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(b.subprocess, 'Popen', side_effect=spawn))
+            stack.enter_context(patch.object(b, 'udp', return_value=counters))
+            stack.enter_context(patch.object(b, 'settle', return_value=counters))
+            stack.enter_context(patch.object(b, 'validate_delivery'))
+            for p in patches:
+                stack.enter_context(p)
+            b.coordinate(Path('/unused'), os.getpid(), 1234, self.output,
+                         [0] * len(codes), 32, 8, 3, 1, 2, True, timeout=timeout)
+
+    def evidence(self):
+        return json.loads((self.output / 'failure.json').read_text())
+
+    def test_warmup_timeout_preserves_partial_line_and_live_socket_before_cleanup(self):
+        code = ('import socket,sys\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n'
+                's.bind(("127.0.0.1",0))\nsys.stdout.buffer.write(b"partial\\xff")\n'
+                'sys.stdout.flush()\ninput()\n')
+        with self.assertRaisesRegex(RuntimeError, 'phase 0 timeout'):
+            self.coordinate([code])
+        row = self.evidence()
+        self.assertEqual(row['stage'], 'warmup')
+        self.assertIsNone(row['last_success'])
+        self.assertIsNone(row['namespace_since_last_success']['counters'])
+        peer = row['workers'][0]
+        self.assertIsNone(peer['exit_code'])
+        self.assertIsNone(peer['report'])
+        self.assertEqual(bytes.fromhex(peer['partial_stdout_hex']), b'partial\xff')
+        self.assertEqual((self.output / peer['stdout']).read_bytes(), b'partial\xff')
+        self.assertEqual(peer['sockets']['status'], 'available')
+        socket = peer['sockets']['sockets'][0]
+        self.assertGreater(socket['inode'], 0)
+        self.assertEqual(socket['rx_queue'], 0)
+        self.assertEqual(socket['drops'], 0)
+        self.assertEqual(len(socket['cookie']), 2)
+        self.assertIsNone(peer['socket_delta']['drops'])  # No baseline before warmup.
+
+    def test_bad_json_preserves_original_decode_error_and_exact_raw_bytes(self):
+        with self.assertRaises(json.JSONDecodeError) as caught:
+            self.coordinate(['print("{bad json}",flush=True); input()'])
+        row = self.evidence()
+        self.assertEqual(row['original_error']['type'], type(caught.exception).__name__)
+        self.assertEqual(bytes.fromhex(row['workers'][0]['report_line_hex']), b'{bad json}')
+        self.assertEqual((self.output / 'worker-0.jsonl').read_bytes(), b'{bad json}\n')
+
+    def test_completed_sibling_report_survives_partial_report_timeout(self):
+        self.coordinate_failure_with_sibling('import sys; sys.stdout.write("truncated"); '
+                                            'sys.stdout.flush(); input()', 'timeout')
+
+    def test_exit_after_report_keeps_report_and_exit_status(self):
+        code = f'print({json.dumps(fixture())!r},flush=True)'
+        with self.assertRaisesRegex(RuntimeError, 'exited'):
+            self.coordinate([code, 'input()'])
+        peer = self.evidence()['workers'][0]
+        self.assertEqual(peer['report'], fixture())
+        self.assertEqual(peer['exit_code'], 0)
+        self.assertEqual(peer['sockets']['status'], 'unavailable')
+        self.assertIsNone(peer['socket_delta']['drops'])
+
+    def coordinate_failure_with_sibling(self, faulty, message):
+        code = f'print({json.dumps(fixture())!r},flush=True); input()'
+        with self.assertRaisesRegex(RuntimeError, message):
+            self.coordinate([code, faulty])
+        peers = self.evidence()['workers']
+        self.assertEqual(peers[0]['report'], fixture())
+        self.assertIsNone(peers[1]['report'])
+        self.assertIsNone(self.evidence()['last_success'])
+
+    def test_diagnostic_capture_exception_does_not_replace_primary_or_skip_cleanup(self):
+        original = RuntimeError('original collect failure')
+        with self.assertRaises(RuntimeError) as caught:
+            self.coordinate(['input()'] * 4, patches=[
+                patch.object(b, 'collect', side_effect=original),
+                patch.object(b.failure, 'capture', side_effect=OSError('unavailable proc'))])
+        self.assertIs(caught.exception, original)
+        self.assertEqual(self.evidence()['status'], 'unavailable')
+        self.assertIn('unavailable proc', self.evidence()['error'])
+        self.assertIn('original collect failure', (self.output / 'failure.txt').read_text())
+
+    def test_diagnostic_write_failure_preserves_exception_and_reaps_all_children(self):
+        original = RuntimeError('original collect failure')
+        path_open = Path.open
+
+        def fail(path, *args, **kwargs):
+            if path.name in ('failure.json', 'failure.txt'):
+                raise OSError('diagnostic disk full')
+            return path_open(path, *args, **kwargs)
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.coordinate(['input()'] * 4, patches=[
+                patch.object(b, 'collect', side_effect=original),
+                patch.object(Path, 'open', fail)])
+        self.assertIs(caught.exception, original)
+        self.assertIn('diagnostic disk full', '; '.join(original.__notes__))
+
+    def test_raw_log_close_failure_cannot_mask_the_original_or_leave_siblings(self):
+        original = RuntimeError('original collect failure')
+        path_open = Path.open
+
+        class BrokenClose:
+            def __init__(self, file):
+                self.file = file
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.file.close()
+                raise OSError('raw evidence close failed')
+
+            def write(self, data):
+                return self.file.write(data)
+
+            def flush(self):
+                return self.file.flush()
+
+        def open_log(path, *args, **kwargs):
+            file = path_open(path, *args, **kwargs)
+            return BrokenClose(file) if path.name == 'worker-0.jsonl' else file
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.coordinate(['input()'] * 4, patches=[
+                patch.object(b, 'collect', side_effect=original),
+                patch.object(Path, 'open', open_log)])
+        self.assertIs(caught.exception, original)
+        self.assertIn('raw evidence close failed', '; '.join(original.__notes__))
+
+    def test_unavailable_proc_is_never_zero_loss(self):
+        with patch.object(b.failure, 'process_identity', side_effect=PermissionError('no proc')):
+            result = b.failure.process_snapshot(os.getpid())
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['sockets'], [])
+        self.assertIn('no proc', result['error'])
+        delta = b.failure.process_delta(result, result)
+        self.assertIsNone(delta['drops'])
+
+    def test_expired_diagnostic_budget_is_unavailable_without_more_socket_reads(self):
+        with patch.object(b.failure, 'socket_diagnostics') as diagnostics:
+            row = b.failure.process_snapshot(os.getpid(), deadline=0)
+        diagnostics.assert_not_called()
+        self.assertEqual(row['status'], 'unavailable')
+        self.assertIn('deadline expired', row['error'])
+
+    def test_reused_or_missing_socket_identity_has_no_delta(self):
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            before = b.failure.process_snapshot(os.getpid())
+            self.assertEqual(before['status'], 'available')
+            for field in ('inode', 'cookie', 'fds'):
+                after = deepcopy(before)
+                after['sockets'][0][field] = ([] if field != 'inode' else 123456789)
+                self.assertIsNone(b.failure.process_delta(before, after)['drops'])
+            after = deepcopy(before)
+            after['sockets'] = []
+            self.assertIsNone(b.failure.process_delta(before, after)['drops'])
+
+    def test_diagnostic_files_are_not_overwritten(self):
+        (self.output / 'failure.json').write_text('prior evidence')
+        original = ValueError('first error')
+        b.failure.write_failure(self.output, 'failure', original, lambda: {})
+        self.assertEqual((self.output / 'failure.json').read_text(), 'prior evidence')
+        self.assertIn('first error', (self.output / 'failure.txt').read_text())
+
+    def test_existing_queue_and_drop_gates_still_reject(self):
+        header = 'sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode ref pointer drops\n'
+        row = '1: 0100007F:1234 00000000:0000 07 {queue} 00:00000000 00000000 1000 0 12345 2 0000000000000000 {drops}\n'
+        for queue, drops in [('00000000:00000000', 1), ('00000000:00000001', 0),
+                             ('00000001:00000000', 0)]:
+            with patch.object(Path, 'read_text', return_value=header + row.format(queue=queue, drops=drops)):
+                with self.assertRaisesRegex(RuntimeError, 'queued/dropped'):
+                    b.empty_sockets([0x1234])
+
+    def test_serialization_failure_still_writes_primary_traceback(self):
+        original = ValueError('primary')
+        b.failure.write_failure(self.output, 'failure', original, lambda: dict(bad={1, 2}))
+        self.assertEqual(self.evidence()['status'], 'unavailable')
+        self.assertIn('primary', (self.output / 'failure.txt').read_text())
+
+    def test_server_is_snapshotted_before_terminate_and_killed_if_term_is_ignored(self):
+        popen = subprocess.Popen
+        waits = []
+
+        def spawn(_command, **kwargs):
+            code = ('import signal,socket,time\n'
+                    'signal.signal(signal.SIGTERM,signal.SIG_IGN)\n'
+                    's=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n'
+                    's.bind(("127.0.0.1",0))\ntime.sleep(30)\n')
+            process = popen([sys.executable, '-c', code], **kwargs)
+            wait = process.wait
+
+            def short_wait(timeout):
+                waits.append(timeout)
+                return wait(timeout=.1)
+
+            process.wait = short_wait
+            return process
+
+        original = RuntimeError('coordinator failure')
+        with patch.object(b.subprocess, 'Popen', side_effect=spawn), \
+                patch.object(b, 'coordinate', side_effect=original), \
+                self.assertRaises(RuntimeError) as caught:
+            b.run(Path(sys.executable), Path(sys.executable), self.output / 'server',
+                  [min(os.sched_getaffinity(0))], allow_shared_cpus=True)
+        self.assertIs(caught.exception, original)
+        row = json.loads((self.output / 'server/run-failure.json').read_text())
+        self.assertEqual(row['server']['status'], 'available')
+        self.assertIsNone(row['exit_code'])
+        self.assertFalse(Path(f"/proc/{row['server']['pid']}").exists())
+        self.assertEqual(waits, [5, 5])  # Timeout, then kill and reap.
+        self.assertFalse((self.output / 'server/result.json').exists())
+
+    def test_namespace_read_failure_preserves_original_error_and_no_fake_baseline(self):
+        original = PermissionError('SNMP unavailable')
+        with self.assertRaises(PermissionError) as caught:
+            self.coordinate([], patches=[patch.object(b, 'udp', side_effect=original)])
+        self.assertIs(caught.exception, original)
+        self.assertEqual(self.evidence()['namespace_delta']['status'], 'unavailable')
+        self.assertIsNone(self.evidence()['namespace_delta']['counters'])
+
+    def test_wrong_phase_retains_the_rejected_report(self):
+        with self.assertRaisesRegex(RuntimeError, 'wrong worker'):
+            self.coordinate(['print(\'{"phase":9}\',flush=True); input()'])
+        self.assertEqual(self.evidence()['workers'][0]['report'], dict(phase=9))
+
+    def test_diagnostic_key_failure_leaves_raw_observations_unavailable(self):
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            with patch.object(b.failure, 'socket_diagnostics', return_value={}):
+                row = b.failure.process_snapshot(os.getpid())
+        self.assertEqual(row['status'], 'unavailable')
+        self.assertTrue(row['sockets'])
+        self.assertIn('udp', row['tables'])
+        self.assertIsNone(b.failure.process_delta(row, row)['drops'])
 
 
 if __name__ == '__main__':
