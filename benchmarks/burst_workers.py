@@ -99,7 +99,7 @@ def settle(before, reports, port, gro):
     return after
 
 
-def validate_report(row, previous, phase, batches, batch, datagrams, latency=False):
+def validate_report(row, previous, phase, batches, batch, datagrams, latency=False, producer=0):
     require(row['phase'] == phase, 'wrong/repeated worker phase')
     require(row['errors'] == row['pending_requests'] == row['pending_fences'] == 0,
             'worker errors or unfinished work')
@@ -109,7 +109,7 @@ def validate_report(row, previous, phase, batches, batch, datagrams, latency=Fal
     first = previous['active']['completed'] if previous else 0
     require(('latency' in row) == latency, 'wrong latency sampling mode')
     if latency:
-        burst_latency.metadata(row['latency'], phase, 4 * first, requests)
+        burst_latency.metadata(row['latency'], phase, 4 * first, requests, producer=producer)
     expected = dict(batches=batches, requests=requests, first_completed=first,
                     completed=first + requests, request_datagrams=batches * datagrams,
                     fences=batches, sent_datagrams=batches * (datagrams + 1),
@@ -195,7 +195,7 @@ def export_latency(workers, reports, output, phase, width, timeout):
         path = output / f'latency-{index}' / f'phase-{phase}.bin'
         meta = report['latency']
         evidence.append(burst_latency.inspect(path, meta, phase, meta['first_stream'],
-                                              report['work']['requests'], width))
+                                              report['work']['requests'], width, producer=index))
     return evidence
 
 
@@ -228,8 +228,8 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                 os.set_blocking(process.stdout.fileno(), False)
             state['stage'] = 'warmup'
             previous = collect(workers, 0, timeout)
-            for row in previous:
-                validate_report(row, None, 0, warmup, batch, datagrams, latency)
+            for index, row in enumerate(previous):
+                validate_report(row, None, 0, warmup, batch, datagrams, latency, producer=index)
             after = settle(before, previous, port, gro)
             warmup_reports = previous
             if latency:
@@ -252,9 +252,9 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                     for worker in workers:
                         worker['process'].stdin.write(f'PREPARE {phase} {batches}\n'.encode())
                     ready = collect(workers, phase, timeout)
-                    for old, row in zip(previous, ready):
+                    for index, (old, row) in enumerate(zip(previous, ready)):
                         burst_latency.metadata(row.get('latency_ready'), phase,
-                            old['active']['next_stream'], batches * batch * datagrams, ready=True)
+                            old['active']['next_stream'], batches * batch * datagrams, ready=True, producer=index)
                 state['stage'] = 'measured'
                 start_udp = after
                 start_totals = totals(previous)
@@ -264,8 +264,8 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                 for worker in workers:
                     worker['process'].stdin.write(f'RUN {phase} {batches}\n'.encode())
                 reports = collect(workers, phase, timeout)
-                for old, new in zip(previous, reports):
-                    validate_report(new, old, phase, batches, batch, datagrams, latency)
+                for index, (old, new) in enumerate(zip(previous, reports)):
+                    validate_report(new, old, phase, batches, batch, datagrams, latency, producer=index)
                 after = settle(before, reports, port, gro)
                 seconds = time.perf_counter() - start
                 server_cpu = cpu_delta(start_cpu, cpu(server_pid), seconds)

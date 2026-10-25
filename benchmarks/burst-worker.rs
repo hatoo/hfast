@@ -172,6 +172,7 @@ fn report_failure(phase: usize, error: &anyhow::Error, active: &Peer, quiet: Opt
 
 fn prepare_latency(
     active: &mut Peer,
+    producer: usize,
     phase: usize,
     batches: usize,
     batch: usize,
@@ -180,6 +181,7 @@ fn prepare_latency(
     // Drop the preceding ledger before reserving the next one.
     active.latency = None;
     active.latency = Some(burst_latency::Ledger::new(
+        producer,
         phase,
         active.next_stream,
         batches
@@ -219,6 +221,14 @@ pub(super) fn main(args: &[String]) -> Result<()> {
     ensure!((1..=32).contains(&batch) && (1..=32).contains(&datagrams));
     ensure!((1..=MAX_BATCHES).contains(&warmup));
     let directory = args.get(5).map(std::path::PathBuf::from);
+    let producer: usize = if directory.is_some() {
+        std::env::var("BURST_PRODUCER_INDEX")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse()?
+    } else {
+        0
+    };
+    ensure!(producer < 4, "invalid latency producer");
     if let Some(path) = &directory {
         // Exclusive creation also prevents accidental reuse of prior evidence.
         std::fs::create_dir(path)?;
@@ -234,7 +244,7 @@ pub(super) fn main(args: &[String]) -> Result<()> {
     let mut phase = 0;
     let result = (|| -> Result<()> {
         if directory.is_some() {
-            prepare_latency(&mut active, 0, warmup, batch, datagrams)?;
+            prepare_latency(&mut active, producer, 0, warmup, batch, datagrams)?;
         }
         run_phase(&mut active, &mut quiet, 0, warmup, batch, datagrams)?;
         if let Some(path) = &directory {
@@ -246,7 +256,7 @@ pub(super) fn main(args: &[String]) -> Result<()> {
                 let Some(batches) = prepare_command(&command_line()?, phase)? else {
                     break;
                 };
-                prepare_latency(&mut active, phase, batches, batch, datagrams)?;
+                prepare_latency(&mut active, producer, phase, batches, batch, datagrams)?;
                 println!(
                     "{}",
                     json!({"phase": phase, "latency_ready": active.latency.as_ref().unwrap().metadata()})

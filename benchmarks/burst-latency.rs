@@ -5,7 +5,7 @@ use std::{io::Write, path::Path, time::Instant};
 
 pub const MAX_SAMPLES: usize = 1 << 22;
 pub const MAX_PHASE: usize = 64;
-const MAGIC: &[u8; 8] = b"HFBSTL01";
+const MAGIC: &[u8; 8] = b"HFBSTL02";
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -20,6 +20,7 @@ impl Sample {
 }
 
 pub struct Ledger {
+    producer: usize,
     phase: usize,
     first: u64,
     expected: usize,
@@ -29,7 +30,14 @@ pub struct Ledger {
     end_ns: Option<u64>,
 }
 impl Ledger {
-    pub fn new(phase: usize, first: u64, count: usize, epoch: Instant) -> Result<Self> {
+    pub fn new(
+        producer: usize,
+        phase: usize,
+        first: u64,
+        count: usize,
+        epoch: Instant,
+    ) -> Result<Self> {
+        ensure!(producer < 4, "invalid latency producer");
         ensure!(phase <= MAX_PHASE, "latency phase limit exceeded");
         ensure!(
             (1..=MAX_SAMPLES).contains(&count),
@@ -56,6 +64,7 @@ impl Ledger {
         std::hint::black_box(&samples); // Fault in ledger storage before timing.
         samples.clear();
         Ok(Self {
+            producer,
             phase,
             first,
             expected: count,
@@ -147,7 +156,7 @@ impl Ledger {
     }
 
     pub fn metadata(&self) -> Value {
-        json!({"version": 1, "phase": self.phase, "first_stream": self.first,
+        json!({"version": 2, "producer": self.producer, "phase": self.phase, "first_stream": self.first,
             "expected": self.expected, "count": self.samples.len(), "end_ns": self.end_ns,
             "bytes": 32 + 24 * self.samples.len()})
     }
@@ -171,7 +180,9 @@ impl Ledger {
 
     fn write(&self, out: &mut impl Write) -> Result<()> {
         out.write_all(MAGIC)?;
-        for value in [self.phase as u64, self.first, self.samples.len() as u64] {
+        out.write_all(&(self.phase as u32).to_le_bytes())?;
+        out.write_all(&(self.producer as u32).to_le_bytes())?;
+        for value in [self.first, self.samples.len() as u64] {
             out.write_all(&value.to_le_bytes())?;
         }
         for sample in &self.samples {
@@ -191,7 +202,7 @@ mod peer_tests {
     #[test]
     fn every_authenticated_response_has_its_own_clock_and_stream_identity() {
         let now = Instant::now();
-        let mut l = Ledger::new(3, 128, 4, now).unwrap();
+        let mut l = Ledger::new(0, 3, 128, 4, now).unwrap();
         let mut b = crate::Batch::new(128, 4);
         l.send(128, 4, now + Duration::from_nanos(10)).unwrap();
         for (id, ns) in [(140, 20), (128, 23), (136, 31), (132, 40)] {
@@ -215,7 +226,7 @@ mod peer_tests {
     #[test]
     fn invalid_responses_never_read_a_clock_or_create_successful_samples() {
         let now = Instant::now();
-        let mut l = Ledger::new(0, 4, 2, now).unwrap();
+        let mut l = Ledger::new(0, 0, 4, 2, now).unwrap();
         let mut b = crate::Batch::new(4, 2);
         l.send(4, 2, now).unwrap();
         for (id, offset, fin, data) in [
@@ -264,7 +275,7 @@ mod peer_tests {
             .unwrap();
         let now = Instant::now();
         for (phase, first) in [(0, 0), (1, 8)] {
-            let mut l = Ledger::new(phase, first, 2, now).unwrap();
+            let mut l = Ledger::new(0, phase, first, 2, now).unwrap();
             for i in 0..2 {
                 let id = first + i * 4;
                 l.send(id, 1, now + Duration::from_nanos(10 * i)).unwrap();
@@ -292,15 +303,16 @@ mod peer_tests {
             (0, (1 << 62) - 4, 2),
             (0, u64::MAX, 1),
         ] {
-            assert!(Ledger::new(phase, first, count, now).is_err());
+            assert!(Ledger::new(0, phase, first, count, now).is_err());
         }
+        assert!(Ledger::new(4, 0, 0, 1, now).is_err());
         assert_eq!(std::mem::size_of::<Sample>(), 24);
     }
 
     #[test]
     fn clocks_and_incomplete_bursts_cannot_produce_a_finished_ledger() {
         let now = Instant::now();
-        let mut l = Ledger::new(1, 4, 2, now).unwrap();
+        let mut l = Ledger::new(0, 1, 4, 2, now).unwrap();
         assert!(l.complete(4, now).is_err());
         assert!(l.send(8, 2, now).is_err());
         l.send(4, 2, now).unwrap();
@@ -321,7 +333,7 @@ mod peer_tests {
     #[test]
     fn export_has_exact_little_endian_timestamps_and_propagates_write_failure() {
         let now = Instant::now();
-        let mut l = Ledger::new(2, 128, 1, now).unwrap();
+        let mut l = Ledger::new(3, 2, 128, 1, now).unwrap();
         l.send(128, 1, now + Duration::from_nanos(10)).unwrap();
         l.complete(128, now + Duration::from_nanos(37)).unwrap();
         l.finish(now + Duration::from_nanos(40)).unwrap();
@@ -332,7 +344,7 @@ mod peer_tests {
             .chunks_exact(8)
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        assert_eq!(fields, [2, 128, 1, 128, 10, 37]);
+        assert_eq!(fields, [2 | (3 << 32), 128, 1, 128, 10, 37]);
         let mut truncated = &mut [0u8; 55][..];
         assert!(l.write(&mut truncated).is_err());
     }

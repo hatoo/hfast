@@ -1,6 +1,6 @@
 """Independent, bounded validation and exact quantiles for native burst samples.
 
-Files contain <8sQQQ header (magic, phase, first stream, count), followed by
+Files contain <8sIIQQ header (magic, phase, producer, first stream, count), followed by
 count <QQQ records (stream, send ns, authenticated completion ns). Phase-relative
 timestamps are exact; records are sorted by duration outside measured work.
 """
@@ -14,9 +14,9 @@ import struct
 
 MAX_SAMPLES = 1 << 22
 MAX_PHASE = 64
-HEADER = struct.Struct('<8sQQQ')
+HEADER = struct.Struct('<8sIIQQ')
 SAMPLE = struct.Struct('<QQQ')
-MAGIC = b'HFBSTL01'
+MAGIC = b'HFBSTL02'
 INTERVAL = 'before-sendmsg-to-validated-authenticated-response-ns-v1'
 
 
@@ -35,10 +35,11 @@ def limits(batch, datagrams, batches, cycles, warmup):
             'sample limit exceeded (4194304 per worker/phase)')
 
 
-def metadata(row, phase, first, count, *, ready=False):
+def metadata(row, phase, first, count, *, ready=False, producer=0):
     require(isinstance(row, dict), 'missing metadata')
-    expected = dict(version=1, phase=phase, first_stream=first, expected=count,
+    expected = dict(version=2, producer=producer, phase=phase, first_stream=first, expected=count,
                     count=0 if ready else count, bytes=32 if ready else 32 + 24 * count)
+    require(type(producer) is int and 0 <= producer < 4, 'invalid producer')
     require(0 <= phase <= MAX_PHASE and 0 < count <= MAX_SAMPLES,
             'metadata outside resource limits')
     require(first % 4 == 0 and 0 <= first < first + count * 4 <= 1 << 62,
@@ -68,7 +69,7 @@ def records(file, meta, digest):
     head = file.read(HEADER.size)
     digest.update(head)
     require(len(head) == HEADER.size, 'truncated header')
-    require(HEADER.unpack(head) == (MAGIC, meta['phase'], meta['first_stream'], meta['count']),
+    require(HEADER.unpack(head) == (MAGIC, meta['phase'], meta['producer'], meta['first_stream'], meta['count']),
             'wrong sample header/phase/count')
     left = meta['count']
     while left:
@@ -81,22 +82,22 @@ def records(file, meta, digest):
     require(not file.read(1), 'extra samples')
 
 
-def inspect(path, meta, phase, first, count, width):
+def inspect(path, meta, phase, first, count, width, producer=0):
     """Quick bounded export handshake. Full record checks run after STOP.
 
     Scanning large exports between phases could expire idle QUIC connections or
     worker command deadlines. Only a fixed-size header is read while peers live.
     This observation is NOT accepted latency evidence until validate() succeeds.
     """
-    metadata(meta, phase, first, count)
+    metadata(meta, phase, first, count, producer=producer)
     with open_file(path, meta['bytes']) as file:
-        require(file.read(HEADER.size) == HEADER.pack(MAGIC, phase, first, count),
+        require(file.read(HEADER.size) == HEADER.pack(MAGIC, phase, producer, first, count),
                 'wrong sample header/phase/count')
-    return dict(path=str(path), metadata=meta, width=width)
+    return dict(path=str(path), metadata=meta, width=width, producer=producer)
 
 
-def validate(path, meta, phase, first, count, width):
-    metadata(meta, phase, first, count)
+def validate(path, meta, phase, first, count, width, producer=0):
+    metadata(meta, phase, first, count, producer=producer)
     require(type(width) is int and 1 <= width <= 1024 and count % width == 0,
             'invalid burst width')
     # A compact membership bitmap plus two timestamps per burst; independent
@@ -168,9 +169,11 @@ def summarize(evidence):
 
 
 def finish(evidence):
+    identities = [(e['metadata']['producer'], e['metadata']['phase']) for e in evidence]
+    require(len(identities) == len(set(identities)), 'repeated producer/phase export')
     warmup = [e for e in evidence if e['metadata']['phase'] == 0]
     measured = [e for e in evidence if e['metadata']['phase'] > 0]
-    return dict(version=1, interval=INTERVAL, warmup=summarize(warmup),
+    return dict(version=2, interval=INTERVAL, warmup=summarize(warmup),
                 measured=summarize(measured), files=evidence)
 
 
@@ -179,7 +182,7 @@ def validate_exports(exports):
     for row in exports:
         meta = row['metadata']
         evidence.append(validate(row['path'], meta, meta['phase'], meta['first_stream'],
-                                 meta['count'], row['width']))
+                                 meta['count'], row['width'], producer=row['producer']))
     return evidence
 
 
@@ -189,7 +192,7 @@ def compare(baseline, candidate, enabled):
         require(('latency' in row) == enabled, 'mixed or missing sampling mode')
         if enabled:
             data = row['latency']
-            require(data['version'] == 1 and data['interval'] == INTERVAL, 'different interval')
+            require(data['version'] == 2 and data['interval'] == INTERVAL, 'different interval')
             require(data['measured']['count'] == row['measured_requests'], 'missing measured samples')
             require(data['warmup']['count'] + data['measured']['count'] == row['completed'],
                     'missing warmup samples')

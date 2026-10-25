@@ -19,7 +19,7 @@ class SampleTests(unittest.TestCase):
         self.path = Path(self.temp.name) / 'samples.bin'
         # Two bursts, deliberately out of stream order; sorted by exact duration.
         self.samples = [(4, 10, 12), (12, 20, 23), (0, 10, 14), (8, 20, 27)]
-        self.meta = dict(version=1, phase=1, first_stream=0, count=4, expected=4,
+        self.meta = dict(version=2, producer=0, phase=1, first_stream=0, count=4, expected=4,
                          bytes=128, end_ns=30)
 
     def tearDown(self):
@@ -27,7 +27,7 @@ class SampleTests(unittest.TestCase):
 
     def write(self, samples=None, head=None):
         # Do not use the implementation's packer: this is the wire format oracle.
-        self.path.write_bytes(struct.pack('<8sQQQ', *(head or (b'HFBSTL01', 1, 0, 4))) +
+        self.path.write_bytes(struct.pack('<8sIIQQ', *(head or (b'HFBSTL02', 1, 0, 0, 4))) +
                               b''.join(struct.pack('<QQQ', *s) for s in
                                        (self.samples if samples is None else samples)))
 
@@ -40,14 +40,24 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(l.summarize([one, one]), dict(count=8, min_ns=2, p50_ns=3,
                          p99_ns=7, p99_9_ns=7, max_ns=7, sum_ns=32, mean_ns=4))
         warm_path = self.path.with_name('warmup.bin')
-        warm_path.write_bytes(struct.pack('<8sQQQQQQ', b'HFBSTL01', 0, 0, 1, 0, 1, 101))
-        warm_meta = dict(version=1, phase=0, first_stream=0, count=1, expected=1, bytes=56, end_ns=101)
+        warm_path.write_bytes(struct.pack('<8sIIQQQQQ', b'HFBSTL02', 0, 0, 0, 1, 0, 1, 101))
+        warm_meta = dict(version=2, producer=0, phase=0, first_stream=0, count=1, expected=1, bytes=56, end_ns=101)
         warm = l.validate(warm_path, warm_meta, 0, 0, 1, 1)
-        result = l.finish([one, warm, one, one, one])
+        evidence = [one, warm]
+        for producer in range(1, 4):
+            path = self.path.with_name(f'producer-{producer}.bin')
+            raw = bytearray(self.path.read_bytes())
+            struct.pack_into('<I', raw, 12, producer)
+            path.write_bytes(raw)
+            meta = dict(self.meta, producer=producer)
+            evidence.append(l.validate(path, meta, 1, 0, 4, 2, producer=producer))
+        result = l.finish(evidence)
         self.assertEqual(result['measured']['count'], 16)
         self.assertEqual(result['measured']['p99_9_ns'], 7)
         self.assertEqual(result['warmup']['count'], 1)
         self.assertEqual(result['warmup']['min_ns'], 100)
+        with self.assertRaisesRegex(ValueError, 'repeated producer'):
+            l.finish([*evidence, one])
 
     def test_zero_reversed_and_outside_phase_times_fail(self):
         for sample in [(4, 10, 10), (4, 10, 9), (4, 10, 31), (4, 0, 0)]:
@@ -62,8 +72,9 @@ class SampleTests(unittest.TestCase):
                 self.validate()
 
     def test_phase_count_first_and_magic_in_header_are_independently_checked(self):
-        for header in [(b'HFBSTL02', 1, 0, 4), (b'HFBSTL01', 0, 0, 4),
-                       (b'HFBSTL01', 1, 4, 4), (b'HFBSTL01', 1, 0, 3)]:
+        for header in [(b'HFBSTL03', 1, 0, 0, 4), (b'HFBSTL02', 0, 0, 0, 4),
+                       (b'HFBSTL02', 1, 0, 4, 4), (b'HFBSTL02', 1, 0, 0, 3),
+                       (b'HFBSTL02', 1, 1, 0, 4)]:
             with self.subTest(header=header), self.assertRaisesRegex(ValueError, 'header'):
                 self.write(head=header)
                 self.validate()
@@ -110,8 +121,8 @@ class SampleTests(unittest.TestCase):
                      (1, 1, 0, 1, 1), (True, 1, 1, 1, 1), (1, 1, 1.0, 1, 1)]:
             with self.subTest(args=args), self.assertRaises(ValueError):
                 l.limits(*args)
-        for field, value in [('count', 3), ('count', 5), ('count', True), ('version', 2),
-                             ('phase', 0), ('first_stream', 4), ('bytes', 127),
+        for field, value in [('count', 3), ('count', 5), ('count', True), ('version', 1),
+                             ('phase', 0), ('producer', 1), ('first_stream', 4), ('bytes', 127),
                              ('end_ns', 0), ('end_ns', -1), ('end_ns', None),
                              ('end_ns', 1 << 64), ('end_ns', float('nan'))]:
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
@@ -131,7 +142,7 @@ class ControllerTests(unittest.TestCase):
         warm = fixture()
         timed = fixture(warm, 1)
         for phase, row in enumerate((warm, timed)):
-            row['latency'] = dict(version=1, phase=phase, first_stream=phase * 2048,
+            row['latency'] = dict(version=2, producer=0, phase=phase, first_stream=phase * 2048,
                 expected=512, count=512, bytes=32 + 512 * 24, end_ns=100)
         ready = dict(phase=1, latency_ready=dict(timed['latency'], count=0, bytes=32, end_ns=None))
         events = []
@@ -161,7 +172,7 @@ class ControllerTests(unittest.TestCase):
             return []
 
         reports = iter([warm, ready, timed])
-        summary = dict(version=1, interval=l.INTERVAL, measured=dict(count=512, p50_ns=2,
+        summary = dict(version=2, interval=l.INTERVAL, measured=dict(count=512, p50_ns=2,
                        p99_ns=3, p99_9_ns=4), warmup=dict(count=512))
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(b.subprocess, 'Popen', return_value=process), \
@@ -186,12 +197,12 @@ class ControllerTests(unittest.TestCase):
         row = fixture()
         with self.assertRaisesRegex(RuntimeError, 'sampling mode'):
             b.validate_report(row, None, 0, 2, 32, 8, True)
-        row['latency'] = dict(version=1, phase=0, first_stream=0, expected=512,
+        row['latency'] = dict(version=2, producer=0, phase=0, first_stream=0, expected=512,
                               count=512, bytes=32 + 512 * 24, end_ns=100)
         b.validate_report(row, None, 0, 2, 32, 8, True)
         with self.assertRaisesRegex(RuntimeError, 'sampling mode'):
             b.validate_report(row, None, 0, 2, 32, 8)
-        for field, value in [('count', 511), ('phase', 1), ('first_stream', 2048)]:
+        for field, value in [('count', 511), ('phase', 1), ('producer', 1), ('first_stream', 2048)]:
             wrong = deepcopy(row)
             wrong['latency'][field] = value
             with self.assertRaises(ValueError):
@@ -203,7 +214,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_comparison_rejects_mixed_missing_or_incomplete_latency(self):
         default = dict(measured_requests=4, completed=6)
-        data = dict(version=1, interval=l.INTERVAL, measured=dict(count=4, p50_ns=2,
+        data = dict(version=2, interval=l.INTERVAL, measured=dict(count=4, p50_ns=2,
                     p99_ns=3, p99_9_ns=4), warmup=dict(count=2))
         sampled = dict(default, latency=data)
         self.assertEqual(l.compare(default, default, False), {})

@@ -45,7 +45,7 @@ def fault_proxy(args, fault):
     # This proxy is independent of the controller's validator. Three siblings
     # use the native peer directly; only producer 3 corrupts phase-1 exports.
     source = '''#!/usr/bin/env python3
-import json,os,signal,struct,subprocess,sys
+import json,os,signal,struct,subprocess,sys,time
 from pathlib import Path
 PEER = @PEER@
 FAULT = @FAULT@
@@ -68,7 +68,14 @@ try:
                 sys.exit(7)
             elif FAULT=='truncated': raw=raw[:-1]
             elif FAULT=='oversized': raw+=b'x'
-            elif FAULT=='wrong-phase': struct.pack_into('<Q',raw,8,0)
+            elif FAULT=='wrong-phase': struct.pack_into('<I',raw,8,0)
+            elif FAULT=='wrong-producer':
+                sibling=directory.parent/'latency-0/phase-1.bin'
+                deadline=time.monotonic()+2
+                while not sibling.exists() or sibling.stat().st_size!=len(raw):
+                    assert time.monotonic()<deadline, 'sibling export missing'
+                    time.sleep(.001)
+                raw=bytearray(sibling.read_bytes())
             elif FAULT=='duplicate': raw[32+24:32+32]=raw[32:40]
             elif FAULT=='zero-duration': raw[48:56]=raw[40:48]
             file.write_bytes(raw)
@@ -90,7 +97,7 @@ finally:
 
 def faults(args, cpus):
     results = []
-    for fault in ('truncated', 'oversized', 'wrong-phase', 'duplicate', 'zero-duration', 'exit'):
+    for fault in ('truncated', 'oversized', 'wrong-phase', 'wrong-producer', 'duplicate', 'zero-duration', 'exit'):
         path = args.output / f'fault-{fault}'
         proxy = fault_proxy(args, fault)
         start = time.monotonic()

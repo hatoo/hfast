@@ -61,14 +61,15 @@ most 96 MiB/worker), released before preparing the next ledger. Phase reports
 keep the original 65,536-byte bound. Sidecar size is exactly `32 + 24 * count`
 bytes. Provision disk space for every warmup and measured phase before a large run.
 
-Each worker exclusively creates `latency-I/phase-P.bin`. All integers are unsigned
-64-bit little-endian values. The 32-byte header is magic `HFBSTL01`, phase,
-first stream ID and sample count. Each 24-byte record is stream ID, send timestamp
+Each worker exclusively creates `latency-I/phase-P.bin`. The 32-byte header is
+magic `HFBSTL02`, 32-bit phase and producer IDs, then 64-bit first stream ID and
+sample count, all little-endian. Each 24-byte record is three unsigned 64-bit
+little-endian values: stream ID, send timestamp
 and completion timestamp, in nanoseconds relative to that worker phase's epoch.
 Records are sorted by `completion - send` during untimed export. Stream IDs and
 timestamps retain the original identities; no precision is discarded.
 
-An independent Python reader checks exact file length, header, stream membership,
+An independent Python reader checks exact file length, producer/phase identity, stream membership,
 uniqueness, timestamps, identical send times within each burst and serial burst
 ordering. It rejects zero/reversed durations, invalid phase bounds, truncated or
 oversized files, nonregular files and symlinks. A compact membership bitmap and
@@ -100,7 +101,7 @@ preparation/export/scanning remain outside controller wall/CPU measurements.
 `burst-latency-check.py` runs one/four producers at 1, 36, 64 and 1024 outstanding
 requests with native GRO/GSO and real GRO-denial fallback. It checks observed
 capacity at default and explicit receive-buffer settings. It also injects
-truncated/oversized exports, wrong phases, duplicate IDs, zero durations, producer
+truncated/oversized exports, wrong phases, swapped producers, duplicate IDs, zero durations, producer
 exit and a native invalid export command. All faults must fail without publishing
 successful results or losing previous samples. Existing throughput-only/legacy
 smoke and failure tests remain in CI.
