@@ -89,6 +89,21 @@ jobs:
           python benchmarks/h2-upload-oracle-check.py /tmp/h2-upload-peer --server target/release/hfast
       - name: QUIC handshake recovery with sparse ACKs
         run: python benchmarks/crypto-recovery-check.py target/release/hfast
+      - name: Coalesced QUIC receive offsets, sample bounds and failure oracles
+        run: |
+          python -m unittest discover -s benchmarks -p test_coalesced_receive.py -v
+          python benchmarks/coalesced-receive-check.py target/release/hfast --output "$RUNNER_TEMP/coalesced"
+          python benchmarks/coalesced-receive-check.py target/release/hfast --threads 2 --output "$RUNNER_TEMP/coalesced-t2"
+          HFAST_GRO_BINARY="$PWD/target/release/hfast" python benchmarks/coalesced-receive-check.py benchmarks/without-udp-gro.py --threads 2 --output "$RUNNER_TEMP/coalesced-denied-t2"
+          python benchmarks/coalesced-receive-check.py target/release/hfast --scenario finished-retired --cid-length 0
+          python benchmarks/coalesced-receive-check.py target/release/hfast --scenario finished-retired --cid-length 20
+      - name: Preserve coalesced receive failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coalesced-receive-failure
+          path: ${{ runner.temp }}/coalesced*
+          retention-days: 7
       - name: QUIC recovery oracle, deterministic impairments and failure controls
         run: |
           python -m unittest discover -s benchmarks -p test_quic_recovery.py -v
