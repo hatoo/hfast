@@ -14,7 +14,8 @@ import selectors
 import socket
 import subprocess
 import time
-import traceback
+
+import burst_failure as failure
 
 ERROR_COUNTERS = ('InErrors', 'RcvbufErrors', 'SndbufErrors', 'NoPorts',
                   'InCsumErrors', 'MemErrors')
@@ -149,6 +150,8 @@ def collect(workers, phase, timeout):
     deadline = time.monotonic() + timeout
     with selectors.DefaultSelector() as poll:
         for index, worker in enumerate(workers):
+            worker['report'] = None
+            worker['report_line'] = b''
             poll.register(worker['process'].stdout, selectors.EVENT_READ, index)
         while any(row is None for row in reports):
             remaining = deadline - time.monotonic()
@@ -165,9 +168,11 @@ def collect(workers, phase, timeout):
                 if b'\n' not in worker['buffer']:
                     continue
                 line, extra = worker['buffer'].split(b'\n', 1)
+                worker['report_line'] = line
                 require(not extra and reports[index] is None, 'duplicate worker report')
                 worker['buffer'] = b''
                 row = json.loads(line)
+                worker['report'] = row
                 require(row['phase'] == phase, f'wrong worker {index} phase')
                 reports[index] = row
     for worker in workers:
@@ -178,19 +183,26 @@ def collect(workers, phase, timeout):
 def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, cycles,
                warmup, gro, timeout=60):
     workers = []
+    primary = None
+    state = dict(phase=0, stage='startup', namespace_before={}, last_success=None,
+                 server_baseline=failure.observe(failure.process_snapshot, server_pid))
     with ExitStack() as files:
         events = files.enter_context((output / 'phases.jsonl').open('x'))
-        before = udp()
         try:
+            before = udp()
+            netns = os.readlink('/proc/self/ns/net')
+            state['namespace_before'] = failure.namespace_at(before, netns)
             for index, core in enumerate(cpus):
                 command = ['taskset', '-c', str(core), str(peer), '--worker', str(port),
                            str(batch), str(datagrams), str(warmup)]
                 stderr = files.enter_context((output / f'worker-{index}.stderr').open('xb'))
                 stdout = files.enter_context((output / f'worker-{index}.jsonl').open('xb'))
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=stderr, bufsize=0)
-                os.set_blocking(process.stdout.fileno(), False)
+                                           stderr=stderr, bufsize=0,
+                                           env=dict(os.environ, BURST_PRODUCER_INDEX=str(index)))
                 workers.append(dict(process=process, stdout=stdout, buffer=b'', command=command))
+                os.set_blocking(process.stdout.fileno(), False)
+            state['stage'] = 'warmup'
             previous = collect(workers, 0, timeout)
             for row in previous:
                 validate_report(row, None, 0, warmup, batch, datagrams)
@@ -198,8 +210,16 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
             warmup_reports = previous
             events.write(json.dumps(dict(phase=0, workers=previous, udp=after)) + '\n')
             events.flush()
+            state['last_success'] = dict(phase=0, reports=previous,
+                                         namespace=failure.namespace_at(after, netns))
+            # All peers are idle after warmup. No diagnostic syscalls are added
+            # to any successful measured phase or native request loop.
+            for worker in workers:
+                worker['socket_baseline'] = failure.observe(
+                    failure.process_snapshot, worker['process'].pid)
             rows = []
             for phase in range(1, cycles + 1):
+                state.update(phase=phase, stage='measured')
                 start_udp = after
                 start_totals = totals(previous)
                 start_cpu = cpu(server_pid)
@@ -226,7 +246,10 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                 events.write(json.dumps(row) + '\n')
                 events.flush()
                 previous = reports
+                state['last_success'] = dict(phase=phase, reports=reports,
+                                             namespace=failure.namespace_at(after, netns))
             # Sockets stay live until every delivery, queue and credit gate passes.
+            state['stage'] = 'shutdown'
             for worker in workers:
                 worker['process'].stdin.write(b'STOP\n')
             for worker in workers:
@@ -249,17 +272,22 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                         completed=sum(row['active']['completed'] for row in previous),
                         workers=previous, udp_before=before, udp_after=after,
                         commands=[w['command'] for w in workers], **totals(previous))
-        except BaseException:
-            (output / 'failure.txt').write_text(traceback.format_exc())
+        except BaseException as error:
+            primary = error
+            failure.write_failure(output, 'failure', error,
+                                  lambda: failure.capture(server_pid, workers, state))
             raise
         finally:
-            for worker in workers:
-                process = worker['process']
-                if process.poll() is None:
-                    process.kill()
-                process.wait(timeout=5)
-                process.stdin.close()
-                process.stdout.close()
+            errors = failure.cleanup(workers)
+            try:
+                files.close()
+            except Exception as error:
+                errors.append(f'closing raw evidence: {error}')
+            if errors:
+                if primary is not None:
+                    primary.add_note('Worker cleanup: ' + '; '.join(errors))
+                else:
+                    raise RuntimeError('Worker cleanup: ' + '; '.join(errors))
 
 
 def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
@@ -283,18 +311,43 @@ def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
     binary = server if gro else Path(__file__).with_name('without-udp-gro.py')
     command = [str(binary), '--threads', '1', '--tcp', '0', '--quic', str(port),
                '--max-streams', str(2 * batch * datagrams)]
+    manifest = dict(inputs=inputs, server_command=command, client_cpus=cpus, batch=batch,
+                    datagrams=datagrams, batches=batches, cycles=cycles, warmup=warmup,
+                    gro=gro, timeout=timeout, smoke=allow_shared_cpus)
+    with (output / 'manifest.json').open('x') as file:
+        file.write(json.dumps(manifest, indent=2) + '\n')
     with (output / 'server.log').open('x') as log:
         process = subprocess.Popen(command, stdout=log, stderr=log,
                                    env=dict(os.environ, HFAST_GRO_BINARY=str(server)))
+        primary = None
         try:
             time.sleep(.2)
             require(process.poll() is None, 'server failed at startup')
             result = coordinate(peer, process.pid, port, output, cpus, batch, datagrams,
                                 batches, cycles, warmup, gro, timeout)
             require(process.poll() is None, 'server exited during measurement')
+        except BaseException as error:
+            primary = error
+            failure.write_failure(output, 'run-failure', error,
+                                  lambda: dict(manifest=manifest, timing_evidence=False,
+                                               exit_code=process.poll(),
+                                               server=failure.observe(failure.process_snapshot, process.pid),
+                                               namespace=failure.observe(failure.namespace_snapshot)))
+            raise
         finally:
-            process.terminate()
-            process.wait(timeout=5)
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            except Exception as error:
+                if primary is not None:
+                    primary.add_note(f'Server cleanup: {error}')
+                else:
+                    raise
     require(inputs == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (server, peer)},
             'input binary changed')
     result.update(inputs=inputs, server_command=command, smoke=allow_shared_cpus)

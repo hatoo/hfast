@@ -3,6 +3,9 @@
 use super::*;
 use std::io::Write;
 
+#[path = "udp_socket_evidence.rs"]
+mod udp_socket_evidence;
+
 const MAX_BATCHES: usize = 1 << 20;
 
 fn command(expected: usize) -> Result<Option<usize>> {
@@ -111,6 +114,34 @@ fn run_phase(
     Ok(())
 }
 
+fn failure_peer(peer: &Peer) -> Value {
+    let ledger = match ledger(peer) {
+        Ok(row) => json!({"status": "available", "value": row}),
+        Err(error) => json!({"status": "unavailable", "error": format!("{error:#}")}),
+    };
+    json!({"ledger": ledger, "socket": udp_socket_evidence::snapshot(&peer.socket)})
+}
+
+fn report_failure(phase: usize, error: &anyhow::Error, active: &Peer, quiet: Option<&Peer>) {
+    // Only failed runs pay for /proc and getsockopt. Observe our still-owned
+    // sockets before unwinding, even if the controller later sees an exited PID.
+    // A broken diagnostic stream must not replace the protocol error.
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}",
+        json!({"kind": "burst_failure", "phase": phase, "pid": std::process::id(),
+            "error": format!("{error:#}"), "timing_evidence": false,
+            "udp_table": match std::fs::read_to_string("/proc/self/net/udp") {
+                Ok(table) => json!({"status": "available", "value": table}),
+                Err(error) => json!({"status": "unavailable", "error": error.to_string()}),
+            },
+            "active": failure_peer(active),
+            "quiet": quiet.map(failure_peer).unwrap_or_else(||
+                json!({"status": "unavailable", "error": "quiet connection not established"})),
+        })
+    );
+}
+
 pub(super) fn main(args: &[String]) -> Result<()> {
     ensure!(
         args.len() == 4,
@@ -127,15 +158,28 @@ pub(super) fn main(args: &[String]) -> Result<()> {
     ensure!((1..=32).contains(&batch) && (1..=32).contains(&datagrams));
     ensure!((1..=MAX_BATCHES).contains(&warmup));
     let mut active = Peer::connect(port, batch * datagrams)?;
-    let mut quiet = Peer::connect(port, batch * datagrams)?;
-    run_phase(&mut active, &mut quiet, 0, warmup, batch, datagrams)?;
-    let mut phase = 1;
-    while let Some(batches) = command(phase)? {
-        run_phase(&mut active, &mut quiet, phase, batches, batch, datagrams)
-            .with_context(|| format!("worker phase {phase}"))?;
-        phase += 1;
+    let mut quiet = match Peer::connect(port, batch * datagrams) {
+        Ok(peer) => peer,
+        Err(error) => {
+            report_failure(0, &error, &active, None);
+            return Err(error);
+        }
+    };
+    let mut phase = 0;
+    let result = (|| -> Result<()> {
+        run_phase(&mut active, &mut quiet, 0, warmup, batch, datagrams)?;
+        phase = 1;
+        while let Some(batches) = command(phase)? {
+            run_phase(&mut active, &mut quiet, phase, batches, batch, datagrams)
+                .with_context(|| format!("worker phase {phase}"))?;
+            phase += 1;
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        report_failure(phase, error, &active, Some(&quiet));
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]

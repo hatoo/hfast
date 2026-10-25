@@ -111,6 +111,38 @@ explicitly. Keep every workload setting fixed, alternate order and repeat with
 Concurrent success does not establish general QUIC loss-recovery correctness or
 remove the existing WSL measurement uncertainty.
 
+Failed concurrent runs preserve `manifest.json`, raw stdout/stderr for each
+worker, and `failure.json`/`failure.txt` before the controller kills workers.
+The JSON includes initial, last-success and failure namespace counters; full and
+partial reports; PID/command/exit state; and live, process-owned socket inodes,
+FDs, diagnostic cookies, capacities, queues and drop counters. Socket deltas
+require stable identities. The baseline socket snapshots run before the first
+measured phase; failure snapshots run only after an error. Successful phase
+timers, request bytes and accounting gates are unchanged.
+
+`run-failure.json` retains the server snapshot before its teardown. If a native
+worker exits first, its stderr contains a `burst_failure` JSON record with the
+original error, phase, partial peer ledgers and its still-owned socket counters
+and raw UDP table. Failure in the first connection's handshake may occur before
+any native peer can be retained; missing/exited/reused/unreadable identities are
+explicitly unavailable, never inferred to have zero drops. Snapshots are not
+atomic. A positive drop count does not establish the sole cause of a failure.
+Diagnostics use exclusive file creation; diagnostic errors cannot replace the
+original exception or skip cleanup of sibling processes.
+
+The bounded negative oracle injects exit, malformed/truncated output and real
+receive-queue overflow with one/four producers and GRO/fallback. It verifies
+counter/identity retention before teardown, exact overflow attribution, original
+errors, reaped children, and native failure records. Its failed workloads and
+the ordinary smoke's timings are not performance evidence:
+
+```sh
+unshare --user --map-root-user --net sh -c \
+  'ip link set lo up && exec "$@"' burst-faults \
+  python3 benchmarks/burst-worker-fault-check.py /immutable/hfast /new/peer/burst-peer \
+  /new/burst-faults
+```
+
 A fixed-server check on 2026-10-15 used accepted hfast `d2de04a` (binary SHA256
 `bfe08e14e13415208af7e0fdd6bc600414a434adcbca10aa3a4613f9dcf663dc`), rustc
 1.98.0 and the pinned native transport above. With 32 requests/datagram, eight

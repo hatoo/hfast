@@ -78,6 +78,18 @@ class Parsing(unittest.TestCase):
             with self.subTest(message=bad), self.assertRaises(ValueError):
                 udp.diag_messages(bad, 1)
 
+    def test_diagnostic_deadline_bounds_even_a_continuing_dump(self):
+        # Zero-status acknowledgements are legal but do not terminate a dump.
+        ack = nl_message(struct.pack('=i', 0), kind=2)
+        with patch.object(udp.socket, 'socket') as create, \
+                patch.object(udp.time, 'monotonic', side_effect=[1, 2, 3]):
+            netlink = create.return_value.__enter__.return_value
+            netlink.recvmsg.return_value = (ack, [], 0, (0, 0))
+            with self.assertRaisesRegex(ValueError, 'deadline expired'):
+                udp.socket_diagnostics({socket.AF_INET}, deadline=2.5)
+        self.assertEqual(netlink.recvmsg.call_count, 2)
+        self.assertEqual([call.args[0] for call in netlink.settimeout.call_args_list], [2, 1.5, .5])
+
 
 class LiveSockets(unittest.TestCase):
     def socket(self, family=socket.AF_INET, port=0, small=False):
