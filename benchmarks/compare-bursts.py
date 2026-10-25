@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import time
 import burst_workers
+import burst_buffer
 
 
 def sha(path):
@@ -17,35 +18,44 @@ def sha(path):
 
 
 def run(args, variant, pair):
+    buffer_flags = burst_buffer.flags(args.udp_receive_buffer)
     stem = args.output / f'{pair}-{variant}'
     if args.producer_cpus:
         gro = not (args.baseline_without_gro if variant == 'baseline' else args.candidate_without_gro)
         result = burst_workers.run(getattr(args, variant), args.peer, stem, args.producer_cpus,
                                   batch=args.batch, datagrams=args.datagrams, batches=args.batches,
-                                  cycles=args.cycles, warmup=args.warmup, gro=gro)
+                                  cycles=args.cycles, warmup=args.warmup, gro=gro,
+                                  udp_receive_buffer=args.udp_receive_buffer)
         result.update(variant=variant, pair=pair)
         return result
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
     server_command = [str(getattr(args, variant)), '--threads', '1', '--tcp', '0',
-                      '--quic', str(port), '--max-streams', str(args.batch * args.datagrams * 2)]
+                      '--quic', str(port), '--max-streams', str(args.batch * args.datagrams * 2),
+                      *buffer_flags]
     with stem.with_suffix('.server.log').open('x') as log:
         server = subprocess.Popen(server_command, stdout=log, stderr=log)
         try:
             time.sleep(.2)
             assert server.poll() is None
+            capacity_before = burst_buffer.observe(server.pid, port, args.udp_receive_buffer)
+            with stem.with_suffix('.receive-buffer.json').open('x') as evidence:
+                evidence.write(json.dumps(capacity_before, indent=2) + '\n')
             command = ['/usr/bin/time', '-o', str(stem.with_suffix('.peer-cpu.txt')),
                        '-f', '%U %S %e %M', 'taskset', '-c', str(args.client_cpu),
                        str(args.peer), str(port), str(server.pid), str(args.batch),
                        str(args.datagrams), str(args.batches), str(args.cycles),
                        str(args.warmup), str(int(variant == 'candidate' and not args.candidate_without_gro))]
             p = subprocess.run(command, capture_output=True, text=True, timeout=300)
-            stem.with_suffix('.stdout').open('x').write(p.stdout)
-            stem.with_suffix('.stderr').open('x').write(p.stderr)
+            for suffix, data in [('.stdout', p.stdout), ('.stderr', p.stderr)]:
+                with stem.with_suffix(suffix).open('x') as file:
+                    file.write(data)
             assert p.returncode == 0, (stem, p.stderr)
             result = json.loads(p.stdout)
             assert server.poll() is None
+            result['udp_receive_buffer'] = burst_buffer.interval(
+                capacity_before, burst_buffer.observe(server.pid, port, args.udp_receive_buffer))
         finally:
             server.terminate()
             server.wait(timeout=5)
@@ -77,16 +87,23 @@ def run(args, variant, pair):
                   peer_cpu=dict(user=peer_user, system=peer_system, wall=peer_wall, rss_kb=peer_rss),
                   peer_cores=(peer_user + peer_system) / peer_wall,
                   command=command, server_command=server_command)
-    stem.with_suffix('.json').open('x').write(json.dumps(result, indent=2)+'\n')
+    with stem.with_suffix('.json').open('x') as file:
+        file.write(json.dumps(result, indent=2) + '\n')
     return result
 
 
 def main(args):
+    burst_buffer.validate(args.udp_receive_buffer)
     assert not any(name in os.environ for name in (
         'LD_PRELOAD', 'GRO_AUDIT_COUNTERS', 'HFAST_GRO_PRELOAD', 'BURST_QUEUE_AUDIT'
     )), 'audit/instrumentation environment cannot be timed'
     args.output.mkdir(parents=True)
     inputs = {name: sha(getattr(args, name)) for name in ['baseline', 'candidate', 'peer']}
+    with (args.output / 'manifest.json').open('x') as file:
+        file.write(json.dumps(dict(
+            inputs=inputs, udp_receive_buffer_requested=args.udp_receive_buffer,
+            arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}),
+            indent=2) + '\n')
     rows, paired = [], []
     for pair in range(args.pairs):
         order = ['baseline', 'candidate']
@@ -100,19 +117,24 @@ def main(args):
             print(json.dumps({k: result[k] for k in ['pair', 'variant', 'requests_per_second',
                 'cpu_ns_per_request', 'server_cores', 'measured_requests', 'sent_datagrams', 'received_datagrams']}), flush=True)
         b, c = runs['baseline'], runs['candidate']
+        burst_buffer.require_equal(b['udp_receive_buffer'], c['udp_receive_buffer'])
+        burst_buffer.require_equal(rows[0]['udp_receive_buffer'], c['udp_receive_buffer'])
         assert b['completed'] == c['completed'] and b['sent_datagrams'] == c['sent_datagrams']
         assert b['sent_messages'] == c['sent_messages']
         paired.append(dict(pair=pair, rps_percent=(c['requests_per_second']/b['requests_per_second']-1)*100,
                            cpu_percent=((c['cpu_ns_per_request']/b['cpu_ns_per_request']-1)*100 if b['cpu_ns_per_request'] else None)))
     assert inputs == {name: sha(getattr(args, name)) for name in inputs}
     summary = dict(inputs=inputs, batch=args.batch, datagrams=args.datagrams, batches=args.batches,
+                   udp_receive_buffer_requested=args.udp_receive_buffer,
+                   receive_buffer_capacities=[r['udp_receive_buffer']['effective_bytes'] for r in rows],
                    producer_cpus=args.producer_cpus, warmup=args.warmup,
                    cycles=args.cycles, pairs=paired, completed=sum(x['completed'] for x in rows),
                    sent_datagrams=sum(x['sent_datagrams'] for x in rows), errors=0, reverse=args.reverse,
                    median_rps_percent=statistics.median(x['rps_percent'] for x in paired),
                    median_cpu_percent=(statistics.median(x['cpu_percent'] for x in paired if x['cpu_percent'] is not None) if any(x['cpu_percent'] is not None for x in paired) else None))
-    (args.output/'results.json').open('x').write(json.dumps(rows,indent=2)+'\n')
-    (args.output/'summary.json').open('x').write(json.dumps(summary,indent=2)+'\n')
+    for name, data in [('results', rows), ('summary', summary)]:
+        with (args.output / f'{name}.json').open('x') as file:
+            file.write(json.dumps(data, indent=2) + '\n')
     print(json.dumps(summary),flush=True)
 
 
@@ -127,6 +149,8 @@ if __name__ == '__main__':
     parser.add_argument('--warmup', type=int, default=256)
     parser.add_argument('--pairs', type=int, default=3)
     parser.add_argument('--client-cpu', type=int, default=8)
+    parser.add_argument('--udp-receive-buffer', type=burst_buffer.argument, default=0,
+                        help='identical server receive-buffer request in bytes for both variants')
     parser.add_argument('--producer-cpus', type=lambda s: list(map(int, s.split(','))),
                         help='coordinated mode: one or four CPUs; both servers default to GRO')
     parser.add_argument('--baseline-without-gro', action='store_true',
