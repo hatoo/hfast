@@ -84,6 +84,12 @@ smoke phases must not be interpreted as performance measurements. Phases time ou
 after 60 seconds; worker failure, partial output, missing/duplicate work or drops
 fail the entire run, retain logs and terminate the remaining processes.
 
+For exact per-request latency, coordinated mode supports opt-in `--latency` on
+both controllers. [The latency fixture](burst-latency.md) documents its interval,
+bounded sidecars, exact merged percentiles and independent rejection tests.
+Both compared servers must use the same sampling mode; throughput-only reports
+contain no request latency samples.
+
 ```sh
 python3 -m unittest discover -s benchmarks -p test_burst_workers.py -v
 unshare --user --map-root-user --net sh -c \

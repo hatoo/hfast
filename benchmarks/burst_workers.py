@@ -17,6 +17,7 @@ import time
 
 import burst_failure as failure
 import burst_buffer
+import burst_latency
 
 ERROR_COUNTERS = ('InErrors', 'RcvbufErrors', 'SndbufErrors', 'NoPorts',
                   'InCsumErrors', 'MemErrors')
@@ -98,7 +99,7 @@ def settle(before, reports, port, gro):
     return after
 
 
-def validate_report(row, previous, phase, batches, batch, datagrams):
+def validate_report(row, previous, phase, batches, batch, datagrams, latency=False):
     require(row['phase'] == phase, 'wrong/repeated worker phase')
     require(row['errors'] == row['pending_requests'] == row['pending_fences'] == 0,
             'worker errors or unfinished work')
@@ -106,6 +107,9 @@ def validate_report(row, previous, phase, batches, batch, datagrams):
     work = row['work']
     requests = batches * batch * datagrams
     first = previous['active']['completed'] if previous else 0
+    require(('latency' in row) == latency, 'wrong latency sampling mode')
+    if latency:
+        burst_latency.metadata(row['latency'], phase, 4 * first, requests)
     expected = dict(batches=batches, requests=requests, first_completed=first,
                     completed=first + requests, request_datagrams=batches * datagrams,
                     fences=batches, sent_datagrams=batches * (datagrams + 1),
@@ -181,9 +185,26 @@ def collect(workers, phase, timeout):
     return reports
 
 
+def export_latency(workers, reports, output, phase, width, timeout):
+    for worker in workers:
+        worker['process'].stdin.write(f'EXPORT {phase}\n'.encode())
+    exported = collect(workers, phase, timeout)
+    evidence = []
+    for index, (report, row) in enumerate(zip(reports, exported)):
+        require(row.get('latency_export') == report['latency'], 'latency export metadata mismatch')
+        path = output / f'latency-{index}' / f'phase-{phase}.bin'
+        meta = report['latency']
+        evidence.append(burst_latency.inspect(path, meta, phase, meta['first_stream'],
+                                              report['work']['requests'], width))
+    return evidence
+
+
 def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, cycles,
-               warmup, gro, timeout=60):
+               warmup, gro, timeout=60, latency=False):
+    if latency:
+        burst_latency.limits(batch, datagrams, batches, cycles, warmup)
     workers = []
+    sample_files = []
     primary = None
     state = dict(phase=0, stage='startup', namespace_before={}, last_success=None,
                  server_baseline=failure.observe(failure.process_snapshot, server_pid))
@@ -196,6 +217,8 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
             for index, core in enumerate(cpus):
                 command = ['taskset', '-c', str(core), str(peer), '--worker', str(port),
                            str(batch), str(datagrams), str(warmup)]
+                if latency:
+                    command += ['--latency-dir', str(output / f'latency-{index}')]
                 stderr = files.enter_context((output / f'worker-{index}.stderr').open('xb'))
                 stdout = files.enter_context((output / f'worker-{index}.jsonl').open('xb'))
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -206,9 +229,13 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
             state['stage'] = 'warmup'
             previous = collect(workers, 0, timeout)
             for row in previous:
-                validate_report(row, None, 0, warmup, batch, datagrams)
+                validate_report(row, None, 0, warmup, batch, datagrams, latency)
             after = settle(before, previous, port, gro)
             warmup_reports = previous
+            if latency:
+                state['stage'] = 'warmup-sample-export'
+                sample_files += export_latency(workers, previous, output, 0,
+                                               batch * datagrams, timeout)
             events.write(json.dumps(dict(phase=0, workers=previous, udp=after)) + '\n')
             events.flush()
             state['last_success'] = dict(phase=0, reports=previous,
@@ -220,7 +247,15 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                     failure.process_snapshot, worker['process'].pid)
             rows = []
             for phase in range(1, cycles + 1):
-                state.update(phase=phase, stage='measured')
+                state.update(phase=phase, stage='prepare' if latency else 'measured')
+                if latency:
+                    for worker in workers:
+                        worker['process'].stdin.write(f'PREPARE {phase} {batches}\n'.encode())
+                    ready = collect(workers, phase, timeout)
+                    for old, row in zip(previous, ready):
+                        burst_latency.metadata(row.get('latency_ready'), phase,
+                            old['active']['next_stream'], batches * batch * datagrams, ready=True)
+                state['stage'] = 'measured'
                 start_udp = after
                 start_totals = totals(previous)
                 start_cpu = cpu(server_pid)
@@ -230,7 +265,7 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                     worker['process'].stdin.write(f'RUN {phase} {batches}\n'.encode())
                 reports = collect(workers, phase, timeout)
                 for old, new in zip(previous, reports):
-                    validate_report(new, old, phase, batches, batch, datagrams)
+                    validate_report(new, old, phase, batches, batch, datagrams, latency)
                 after = settle(before, reports, port, gro)
                 seconds = time.perf_counter() - start
                 server_cpu = cpu_delta(start_cpu, cpu(server_pid), seconds)
@@ -243,6 +278,10 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                            requests_per_second=requests / seconds, server_cpu=server_cpu,
                            client_cpu=clients, workers=reports, udp_before=start_udp,
                            udp_after=after, **delta)
+                if latency:
+                    state['stage'] = 'sample-export'
+                    sample_files += export_latency(workers, reports, output, phase,
+                                                   batch * datagrams, timeout)
                 rows.append(row)
                 events.write(json.dumps(row) + '\n')
                 events.flush()
@@ -262,7 +301,7 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
             seconds = sum(row['seconds'] for row in rows)
             requests = sum(row['requests'] for row in rows)
             server_seconds = sum(row['server_cpu']['user'] + row['server_cpu']['system'] for row in rows)
-            return dict(producers=len(workers), client_cpus=cpus, connections=2 * len(workers),
+            result = dict(producers=len(workers), client_cpus=cpus, connections=2 * len(workers),
                         batch=batch, datagrams=datagrams, batches=batches, cycles=rows,
                         warmup=warmup_reports, gro=gro, errors=0, pending_requests=0,
                         pending_fences=0, lost_packets=0, duplicate_responses=0,
@@ -273,6 +312,13 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
                         completed=sum(row['active']['completed'] for row in previous),
                         workers=previous, udp_before=before, udp_after=after,
                         commands=[w['command'] for w in workers], **totals(previous))
+            if latency:
+                state['stage'] = 'sample-validation'
+                sample_files = burst_latency.validate_exports(sample_files)
+                state['stage'] = 'sample-summary'
+                result['latency'] = burst_latency.finish(sample_files)
+                burst_latency.compare(result, result, True)
+            return result
         except BaseException as error:
             primary = error
             failure.write_failure(output, 'failure', error,
@@ -293,8 +339,10 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
 
 def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
         cycles=4, warmup=64, gro=True, timeout=60, allow_shared_cpus=False,
-        udp_receive_buffer=0):
+        udp_receive_buffer=0, latency=False):
     buffer_flags = burst_buffer.flags(udp_receive_buffer)
+    if latency:
+        burst_latency.limits(batch, datagrams, batches, cycles, warmup)
     require(len(cpus) in (1, 4), 'use one or four producers')
     require(all(core in os.sched_getaffinity(0) for core in cpus), 'unavailable client CPU')
     require(allow_shared_cpus or (0 in os.sched_getaffinity(0)
@@ -319,6 +367,9 @@ def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
                     gro=gro, timeout=timeout, smoke=allow_shared_cpus,
                     udp_receive_buffer_requested=udp_receive_buffer,
                     receive_buffer_evidence='receive-buffer.json')
+    if latency:
+        manifest['latency_interval'] = burst_latency.INTERVAL
+        manifest['latency_max_samples_per_phase'] = burst_latency.MAX_SAMPLES
     with (output / 'manifest.json').open('x') as file:
         file.write(json.dumps(manifest, indent=2) + '\n')
     with (output / 'server.log').open('x') as log:
@@ -332,7 +383,7 @@ def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
             with (output / 'receive-buffer.json').open('x') as evidence:
                 evidence.write(json.dumps(capacity_before, indent=2) + '\n')
             result = coordinate(peer, process.pid, port, output, cpus, batch, datagrams,
-                                batches, cycles, warmup, gro, timeout)
+                                batches, cycles, warmup, gro, timeout, latency=latency)
             require(process.poll() is None, 'server exited during measurement')
             result['udp_receive_buffer'] = burst_buffer.interval(
                 capacity_before, burst_buffer.observe(process.pid, port, udp_receive_buffer))
@@ -375,12 +426,14 @@ if __name__ == '__main__':
                           ('cycles', 4), ('warmup', 64)]:
         parser.add_argument('--' + name, type=int, default=default)
     parser.add_argument('--without-gro', action='store_true')
+    parser.add_argument('--latency', action='store_true',
+                        help='retain every request timestamp; prepare/export outside timing')
     parser.add_argument('--udp-receive-buffer', type=burst_buffer.argument, default=0,
                         help='server receive-buffer request in bytes (0 keeps the default)')
     args = parser.parse_args()
     result = run(args.server, args.peer, args.output, list(map(int, args.client_cpus.split(','))),
                  batch=args.batch, datagrams=args.datagrams, batches=args.batches,
                  cycles=args.cycles, warmup=args.warmup, gro=not args.without_gro,
-                 udp_receive_buffer=args.udp_receive_buffer)
+                 udp_receive_buffer=args.udp_receive_buffer, latency=args.latency)
     print(json.dumps({key: result[key] for key in ('producers', 'measured_requests', 'completed',
           'seconds', 'requests_per_second', 'server_cores', 'cpu_ns_per_request', 'errors')}))

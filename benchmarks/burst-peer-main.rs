@@ -1,10 +1,11 @@
 //! Two authenticated peers exercise the default batched receive policy.
 //! Only the active peer sends requests; both peers have exact delivery accounting.
 #![allow(dead_code)]
+mod burst_latency;
+mod burst_worker;
 mod clock;
 mod quic;
 mod tls;
-mod burst_worker;
 #[cfg(test)]
 mod http3 {
     pub mod proto;
@@ -57,7 +58,20 @@ impl Batch {
             completed: 0,
         }
     }
-    fn response(&mut self, _pn: u64, id: u64, offset: u64, fin: bool, data: &[u8]) -> Result<()> {
+    fn response(&mut self, pn: u64, id: u64, offset: u64, fin: bool, data: &[u8]) -> Result<()> {
+        self.response_timed(pn, id, offset, fin, data, None, Instant::now)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn response_timed(
+        &mut self,
+        _pn: u64,
+        id: u64,
+        offset: u64,
+        fin: bool,
+        data: &[u8],
+        latency: Option<&mut burst_latency::Ledger>,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<()> {
         ensure!(
             id >= self.first && (id - self.first).is_multiple_of(4),
             "unexpected stream {id}"
@@ -71,6 +85,9 @@ impl Batch {
             offset == 0 && fin && data == RESPONSE,
             "wrong response bytes or incomplete FIN"
         );
+        if let Some(latency) = latency {
+            latency.complete(id, now())?;
+        }
         self.seen[i / 64] |= 1 << (i % 64);
         self.completed += 1;
         Ok(())
@@ -120,6 +137,7 @@ struct Peer {
     received_datagrams: u64,
     fence: Fence,
     queue_audit: Option<std::fs::File>,
+    latency: Option<burst_latency::Ledger>,
 }
 impl Peer {
     fn connect(port: u16, window: usize) -> Result<Self> {
@@ -196,6 +214,7 @@ impl Peer {
             received_datagrams,
             fence: Fence::default(),
             queue_audit: None,
+            latency: None,
         };
         let mut control = Vec::new();
         frame::put_stream(&mut control, 2, 0, false, &[0, 4, 0]);
@@ -270,7 +289,15 @@ impl Peer {
                     batch
                         .as_mut()
                         .context("response outside requested batch")?
-                        .response(pn, id, offset, fin, data)?;
+                        .response_timed(
+                            pn,
+                            id,
+                            offset,
+                            fin,
+                            data,
+                            self.latency.as_mut(),
+                            Instant::now,
+                        )?;
                 }
                 Frame::Stream {
                     id: 3,
@@ -551,6 +578,11 @@ impl Peer {
             .transpose()?;
         // iovecs, ciphertext buffers and aligned ancillary storage all outlive
         // this synchronous syscall. UDP sends are atomic; partial sends fail.
+        // All requests in this atomic GSO send share this submission instant.
+        // Each authenticated complete response gets its own clock read.
+        if let Some(latency) = self.latency.as_mut() {
+            latency.send(batch.first, total, Instant::now())?;
+        }
         let sent = unsafe { libc::sendmsg(self.socket.as_raw_fd(), &message, 0) };
         drop(stopped);
         ensure!(
