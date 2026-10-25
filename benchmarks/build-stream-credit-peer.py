@@ -21,6 +21,7 @@ archive = subprocess.check_output(['git', '-C', str(repo), 'archive', REVISION])
 with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     tar.extractall(source, filter='data')
 for src, dest in [('stream-credit-peer-main.rs', 'main.rs'), ('stream-credit-ledger.rs', 'credit_ledger.rs'),
+                  ('stream-credit-control.rs', 'credit_control.rs'),
                   ('udp-socket-evidence.rs', 'udp_evidence.rs')]:
     shutil.copy2(here / src, source / 'src' / dest)
 conn = source / 'src/quic/conn.rs'

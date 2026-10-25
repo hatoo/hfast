@@ -115,3 +115,56 @@ untimed coverage audit, frozen equal-work alternating/reverse comparisons and
 ordinary production H1/H2/H3 latency/throughput guards. Include every upload byte,
 FIN, response and sample; do not report this manual driver's rate as production
 shb throughput. WSL timing noise and broader QUIC recovery limitations remain.
+
+## Coordinated complete uploads
+
+`concurrent_uploads.py` starts exactly two independent producer processes and
+connections. Both finish TLS and report readiness before either receives `start`.
+No HTTP request or body is sent before that barrier. Each terminal report includes
+process CPU time and Linux `CLOCK_MONOTONIC` start/end timestamps, observed only
+at the upload-loop boundaries. TLS, the barrier wait and socket diagnostics are
+outside that interval; per-request latency collection is unchanged. The controller
+uses earliest native start through latest native finish for aggregate throughput,
+retains both producers' samples, and rejects non-overlapping or inconsistent
+intervals. It never sums rates or overlapping durations.
+
+Producers retain their live sockets until the controller sends `exit`. The
+controller checks each process's inode/cookie/capacity/drop evidence and records
+one shared server delta and one namespace interval covering TLS through final
+close. Every successfully received localhost datagram is reconciled against the
+sum of both peers' sends and receives. `OutDatagrams` is recorded separately:
+Linux UDP segmentation can count one send there but several delivered datagrams
+in `InDatagrams`. Unavailable evidence, any unexpected drop, a missing/failed
+producer, or an inconsistent ledger rejects the entire run. All raw output and
+partial completed counts/samples remain on disk, with bounded child cleanup.
+
+Run the strict stress matrix in a private network namespace:
+
+```sh
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' concurrent \
+  python3 benchmarks/concurrent-upload-check.py /path/to/hfast \
+  /tmp/credit-peer/stream-credit-peer /tmp/concurrent-upload-check
+```
+
+The default matrix covers 1/8/32 streams **per producer**, all five schedules,
+and 16,842,759 bytes per upload. `--threads 2 --without-gro --streams 8` exercises
+worker sharing and fallback receive delivery. The script labels its results as
+correctness smoke tests, permits producers to share a CPU on small CI hosts,
+and reports recovered uploads separately when strict benchmark validation fails.
+It never retries a failed case, increases socket buffers, or discards loss.
+
+CI exercises native debug/release tests, independent controlled wire oracles
+(including a complete producer alongside a late corrupted response), aggregate
+clock/ledger mutations, real single-producer buffer overflow, and either child
+exiting, stalling or emitting malformed/oversized output. The high-pressure
+two-producer stress matrix is explicit: it can expose host queue loss and is
+unsuitable as an unconditional clean-throughput CI assertion. Existing full-upload
+single-producer protocol checks remain required.
+
+The native sender busy-polls/yields while waiting, so near-100% producer CPU
+occupancy alone does **not** demonstrate a client bottleneck or lack of throughput
+headroom. Server CPU counters cover the controller interval through terminal
+reports (excluding TLS) and have kernel tick granularity; short runs may report
+zero ticks. Neither CPU evidence nor these fixture changes establish an hfast
+speed improvement. Timing acceptance still requires clean, qualified workloads
+and independent confirmation, including ordinary and fragmented-upload latency.
