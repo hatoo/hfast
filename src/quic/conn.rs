@@ -1546,6 +1546,7 @@ mod tests {
     mod ack_ledger;
     mod datagram_budget;
     mod key_updates;
+    mod receive_headers;
     mod response_recovery;
     mod send_credit;
     mod stream_credit;
