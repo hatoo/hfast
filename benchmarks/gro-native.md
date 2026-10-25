@@ -123,7 +123,12 @@ timers, request bytes and accounting gates are unchanged.
 `run-failure.json` retains the server snapshot before its teardown. If a native
 worker exits first, its stderr contains a `burst_failure` JSON record with the
 original error, phase, partial peer ledgers and its still-owned socket counters
-and raw UDP table. Failure in the first connection's handshake may occur before
+and raw UDP table. Native per-socket drops come from `getsockopt(SO_MEMINFO)` on
+the still-owned descriptor. A namespace-wide `/proc` walk may repeat an inode
+while other sockets are added or removed; that raw table remains diagnostic
+context and is not used to infer the native socket's drop count. Short or failed
+socket-option reads and changed capacity remain unavailable, never zero loss.
+Failure in the first connection's handshake may occur before
 any native peer can be retained; missing/exited/reused/unreadable identities are
 explicitly unavailable, never inferred to have zero drops. Snapshots are not
 atomic. A positive drop count does not establish the sole cause of a failure.
