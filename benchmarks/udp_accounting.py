@@ -228,3 +228,11 @@ def require_clean_run(peer_udp, server_delta, net_delta):
     unexpected = {k: v for k, v in net_delta['counters'].items()
                   if k not in ('InDatagrams', 'OutDatagrams') and v != 0}
     require(not unexpected, f'unexpected namespace UDP counters: {unexpected}')
+
+
+def require_clean_group(peers_udp, server_delta, net_delta):
+    """One shared server/namespace interval, with every producer mandatory."""
+    require(len(peers_udp) == 2, 'two producer UDP ledgers required')
+    for peer in peers_udp:
+        require_clean_peer(peer)
+    require_clean_run(peers_udp[0], server_delta, net_delta)

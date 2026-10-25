@@ -1,6 +1,7 @@
 //! Bounded localhost upload driver, not the production io_uring client.
 #![allow(dead_code)]
 mod clock;
+mod credit_control;
 mod credit_ledger;
 mod quic;
 mod tls;
@@ -92,12 +93,15 @@ struct Peer {
     retries: u64,
     sent_packets: u64,
     received_packets: u64,
+    handshake_sent: u64,
+    handshake_received: u64,
     ack_packets: u64,
     max_ack_ranges: usize,
     max_flights: usize,
     stream_blocked: u64,
     connection_blocked: u64,
     started: Instant,
+    interval: Option<Value>,
 }
 impl Peer {
     fn connect(port: u16, count: usize, size: u64, mode: String) -> Result<Self> {
@@ -127,10 +131,12 @@ impl Peer {
         let mut wire = Vec::with_capacity(1200);
         let mut buf = [0u8; 65536];
         let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut handshake_sent, mut handshake_received) = (0, 0);
         loop {
             wire.clear();
             while conn.poll_transmit(clock::Instant::now(), &mut wire, None)? != 0 {
                 ensure!(socket.send(&wire)? == wire.len(), "partial UDP send");
+                handshake_sent += 1;
                 wire.clear();
             }
             if conn.probe_ready() {
@@ -138,7 +144,10 @@ impl Peer {
             }
             ensure!(Instant::now() < deadline, "handshake timeout");
             match socket.recv(&mut buf) {
-                Ok(n) => conn.handle_datagram(clock::Instant::now(), &mut buf[..n])?,
+                Ok(n) => {
+                    handshake_received += 1;
+                    conn.handle_datagram(clock::Instant::now(), &mut buf[..n])?;
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -207,12 +216,15 @@ impl Peer {
             retries: 0,
             sent_packets: 0,
             received_packets: 0,
+            handshake_sent,
+            handshake_received,
             ack_packets: 0,
             max_ack_ranges: 0,
             max_flights: 0,
             stream_blocked: 0,
             connection_blocked: 0,
             started: Instant::now(),
+            interval: None,
         })
     }
     fn send(&mut self, payload: &[u8]) -> Result<u64> {
@@ -578,12 +590,15 @@ impl Peer {
     fn report(&self, error: Option<String>) -> Value {
         // Freeze duration before any procfs/getsockopt diagnostics. Per-request
         // latency samples were already frozen at completion in the I/O loop.
-        let elapsed_ns = self.started.elapsed().as_nanos() as u64;
+        let elapsed_ns = self.interval.as_ref().map(|i| &i["elapsed_ns"]);
         let udp = udp_evidence::interval(&self.udp_before, &self.socket);
         let prefix = self.prefix.len() as u64;
         json!({"phase": if error.is_some() {"failed"} else {"done"}, "error": error,
             "mode": self.mode, "body_bytes_per_stream": self.body_size,
-            "elapsed_ns": elapsed_ns, "udp": udp,
+            "elapsed_ns": elapsed_ns, "interval": self.interval, "udp": udp,
+            "port": self.socket.local_addr().unwrap().port(),
+            "total_sent_datagrams": self.handshake_sent + self.sent_packets,
+            "total_received_datagrams": self.handshake_received + self.received_packets,
             "completed": self.uploads.iter().filter(|u| u.complete()).count(),
             "latencies_ns": self.uploads.iter().filter_map(|u| u.completed_ns).collect::<Vec<_>>(),
             "streams": self.uploads.iter().enumerate().map(|(i,u)| json!({"id": i * 4,
@@ -631,8 +646,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     ensure!(
-        args.len() == 6,
-        "usage: peer PORT STREAMS BODY_BYTES ordinary|sparse|loss|reorder|pto TIMEOUT_SECONDS"
+        args.len() == 6 || (args.len() == 7 && args[6] == "--controlled"),
+        "usage: peer PORT STREAMS BODY_BYTES ordinary|sparse|loss|reorder|pto TIMEOUT_SECONDS [--controlled]"
     );
     let mut peer = Peer::connect(
         args[1].parse()?,
@@ -640,10 +655,30 @@ fn main() -> Result<()> {
         args[3].parse()?,
         args[4].clone(),
     )?;
-    let result = peer.run(Duration::from_secs(args[5].parse()?));
-    println!(
-        "{}",
-        peer.report(result.as_ref().err().map(|e| format!("{e:#}")))
-    );
+    let timeout = Duration::from_secs(args[5].parse()?);
+    let controlled = args.len() == 7;
+    let result = (|| -> Result<()> {
+        if controlled {
+            credit_control::emit(
+                json!({"phase": "ready", "tls_ready": peer.conn.probe_ready(),
+                "port": peer.socket.local_addr()?.port(), "streams": peer.uploads.len(),
+                "body_bytes_per_stream": peer.body_size, "mode": peer.mode,
+                "sent_data": peer.sent_data, "sent_packets": peer.sent_packets,
+                "udp": udp_evidence::interval(&peer.udp_before, &peer.socket)}),
+            )?;
+            credit_control::command(0, "start", timeout)?;
+        }
+        let start = credit_control::Start::now()?;
+        peer.started = Instant::now();
+        let result = peer.run(timeout);
+        peer.interval = Some(start.finish()?);
+        result
+    })();
+    credit_control::emit(peer.report(result.as_ref().err().map(|e| format!("{e:#}"))))?;
+    if controlled {
+        // Keep the socket alive for the parent's ownership/capacity/drop audit,
+        // even when the upload failed. The terminal report is already retained.
+        credit_control::command(0, "exit", timeout)?;
+    }
     result
 }

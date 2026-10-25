@@ -7,9 +7,11 @@ import argparse
 import asyncio
 import datetime
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
+import time
 
 from aioquic.buffer import Buffer
 from aioquic import tls
@@ -27,45 +29,8 @@ from cryptography.x509.oid import NameOID
 from udp_accounting import (namespace_delta, namespace_snapshot, process_delta,
                             process_snapshot, require_clean_peer, require_clean_run)
 
-RESPONSE = b'\x01\x08\x00\x00\xd9\xf5\x54\x02\x31\x33\x00\x0dHello, World!'
-
-
-def require(condition, message):
-    if not condition:
-        raise AssertionError(message)
-
-
-def expand(ranges):
-    return {pn for lo, hi in ranges for pn in range(lo, hi + 1)}
-
-
-def validate(row, count, size):
-    require(row['phase'] == 'done' and row['error'] is None, f'peer failed: {row.get("error")}')
-    require(row['completed'] == count and len(row['streams']) == count, 'completion count')
-    require(len(row['latencies_ns']) == count and all(x > 0 for x in row['latencies_ns']), 'all latencies')
-    require(row['control_acked'], 'missing control ACK')
-    for i, s in enumerate(row['streams']):
-        require(s['id'] == 4 * i and s['sent'] == s['end'], 'wrong stream extent')
-        require(s['body_acked'] == size and s['acked_ranges'] == [[0, s['end'] - 1]], 'missing upload ACK')
-        require(s['fin_sent'] and s['fin_acked'] and s['response_fin'], 'missing FIN')
-        require(s['response_ranges'] == [[0, len(RESPONSE) - 1]], 'incomplete response')
-        require(s['latency_ns'] == row['latencies_ns'][i], 'latency mismatch')
-    require(row['sent_data'] == 5 + sum(s['end'] for s in row['streams']), 'connection byte count')
-    require(row['sent_data'] <= row['max_data'] and row['max_flights'] <= 64, 'flow/flight limit')
-    seen = expand(row['received_ranges'])
-    acked = expand(row['acked_packet_ranges'])
-    suppressed = expand(row['suppressed_ack_only_ranges'])
-    require(acked == seen - suppressed, 'omitted/invented packet ACK')
-    if row['mode'] == 'sparse':
-        require(row['max_ack_ranges'] >= 2 and len(row['credit_release_history']) == count and all(h[-1][1] >= 10 for h in row['credit_release_history']) and row['sparse_fence_acked'], 'sparse/retry schedule not reached')
-        require(expand(row['withheld_credit_ranges']) <= acked, 'late credit ACK omitted')
-    if row['mode'] == 'pto':
-        require(row['pto_proven'], 'timer recovery during transmit silence not exercised')
-    if row['mode'] in ('loss', 'reorder'):
-        require(row['dropped_credit_packets'] == 2, 'loss schedule not reached')
-    if row['mode'] == 'reorder':
-        require(row['replayed'] and row['duplicate_packets'] >= 2, 'reorder/duplicate schedule not reached')
-    require_clean_peer(row['udp'])
+from stream_credit_reports import RESPONSE, expand, require, validate
+from concurrent_uploads import coordinate
 
 
 class Server(QuicConnectionProtocol):
@@ -165,7 +130,7 @@ def configuration():
     return conf
 
 
-async def independent(peer, output, mode, fault=None):
+async def independent(peer, output, mode, fault=None, controlled=False):
     count, size = 2, 65543
     protocols, failures = [], []
 
@@ -180,11 +145,35 @@ async def independent(peer, output, mode, fault=None):
     server = await serve('127.0.0.1', 0, configuration=configuration(), create_protocol=factory)
     port = server._transport.get_extra_info('sockname')[1]
     process = await asyncio.create_subprocess_exec(str(peer), str(port), str(count), str(size), mode, '3',
+        *(['--controlled'] if controlled else []), stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    name = fault or mode
+    name = (fault or mode) + ('-controlled' if controlled else '')
     print(json.dumps({'case': name, 'event': 'start'}), flush=True)
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), 12)
+        if controlled:
+            ready_bytes = await asyncio.wait_for(process.stdout.readline(), 7)
+            (output / f'{name}.ready').write_bytes(ready_bytes)
+            ready = json.loads(ready_bytes)
+            require(ready['phase'] == 'ready' and ready['tls_ready'], 'missing TLS readiness')
+            require(ready['sent_data'] == ready['sent_packets'] == 0, 'upload before ready')
+            await asyncio.sleep(.05)
+            require(len(protocols) == 1 and protocols[0].tls_done
+                    and not protocols[0].headers and not protocols[0].bodies,
+                    'wire upload before explicit start')
+            start_ns = time.monotonic_ns()
+            process.stdin.write(b'start\n')
+            await process.stdin.drain()
+            stdout = await asyncio.wait_for(process.stdout.readline(), 7)
+            end_ns = time.monotonic_ns()
+            (output / f'{name}.stdout').write_bytes(stdout)
+            process.stdin.write(b'exit\n')
+            extra, stderr = await asyncio.wait_for(process.communicate(), 5)
+            require(not extra, 'trailing controlled report')
+            interval = json.loads(stdout)['interval']
+            require(start_ns <= interval['start_monotonic_ns'] < interval['end_monotonic_ns'] <= end_ns,
+                    'controlled interval includes TLS/barrier or diagnostics')
+        else:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 12)
         (output / f'{name}.stdout').write_bytes(stdout)
         (output / f'{name}.stderr').write_bytes(stderr)
         require(not failures, f'independent server failed: {failures}')
@@ -238,6 +227,43 @@ async def independent(peer, output, mode, fault=None):
             await process.wait()
         server.close()
         loop.set_exception_handler(previous_handler)
+
+
+async def concurrent_wire_failure(peer, output, target):
+    """A complete sibling cannot hide a late corrupted response on either connection."""
+    count, size = 2, 65543
+    protocols, failures = [], []
+
+    def factory(*args, **kwargs):
+        protocol = Server(*args, size=size, count=count,
+                          fault='late-wrong-body' if len(protocols) == target else None,
+                          failures=failures, **kwargs)
+        protocols.append(protocol)
+        return protocol
+
+    case = output / f'concurrent-late-corruption-{target}'
+    case.mkdir()
+    server = await serve('127.0.0.1', 0, configuration=configuration(), create_protocol=factory)
+    port = server._transport.get_extra_info('sockname')[1]
+    cpus = sorted(os.sched_getaffinity(0))
+    try:
+        try:
+            await asyncio.to_thread(coordinate, peer, os.getpid(), port, case,
+                                    [cpus[-1], cpus[-1]], count=count, size=size, timeout=4)
+        except AssertionError as error:
+            require('peer failed:' in str(error), f'wrong rejection: {error}')
+        else:
+            raise AssertionError('corrupted producer accepted')
+        reports = json.loads((case / 'reports.json').read_text())
+        rows = reports['terminal']
+        require(not failures and len(protocols) == 2, f'independent server failure: {failures}')
+        require(len(rows) == 2 and sorted(r['phase'] for r in rows) == ['done', 'failed'], 'lost sibling report')
+        require(sorted(r['completed'] for r in rows) == [1, 2], 'lost completed uploads')
+        require(sorted(len(r['latencies_ns']) for r in rows) == [1, 2], 'lost partial latency samples')
+        require(all(p.bodies == {0: size, 4: size} and p.fins == {0, 4} for p in protocols), 'incomplete wire upload')
+        return dict(case=case.name, expected_failure=True, retained_completed=3, retained_samples=3)
+    finally:
+        server.close()
 
 
 async def hfast_check(peer, binary, output, mode, count, size, threads):
@@ -320,6 +346,13 @@ async def main(args):
         for fault in ('missing-body-ack', 'early-response', 'missing-response', 'missing-response-fin',
                       'wrong-body', 'duplicate-response', 'missing-fin-ack', 'late-wrong-body'):
             cases.append(await independent(args.peer, args.output, 'ordinary', fault))
+        for mode in ('ordinary', 'loss', 'reorder', 'sparse'):
+            cases.append(await independent(args.peer, args.output, mode, controlled=True))
+        for fault in ('missing-body-ack', 'early-response', 'missing-response', 'missing-response-fin',
+                      'wrong-body', 'duplicate-response', 'missing-fin-ack', 'late-wrong-body'):
+            cases.append(await independent(args.peer, args.output, 'ordinary', fault, controlled=True))
+        for target in range(2):
+            cases.append(await concurrent_wire_failure(args.peer, args.output, target))
     if args.server:
         for mode in (args.mode.split(',') if args.mode else ['ordinary', 'loss', 'reorder', 'sparse', 'pto']):
             for count in args.streams:
