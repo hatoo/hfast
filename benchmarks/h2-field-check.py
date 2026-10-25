@@ -124,6 +124,8 @@ def native_oracle(binary, size, pipeline=1, count=2, fault=None, chunk=65536, le
                     send(frame(4, 0, 0, SETTINGS))
                     pending = []
                     block_size = 0
+                    response_decoder = hpack.Decoder()
+                    response_decoder.max_allowed_table_size = 0
                     while True:
                         # EOF is legal only after a complete PING round trip.
                         first = sock.recv(1)
@@ -174,7 +176,10 @@ def native_oracle(binary, size, pipeline=1, count=2, fault=None, chunk=65536, le
                                             (b"content-type", b"text/plain"), (b"content-length", b"13")])
                                         peer.send_data(sid, b"Hello, World!", end_stream=True)
                                         peer.data_to_send()
-                                        replies.append(frame(1, 4, sid, HEADERS) + frame(0, 1, sid, b"Hello, World!"))
+                                        block = (b"\x20" if sid == 1 else b"") + HEADERS
+                                        assert response_decoder.decode(block) == [
+                                            (":status", "200"), ("content-type", "text/plain"), ("content-length", "13")]
+                                        replies.append(frame(1, 4, sid, block) + frame(0, 1, sid, b"Hello, World!"))
                                     pending.clear()
                                     if fault and fault not in ["wrong-ping", "missing-ping", "extra-after-fence"]:
                                         if fault == "body":
@@ -189,8 +194,12 @@ def native_oracle(binary, size, pipeline=1, count=2, fault=None, chunk=65536, le
                                             assert len(replies) >= 2
                                             replies[0], replies[1] = replies[1], replies[0]
                                         elif fault == "missing-fin":
-                                            r = bytearray(replies[0]); r[9 + len(HEADERS) + 4] = 0
+                                            r = bytearray(replies[0]); r[9 + int.from_bytes(r[:3], "big") + 4] = 0
                                             replies[0] = bytes(r)
+                                        elif fault in ["missing-table-update", "wrong-table-update", "duplicate-table-update"]:
+                                            prefix = {"missing-table-update": b"", "wrong-table-update": b"\x21",
+                                                      "duplicate-table-update": b"\x20\x20"}[fault]
+                                            replies[0] = frame(1, 4, 1, prefix + HEADERS) + frame(0, 1, 1, b"Hello, World!")
                                         else:
                                             raise AssertionError(fault)
                                         injected(b"".join(replies))
@@ -274,6 +283,7 @@ def main():
         results += [native_oracle(args.peer, size, pipeline, pipeline + 3, fault)
                     for size in [16_384, 1_048_576] for pipeline in [1, 8, 64]
                     for fault in ["body", "truncated", "duplicate", "missing", "missing-fin",
+                                  "missing-table-update", "wrong-table-update", "duplicate-table-update",
                                   "wrong-ping", "missing-ping", "extra-after-fence"]]
         results += [native_oracle(args.peer, size, pipeline, pipeline + 3, "reordered")
                     for size in [16_384, 1_048_576] for pipeline in [8, 64]]

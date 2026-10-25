@@ -50,6 +50,12 @@ no dynamic table to keep in sync. The response header block is a constant: a
 client that sends `SETTINGS_HEADER_TABLE_SIZE = 0`, or offers a zero-capacity
 QPACK table, forbids the server's encoder from indexing anyway, so a
 static-table blob is all it would be allowed to send.
+When an HTTP/2 client lowers `SETTINGS_HEADER_TABLE_SIZE` below the initial
+4096 bytes, the next response starts with an HPACK size update to zero, after
+the SETTINGS acknowledgment. The unused table then stays at zero under later
+settings changes; subsequent responses use the original static header block.
+The [independent response checks](benchmarks/h2-flow-control-check.py) exercise
+these changes with pipelined requests, fragmented input and blocked bodies.
 
 **The `Date` header.** Every other server here sends it because TechEmpower
 requires it. Nothing pointed at this reads it, and the point of this server is

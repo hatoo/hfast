@@ -5,6 +5,11 @@ HEADERS/CONTINUATION frames of at most 16 KiB. It checks hfast's fixed response
 bytes, stream order, END_STREAM, a final PING and EOF after half-close. It is a
 correctness and benchmark tool; changes between fixture modes are not evidence
 of a server performance improvement.
+The client requests a zero-capacity HPACK table. The first response must include
+the size update to zero; its extra byte is included in each connection's ledger.
+The independent oracle rejects missing, wrong or duplicate initial updates.
+Older hfast binaries that omitted the required update fail this oracle and must
+not be compared by relaxing the response or byte-accounting checks.
 
 Build and independently validate it:
 

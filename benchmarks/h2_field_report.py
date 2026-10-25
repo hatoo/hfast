@@ -20,7 +20,8 @@ def validate_report(report, size, chunk, count, connections, pipeline):
             credit = 0
     wire_size = size + 9 * ((size + 16383) // 16384)
     tx = 65 + count * wire_size + updates * 13
-    rx = 47 + count * (18 + len(HEADERS) + 13)
+    # One HPACK size-update byte per connection, in the first response only.
+    rx = 48 + count * (18 + len(HEADERS) + 13)
     writes = 4 + count * ((wire_size + chunk - 1) // chunk) + updates
     assert len(report["peers"]) == connections
     for i, peer in enumerate(report["peers"]):

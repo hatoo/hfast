@@ -5,6 +5,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 const HEADERS: &[u8] = b"\x88\x0f\x10\x0atext/plain\x0f\x0d\x02\x31\x33";
+const FIRST_HEADERS: &[u8] = b"\x20\x88\x0f\x10\x0atext/plain\x0f\x0d\x02\x31\x33";
 const SETTINGS: &[u8] = &[0, 3, 127, 255, 255, 255, 0, 4, 127, 255, 255, 255];
 const MAX_PIPELINE: usize = 64;
 const CREDIT_BATCH: u32 = 32_768;
@@ -177,7 +178,9 @@ fn main() {
                         peer.write(&wire, chunk);
                     }
                     for &(stream, time) in &pending {
-                        peer.expect(1, 4, stream, HEADERS);
+                        // Our zero-capacity SETTINGS requires a size update
+                        // in the first response, even with no dynamic entries.
+                        peer.expect(1, 4, stream, if stream == 1 { FIRST_HEADERS } else { HEADERS });
                         peer.expect(0, 1, stream, b"Hello, World!");
                         latencies.push(time.elapsed().as_nanos() as u64);
                         credit += 13;
