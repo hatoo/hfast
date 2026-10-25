@@ -16,6 +16,7 @@ import subprocess
 import time
 
 import burst_failure as failure
+import burst_buffer
 
 ERROR_COUNTERS = ('InErrors', 'RcvbufErrors', 'SndbufErrors', 'NoPorts',
                   'InCsumErrors', 'MemErrors')
@@ -291,7 +292,9 @@ def coordinate(peer, server_pid, port, output, cpus, batch, datagrams, batches, 
 
 
 def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
-        cycles=4, warmup=64, gro=True, timeout=60, allow_shared_cpus=False):
+        cycles=4, warmup=64, gro=True, timeout=60, allow_shared_cpus=False,
+        udp_receive_buffer=0):
+    buffer_flags = burst_buffer.flags(udp_receive_buffer)
     require(len(cpus) in (1, 4), 'use one or four producers')
     require(all(core in os.sched_getaffinity(0) for core in cpus), 'unavailable client CPU')
     require(allow_shared_cpus or (0 in os.sched_getaffinity(0)
@@ -310,10 +313,12 @@ def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
         port = reservation.getsockname()[1]
     binary = server if gro else Path(__file__).with_name('without-udp-gro.py')
     command = [str(binary), '--threads', '1', '--tcp', '0', '--quic', str(port),
-               '--max-streams', str(2 * batch * datagrams)]
+               '--max-streams', str(2 * batch * datagrams), *buffer_flags]
     manifest = dict(inputs=inputs, server_command=command, client_cpus=cpus, batch=batch,
                     datagrams=datagrams, batches=batches, cycles=cycles, warmup=warmup,
-                    gro=gro, timeout=timeout, smoke=allow_shared_cpus)
+                    gro=gro, timeout=timeout, smoke=allow_shared_cpus,
+                    udp_receive_buffer_requested=udp_receive_buffer,
+                    receive_buffer_evidence='receive-buffer.json')
     with (output / 'manifest.json').open('x') as file:
         file.write(json.dumps(manifest, indent=2) + '\n')
     with (output / 'server.log').open('x') as log:
@@ -323,9 +328,14 @@ def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
         try:
             time.sleep(.2)
             require(process.poll() is None, 'server failed at startup')
+            capacity_before = burst_buffer.observe(process.pid, port, udp_receive_buffer)
+            with (output / 'receive-buffer.json').open('x') as evidence:
+                evidence.write(json.dumps(capacity_before, indent=2) + '\n')
             result = coordinate(peer, process.pid, port, output, cpus, batch, datagrams,
                                 batches, cycles, warmup, gro, timeout)
             require(process.poll() is None, 'server exited during measurement')
+            result['udp_receive_buffer'] = burst_buffer.interval(
+                capacity_before, burst_buffer.observe(process.pid, port, udp_receive_buffer))
         except BaseException as error:
             primary = error
             failure.write_failure(output, 'run-failure', error,
@@ -351,7 +361,8 @@ def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
     require(inputs == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (server, peer)},
             'input binary changed')
     result.update(inputs=inputs, server_command=command, smoke=allow_shared_cpus)
-    (output / 'result.json').open('x').write(json.dumps(result, indent=2) + '\n')
+    with (output / 'result.json').open('x') as file:
+        file.write(json.dumps(result, indent=2) + '\n')
     return result
 
 
@@ -364,9 +375,12 @@ if __name__ == '__main__':
                           ('cycles', 4), ('warmup', 64)]:
         parser.add_argument('--' + name, type=int, default=default)
     parser.add_argument('--without-gro', action='store_true')
+    parser.add_argument('--udp-receive-buffer', type=burst_buffer.argument, default=0,
+                        help='server receive-buffer request in bytes (0 keeps the default)')
     args = parser.parse_args()
     result = run(args.server, args.peer, args.output, list(map(int, args.client_cpus.split(','))),
                  batch=args.batch, datagrams=args.datagrams, batches=args.batches,
-                 cycles=args.cycles, warmup=args.warmup, gro=not args.without_gro)
+                 cycles=args.cycles, warmup=args.warmup, gro=not args.without_gro,
+                 udp_receive_buffer=args.udp_receive_buffer)
     print(json.dumps({key: result[key] for key in ('producers', 'measured_requests', 'completed',
           'seconds', 'requests_per_second', 'server_cores', 'cpu_ns_per_request', 'errors')}))

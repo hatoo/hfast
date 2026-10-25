@@ -204,12 +204,17 @@ jobs:
         run: |
           rustfmt --edition 2024 --config skip_children=true --check benchmarks/burst-worker.rs
           python -m unittest discover -s benchmarks -p test_burst_workers.py -v
+          python -m unittest discover -s benchmarks -p test_burst_buffer.py -v
       - name: Concurrent native producers with GRO and fallback delivery
         run: |
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' native-producers \
             "$(command -v python)" benchmarks/burst-worker-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
             "$RUNNER_TEMP/concurrent-producer-smoke"
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' native-producers-buffer \
+            "$(command -v python)" benchmarks/burst-worker-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
+            "$RUNNER_TEMP/concurrent-producer-buffer-smoke" --udp-receive-buffer 4194304
       - name: Native burst failure snapshots, socket overflow and bounded cleanup
         run: |
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' burst-faults \
@@ -224,6 +229,7 @@ jobs:
           path: |
             ${{ runner.temp }}/burst-faults
             ${{ runner.temp }}/concurrent-producer-smoke
+            ${{ runner.temp }}/concurrent-producer-buffer-smoke
           retention-days: 7
       - name: Fixed CRYPTO churn transport
         uses: actions/checkout@v5

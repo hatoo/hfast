@@ -111,6 +111,26 @@ explicitly. Keep every workload setting fixed, alternate order and repeat with
 Concurrent success does not establish general QUIC loss-recovery correctness or
 remove the existing WSL measurement uncertainty.
 
+Both controllers accept `--udp-receive-buffer BYTES` (0 through 4194304).
+The default 0 leaves the server command unchanged. A positive value is passed
+identically to both compared servers, including legacy mode and GRO denial.
+The request is in `manifest.json`; an exclusive `receive-buffer.json` (or
+`*.receive-buffer.json` in legacy mode) records the live server socket before
+warmup. Results include before/after observations with stable process, socket
+and namespace identities and effective receive capacity. All observations are
+outside measured phases. Linux reports doubled SO_RCVBUF accounting; a capacity
+below twice the request is explicitly marked `below_doubled_request`, which may
+mean a host cap or a request the server could not apply. Missing or changed
+evidence stays unavailable with a null effective capacity.
+
+The comparator excludes unequal or unavailable effective capacities, including
+capacity changes between pairs. Different receive buffers define different
+workloads; they cannot establish an optimization gain. For example, add
+`--udp-receive-buffer 4194304` to an otherwise fixed comparison only after a
+baseline guard succeeds at that setting. Keep the request and observed capacity
+fixed in the reversed confirmation. This option changes no production default,
+client buffer, host setting, protocol validation or loss/queue gate.
+
 Failed concurrent runs preserve `manifest.json`, raw stdout/stderr for each
 worker, and `failure.json`/`failure.txt` before the controller kills workers.
 The JSON includes initial, last-success and failure namespace counters; full and
