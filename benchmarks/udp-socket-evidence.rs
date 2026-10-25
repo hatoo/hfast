@@ -3,6 +3,9 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{fs, net::UdpSocket, os::fd::AsRawFd, os::unix::fs::MetadataExt};
 
+// Keep the raw-table parser as a negative oracle for the retained failure dump.
+// Duplicate rows still make that separate evidence ambiguous.
+#[cfg(test)]
 fn drops_for_inode(table: &str, inode: u64) -> Result<u64> {
     let mut lines = table.lines();
     let header = lines.next().context("missing UDP header")?;
@@ -48,23 +51,49 @@ fn receive_capacity(socket: &UdpSocket) -> Result<i32> {
     Ok(capacity)
 }
 
+// Linux UAPI sock_diag.h: SO_MEMINFO returns u32 fields through SK_MEMINFO_DROPS.
+const MEMORY_FIELDS: usize = libc::SK_MEMINFO_DROPS as usize + 1;
+
+fn memory_drops(memory: &[u32; MEMORY_FIELDS], length: usize, capacity: i32) -> Result<u64> {
+    ensure!(length == size_of_val(memory), "short SO_MEMINFO");
+    ensure!(
+        capacity > 0 && memory[libc::SK_MEMINFO_RCVBUF as usize] == capacity as u32,
+        "SO_MEMINFO receive capacity changed"
+    );
+    Ok(u64::from(memory[libc::SK_MEMINFO_DROPS as usize]))
+}
+
+fn socket_drops(socket: &UdpSocket, capacity: i32) -> Result<u64> {
+    let mut memory = [0u32; MEMORY_FIELDS];
+    let mut length = size_of_val(&memory) as libc::socklen_t;
+    // SAFETY: socket stays alive and memory/length are writable for their sizes.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            memory.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("SO_MEMINFO");
+    }
+    memory_drops(&memory, length as usize, capacity)
+}
+
 pub fn snapshot(socket: &UdpSocket) -> Value {
     let mut row = json!({"status": "unavailable", "error": null,
         "inode": null, "rcvbuf": null, "drops": null});
     let result = (|| -> Result<()> {
         let inode = fs::metadata(format!("/proc/self/fd/{}", socket.as_raw_fd()))?.ino();
         row["inode"] = inode.into();
-        row["rcvbuf"] = receive_capacity(socket)?.into();
-        let family = if socket.local_addr()?.is_ipv4() {
-            "udp"
-        } else {
-            "udp6"
-        };
-        row["drops"] = drops_for_inode(
-            &fs::read_to_string(format!("/proc/self/net/{family}"))?,
-            inode,
-        )?
-        .into();
+        let capacity = receive_capacity(socket)?;
+        row["rcvbuf"] = capacity.into();
+        // A /proc UDP table walk can repeat rows when unrelated sockets change
+        // between reads. Query this still-owned descriptor instead; no retry or
+        // interpretation of ambiguous namespace-wide evidence is needed.
+        row["drops"] = socket_drops(socket, capacity)?.into();
         Ok(())
     })();
     match result {
@@ -123,6 +152,91 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_or_changed_memory_is_not_zero_loss() {
+        let mut memory = [0u32; MEMORY_FIELDS];
+        let bytes = size_of_val(&memory);
+        memory[libc::SK_MEMINFO_RCVBUF as usize] = 8192;
+        assert_eq!(memory_drops(&memory, bytes, 8192).unwrap(), 0);
+        for length in 0..bytes {
+            assert!(memory_drops(&memory, length, 8192).is_err());
+        }
+        assert!(memory_drops(&memory, bytes + 4, 8192).is_err());
+        for capacity in [-1, 0, 4096, 16384] {
+            assert!(memory_drops(&memory, bytes, capacity).is_err());
+        }
+        memory[libc::SK_MEMINFO_DROPS as usize] = u32::MAX;
+        assert_eq!(
+            memory_drops(&memory, bytes, 8192).unwrap(),
+            u64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn snapshots_survive_concurrent_same_bucket_socket_churn() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::sync::Barrier;
+
+        let bind = |port: u16| -> UdpSocket {
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            socket.set_reuse_address(true).unwrap();
+            socket
+                .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+                .unwrap();
+            socket.into()
+        };
+        let target = bind(0);
+        let port = target.local_addr().unwrap().port();
+        let before = snapshot(&target);
+        assert_eq!(before["status"], "available", "{before}");
+        // Finish fallible setup before either thread waits at the barrier.
+        let mut held: Vec<_> = (0..96).map(|_| bind(port)).collect();
+        let start = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // More than one /proc seq_file page in the target's hash bucket.
+                // The live target is never closed, rebound or sent any traffic.
+                start.wait();
+                for index in 0..20_000 {
+                    held[index % 96] = bind(port);
+                }
+            });
+            start.wait();
+            for _ in 0..2000 {
+                let report = interval(&before, &target);
+                assert_eq!(report["status"], "available", "{report}");
+                assert_eq!(report["drops"], 0);
+            }
+        });
+    }
+
+    #[test]
+    fn ipv6_and_connected_sockets_keep_their_own_drop_counters() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let socket = UdpSocket::bind(address).unwrap();
+            let other = UdpSocket::bind(address).unwrap();
+            socket.connect(other.local_addr().unwrap()).unwrap();
+            let before = snapshot(&socket);
+            assert_eq!(before["status"], "available", "{before}");
+            assert!(before["rcvbuf"].as_i64().unwrap() > 0);
+            let report = interval(&before, &socket);
+            assert_eq!(report["status"], "available", "{report}");
+            assert_eq!(report["drops"], 0);
+            for (key, value) in [
+                ("inode", json!(0)),
+                ("rcvbuf", json!(0)),
+                ("drops", json!(u32::MAX)),
+                ("drops", Value::Null),
+            ] {
+                let mut changed = before.clone();
+                changed[key] = value;
+                let rejected = interval(&changed, &socket);
+                assert_eq!(rejected["status"], "unavailable", "{rejected}");
+                assert!(rejected["drops"].is_null());
+            }
+        }
+    }
+
+    #[test]
     fn live_socket_capacity_and_zero_loss_are_observed() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let before = snapshot(&socket);
@@ -175,6 +289,9 @@ mod tests {
                 payload.len()
             );
         }
+        let queued = interval(&before, &receiver);
+        assert_eq!(queued["status"], "available", "{queued}");
+        assert!(queued["drops"].as_u64().unwrap() > 0);
         let mut received = 0;
         let mut buf = [0; 513];
         loop {
@@ -191,6 +308,7 @@ mod tests {
         let report = interval(&before, &receiver);
         assert_eq!(report["status"], "available", "{report}");
         assert_eq!(report["drops"], 1024 - received);
+        assert_eq!(report["drops"], queued["drops"]);
         assert_eq!(snapshot(&sender)["drops"], 0);
     }
 }
