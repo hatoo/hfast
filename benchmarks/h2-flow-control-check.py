@@ -152,6 +152,97 @@ def stream_zero(port, fragmented):
         peer.close()
 
 
+def header_table(port, fragmented):
+    replies = 0
+    for size in [0, 1, 31, 32, 127, 128, 4095, 4096, 8192, 0xffffffff]:
+        peer = Peer(port, fragmented=fragmented)
+        try:
+            # Include both a previously used encoder and a reduction before
+            # the first response. SETTINGS ACK must precede the affected block.
+            if size % 2:
+                stream = peer.request()
+                peer.exchange()
+                peer.expect(stream, 13, True)
+                replies += 1
+            peer.client.update_settings({h2.settings.SettingCodes.HEADER_TABLE_SIZE: size})
+            streams = [peer.request(large=fragmented and i == 0) for i in range(17)]
+            peer.exchange()
+            for stream in streams:
+                peer.expect(stream, 13, True)
+            replies += len(streams)
+            assert peer.client.decoder.header_table_size <= size
+            assert not peer.client.decoder.header_table.dynamic_entries
+            # Increasing the permitted size does not require the encoder to
+            # grow its empty table. Further reductions must remain decodable.
+            for following in [0xffffffff, 0, 4096, 1, 0]:
+                peer.client.update_settings({h2.settings.SettingCodes.HEADER_TABLE_SIZE: following})
+                stream = peer.request()
+                peer.exchange()
+                peer.expect(stream, 13, True)
+                replies += 1
+                assert peer.client.decoder.header_table_size <= following
+            assert peer.settings_acks == 8
+        finally:
+            peer.close()
+    return {"case": "header-table", "fragmented": fragmented, "replies": replies}
+
+
+def header_table_order(port, fragmented):
+    replies = 0
+    for same_frame in [False, True]:
+        peer = Peer(port, fragmented=fragmented)
+        try:
+            for sizes in [[4096, 32, 4096], [8192, 0, 0xffffffff], [0, 0, 4096]]:
+                if same_frame:
+                    # Register one pending setting with hyper-h2, then send
+                    # duplicate identifiers in that SETTINGS frame. Its last
+                    # value is authoritative; the encoder must also remember
+                    # the smaller capacity it chose between response blocks.
+                    peer.client.update_settings({h2.settings.SettingCodes.HEADER_TABLE_SIZE: sizes[-1]})
+                    queued = peer.client.data_to_send()
+                    assert len(queued) == 15 and queued[3] == 4
+                    payload = b"".join(b"\x00\x01" + size.to_bytes(4, "big") for size in sizes)
+                    peer.send(frame(4, 0, payload))
+                else:
+                    for size in sizes:
+                        peer.client.update_settings({h2.settings.SettingCodes.HEADER_TABLE_SIZE: size})
+                streams = [peer.request() for _ in range(3)]
+                peer.exchange()
+                for stream in streams:
+                    peer.expect(stream, 13, True)
+                replies += len(streams)
+                # hfast deliberately keeps its unused table at zero after
+                # shrinking it. This also catches a lost intermediate minimum.
+                assert peer.client.decoder.header_table_size == 0
+            assert peer.settings_acks == (5 if same_frame else 11)
+        finally:
+            peer.close()
+    return {"case": "header-table-order", "fragmented": fragmented, "replies": replies}
+
+
+def header_table_pending(port, fragmented):
+    peer = Peer(port, initial=0, fragmented=fragmented)
+    try:
+        first = peer.request()
+        peer.exchange()
+        peer.expect(first, 0)
+        peer.client.update_settings({h2.settings.SettingCodes.HEADER_TABLE_SIZE: 0})
+        peer.grant(1, first)
+        second = peer.request(large=fragmented)
+        peer.exchange()
+        peer.expect(first, 1)
+        peer.expect(second, 0)
+        peer.grant(12, first)
+        peer.grant(13, second)
+        peer.exchange()
+        peer.expect(first, 13, True)
+        peer.expect(second, 13, True)
+        assert peer.client.decoder.header_table_size == 0
+        return {"case": "header-table-pending", "fragmented": fragmented, "replies": 2}
+    finally:
+        peer.close()
+
+
 def connection_credit(port, fragmented):
     peer = Peer(port, fragmented=fragmented)
     try:
@@ -478,7 +569,7 @@ def sparse_readiness(port, fragmented):
         peer.close()
 
 
-def backpressure(port, fragmented):
+def backpressure(port, fragmented, table_change=False):
     # Complete valid responses exceed the TCP send and receive buffers; queued
     # DATA and GOAWAY must survive partial socket writes. For this large batch,
     # hyperframe/hpack decode the wire directly: hyper-h2's active-stream count
@@ -490,7 +581,9 @@ def backpressure(port, fragmented):
                                          (":authority", "localhost"), (":path", "/")])
         wire = (b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, b"")
                 + frame(8, 0, (count * 13).to_bytes(4, "big"))
-                + b"".join(frame(1, i * 2 + 1, headers, flags=5) for i in range(count))
+                + b"".join((frame(4, 0, b"\x00\x01\x00\x00\x00\x00")
+                            if table_change and i == count // 2 else b"")
+                           + frame(1, i * 2 + 1, headers, flags=5) for i in range(count))
                 + frame(8, 0, bytes(4)))
         failures = []
 
@@ -532,6 +625,9 @@ def backpressure(port, fragmented):
                     at += 9 + length
                     if received.type == 4:
                         settings.append("ACK" in received.flags)
+                        if table_change and len(settings) == 3:
+                            assert replies == count // 2 and not awaiting_body
+                            decoder.max_allowed_table_size = 0
                     elif received.type == 1:
                         assert not awaiting_body and not goaways
                         assert received.stream_id == replies * 2 + 1
@@ -554,7 +650,8 @@ def backpressure(port, fragmented):
                         raise AssertionError(received)
                 del carry[:at]
             assert not carry and not awaiting_body and replies == count
-            assert settings == [False, True] and goaways == [(count * 2 - 1, 1)]
+            assert settings == [False, True] + ([True] if table_change else [])
+            assert goaways == [(count * 2 - 1, 1)]
             assert credit == 65535
             sender.join(timeout=15)
             assert not sender.is_alive() and not failures, failures
@@ -562,14 +659,19 @@ def backpressure(port, fragmented):
             if sender.is_alive():
                 sock.shutdown(socket.SHUT_RDWR)
                 sender.join(timeout=5)
-        return {"case": "backpressure", "replies": count + 1,
+        return {"case": "header-table-backpressure" if table_change else "backpressure", "replies": count + 1,
                 "goaway_after_bodies": True, "eof": True}
+
+
+def header_table_backpressure(port, fragmented):
+    return backpressure(port, fragmented, table_change=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--case", choices=["stream-zero", "connection", "settings",
+                                          "header-table", "header-table-order", "header-table-pending", "header-table-backpressure",
                                           "invalid", "pending-queue", "connection-trickle", "sparse-readiness", "backpressure",
                                           "all"], default="all")
     args = parser.parse_args()
@@ -591,6 +693,9 @@ def main():
                     assert time.monotonic() < deadline, "server did not start"
                     time.sleep(0.02)
             checks = {"stream-zero": stream_zero, "connection": connection_credit,
+                      "header-table": header_table, "header-table-order": header_table_order,
+                      "header-table-pending": header_table_pending,
+                      "header-table-backpressure": header_table_backpressure,
                       "settings": settings_and_resets, "invalid": invalid_updates,
                       "pending-queue": pending_queue,
                       "connection-trickle": connection_trickle,
@@ -598,7 +703,7 @@ def main():
                       "backpressure": backpressure}
             results = [check(port, fragmented) for name, check in checks.items()
                        if args.case in [name, "all"]
-                       for fragmented in ([False] if name == "backpressure" else [False, True])]
+                       for fragmented in ([False] if name.endswith("backpressure") else [False, True])]
             print(json.dumps(results, indent=2))
         finally:
             server.terminate()

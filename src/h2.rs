@@ -39,6 +39,8 @@ const FLAG_END_HEADERS: u8 = 0x4;
 /// `0x0f 0x10 0x0a ..` literal without indexing, name 31 (content-type)
 /// `0x0f 0x0d 0x02 ..` literal without indexing, name 28 (content-length)
 const HEADER_BLOCK: &[u8] = b"\x88\x0f\x10\x0atext/plain\x0f\x0d\x02\x31\x33";
+// HPACK size update to zero, before the same static response fields.
+const ZERO_TABLE_HEADER_BLOCK: &[u8] = b"\x20\x88\x0f\x10\x0atext/plain\x0f\x0d\x02\x31\x33";
 const BODY: &[u8] = b"Hello, World!";
 
 /// Generous request stream limits. These are independent of the peer's receive
@@ -50,12 +52,23 @@ const SERVER_SETTINGS: &[u8] = &[
 ];
 const SETTINGS_ACK: &[u8] = &[0, 0, 0, SETTINGS, FLAG_ACK_OR_END_STREAM, 0, 0, 0, 0];
 
+/// The encoder never inserts entries, but HPACK still requires a size update
+/// after the peer lowers its limit (RFC 7541 Section 4.2). Once told, zero is
+/// valid under every later limit, so neither storage nor integer coding is needed.
+#[derive(PartialEq)]
+enum HeaderTable {
+    Default,
+    ZeroPending,
+    Zero,
+}
+
 pub struct Conn {
     /// Stream whose header block is waiting for END_HEADERS, or zero. Only
     /// one block can be open on a connection; its payload need not be retained.
     header_stream: u32,
     header_is_request: bool,
     closing: bool,
+    header_table: HeaderTable,
     /// Consumed DATA payload not yet returned as connection credit. Always
     /// below RECEIVE_CREDIT_BATCH, so it fits beside the two boolean fields.
     /// The remaining receive window is INITIAL_WINDOW minus this value;
@@ -90,6 +103,7 @@ impl Conn {
             header_stream: 0,
             header_is_request: false,
             closing: false,
+            header_table: HeaderTable::Default,
             receive_uncredited: 0,
             last_stream: 0,
             send_window: INITIAL_WINDOW,
@@ -206,6 +220,9 @@ impl Conn {
                             let id = u16::from_be_bytes([setting[0], setting[1]]);
                             let value = u32::from_be_bytes(setting[2..].try_into().unwrap());
                             match id {
+                                1 if value < 4096 && self.header_table == HeaderTable::Default => {
+                                    self.header_table = HeaderTable::ZeroPending;
+                                }
                                 4 => {
                                     if value > MAX_WINDOW {
                                         return self.fail(out, buf.len(), FLOW_CONTROL_ERROR);
@@ -312,19 +329,27 @@ impl Conn {
     }
 
     fn respond(&mut self, out: &mut Vec<u8>, stream: u32) {
-        if self.send_window >= BODY.len() as u32 && self.initial_window >= BODY.len() as u32 {
+        if self.header_table == HeaderTable::ZeroPending {
+            self.header_table = HeaderTable::Zero;
+            self.respond_with_credit(out, stream, ZERO_TABLE_HEADER_BLOCK);
+        } else if self.send_window >= BODY.len() as u32 && self.initial_window >= BODY.len() as u32
+        {
             self.send_window -= BODY.len() as u32;
             respond(out, stream);
         } else {
-            headers(out, stream);
-            let mut response = Pending {
-                stream,
-                window: self.initial_window as i32,
-                sent: 0,
-            };
-            if !send_body(out, &mut self.send_window, &mut response) {
-                self.pending.push_back(response);
-            }
+            self.respond_with_credit(out, stream, HEADER_BLOCK);
+        }
+    }
+
+    fn respond_with_credit(&mut self, out: &mut Vec<u8>, stream: u32, block: &[u8]) {
+        headers(out, stream, block);
+        let mut response = Pending {
+            stream,
+            window: self.initial_window as i32,
+            sent: 0,
+        };
+        if !send_body(out, &mut self.send_window, &mut response) {
+            self.pending.push_back(response);
         }
     }
 
@@ -476,10 +501,10 @@ fn send_body(out: &mut Vec<u8>, connection_window: &mut u32, response: &mut Pend
     done
 }
 
-fn headers(out: &mut Vec<u8>, stream: u32) {
-    out.extend_from_slice(&[0, 0, HEADER_BLOCK.len() as u8, HEADERS, FLAG_END_HEADERS]);
+fn headers(out: &mut Vec<u8>, stream: u32, block: &[u8]) {
+    out.extend_from_slice(&[0, 0, block.len() as u8, HEADERS, FLAG_END_HEADERS]);
     out.extend_from_slice(&stream.to_be_bytes());
-    out.extend_from_slice(HEADER_BLOCK);
+    out.extend_from_slice(block);
 }
 
 #[inline(always)]
@@ -522,6 +547,9 @@ mod flow_control_tests;
 
 #[cfg(test)]
 mod receive_credit_tests;
+
+#[cfg(test)]
+mod header_table_tests;
 
 #[cfg(test)]
 mod tests {
