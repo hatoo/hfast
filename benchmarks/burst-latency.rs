@@ -75,12 +75,27 @@ impl Ledger {
         })
     }
 
-    fn ns(&self, now: Instant) -> Result<u64> {
+    pub fn ns(&self, now: Instant) -> Result<u64> {
         Ok(now
             .checked_duration_since(self.epoch)
             .context("latency clock reversed")?
             .as_nanos()
             .try_into()?)
+    }
+
+    // Read before export sorts the samples. Completion order is checked above.
+    pub fn bounds(&self) -> Result<(u64, u64)> {
+        ensure!(self.end_ns.is_some(), "unfinished latency bounds");
+        Ok((
+            self.samples
+                .first()
+                .context("missing first sample")?
+                .sent_ns,
+            self.samples
+                .last()
+                .context("missing last sample")?
+                .complete_ns,
+        ))
     }
 
     pub fn send(&mut self, first: u64, count: usize, now: Instant) -> Result<()> {
@@ -203,6 +218,7 @@ mod peer_tests {
     fn every_authenticated_response_has_its_own_clock_and_stream_identity() {
         let now = Instant::now();
         let mut l = Ledger::new(0, 3, 128, 4, now).unwrap();
+        assert!(l.bounds().is_err());
         let mut b = crate::Batch::new(128, 4);
         l.send(128, 4, now + Duration::from_nanos(10)).unwrap();
         for (id, ns) in [(140, 20), (128, 23), (136, 31), (132, 40)] {
@@ -213,6 +229,7 @@ mod peer_tests {
         }
         b.complete().unwrap();
         l.finish(now + Duration::from_nanos(50)).unwrap();
+        assert_eq!(l.bounds().unwrap(), (10, 40));
         assert_eq!(
             l.samples
                 .iter()

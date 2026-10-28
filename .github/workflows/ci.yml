@@ -235,6 +235,7 @@ jobs:
           python -m unittest discover -s benchmarks -p test_burst_workers.py -v
           python -m unittest discover -s benchmarks -p test_burst_buffer.py -v
           python -m unittest discover -s benchmarks -p test_burst_latency.py -v
+          python -m unittest discover -s benchmarks -p test_burst_schedule.py -v
       - name: Concurrent native producers with GRO and fallback delivery
         run: |
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' native-producers \
@@ -257,6 +258,12 @@ jobs:
             "$(command -v python)" benchmarks/burst-latency-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
             "$RUNNER_TEMP/burst-latency"
+      - name: Fixed asymmetric native schedules and complete-phase overlap
+        run: |
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' burst-schedule \
+            "$(command -v python)" benchmarks/burst-schedule-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
+            "$RUNNER_TEMP/burst-schedule"
       - name: Preserve native burst failure evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -267,6 +274,7 @@ jobs:
             ${{ runner.temp }}/concurrent-producer-smoke
             ${{ runner.temp }}/concurrent-producer-buffer-smoke
             ${{ runner.temp }}/burst-latency
+            ${{ runner.temp }}/burst-schedule
           retention-days: 7
       - name: Fixed CRYPTO churn transport
         uses: actions/checkout@v5
