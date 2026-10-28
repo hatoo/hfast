@@ -1,0 +1,6 @@
+[
+  {"role": "hot", "batch": 32, "datagrams": 32, "batches": 4096, "delay_ns": 5000000},
+  {"role": "cold", "batch": 1, "datagrams": 1, "batches": 16384, "delay_ns": 0},
+  {"role": "cold", "batch": 1, "datagrams": 1, "batches": 16384, "delay_ns": 0},
+  {"role": "cold", "batch": 1, "datagrams": 1, "batches": 16384, "delay_ns": 0}
+]

@@ -8,6 +8,52 @@ mod udp_socket_evidence;
 
 const MAX_BATCHES: usize = 1 << 20;
 
+fn monotonic_ns() -> Result<u64> {
+    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+    ensure!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } == 0,
+        "monotonic clock read failed"
+    );
+    ensure!(
+        time.tv_sec >= 0 && (0..1_000_000_000).contains(&time.tv_nsec),
+        "invalid clock"
+    );
+    (time.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|n| n.checked_add(time.tv_nsec as u64))
+        .context("clock overflow")
+}
+
+fn scheduled_command(line: &str, phase: usize, batches: usize, now: u64) -> Result<u64> {
+    let (command, deadline) = line
+        .rsplit_once(' ')
+        .context("missing scheduled deadline")?;
+    ensure!(
+        parse_command(command, phase)? == Some(batches),
+        "scheduled work mismatch"
+    );
+    let deadline: u64 = deadline.parse()?;
+    ensure!(
+        deadline > now && deadline - now <= 1_000_000_000,
+        "scheduled deadline expired or too far ahead"
+    );
+    Ok(deadline)
+}
+
+fn wait_until(deadline: u64) -> Result<()> {
+    loop {
+        let now = monotonic_ns()?;
+        if now >= deadline {
+            return Ok(());
+        }
+        if deadline - now > 100_000 {
+            std::thread::sleep(Duration::from_nanos(deadline - now - 100_000));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 fn command_line() -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut bytes = Vec::new();
@@ -93,12 +139,15 @@ fn run_phase(
     batches: usize,
     batch: usize,
     datagrams: usize,
+    run_at: Option<u64>,
 ) -> Result<()> {
     let first = active.completed;
     let sent = active.sent_datagrams;
     let messages = active.sent_messages;
     let received = active.received_datagrams;
+    let clock_before = monotonic_ns()?;
     let start = Instant::now();
+    let clock_after = monotonic_ns()?;
     let mut work = BurstWorkspace::new(datagrams);
     work.prepare(active.next_stream, batch, &active.request);
     for i in 0..batches {
@@ -136,6 +185,18 @@ fn run_phase(
     });
     if let Some(latency) = &active.latency {
         report["latency"] = latency.metadata();
+        let offset = latency.ns(start)?;
+        let (first_sent, last_complete) = latency.bounds()?;
+        report["phase_clock"] = json!({
+            "clock": "CLOCK_MONOTONIC",
+            "namespace": std::fs::read_link("/proc/self/ns/time")?.to_string_lossy(),
+            "run_at_ns": run_at,
+            "start_ns": clock_before,
+            "epoch_low_ns": clock_before.checked_sub(offset).context("clock epoch underflow")?,
+            "epoch_high_ns": clock_after.checked_sub(offset).context("clock epoch underflow")?,
+            "end_ns": monotonic_ns()?,
+            "first_sent_ns": first_sent, "last_complete_ns": last_complete,
+        });
     }
     println!("{report}");
     std::io::stdout().flush()?;
@@ -207,8 +268,8 @@ fn export_latency(active: &mut Peer, directory: &std::path::Path, phase: usize) 
 
 pub(super) fn main(args: &[String]) -> Result<()> {
     ensure!(
-        args.len() == 4 || (args.len() == 6 && args[4] == "--latency-dir"),
-        "usage: peer --worker PORT BATCH DATAGRAMS WARMUP [--latency-dir NEW_DIRECTORY]"
+        args.len() >= 4,
+        "usage: peer --worker PORT BATCH DATAGRAMS WARMUP [--latency-dir NEW_DIRECTORY] [--initial-window N] [--scheduled]"
     );
     ensure!(
         std::env::var_os("BURST_QUEUE_AUDIT").is_none(),
@@ -220,7 +281,42 @@ pub(super) fn main(args: &[String]) -> Result<()> {
     let warmup: usize = args[3].parse()?;
     ensure!((1..=32).contains(&batch) && (1..=32).contains(&datagrams));
     ensure!((1..=MAX_BATCHES).contains(&warmup));
-    let directory = args.get(5).map(std::path::PathBuf::from);
+    let mut directory = None;
+    let mut initial_window = None;
+    let mut scheduled = false;
+    let mut options = args[4..].iter();
+    while let Some(flag) = options.next() {
+        match flag.as_str() {
+            "--latency-dir" if directory.is_none() => {
+                directory = Some(std::path::PathBuf::from(
+                    options.next().context("missing latency directory")?,
+                ));
+            }
+            "--initial-window" if initial_window.is_none() => {
+                initial_window = Some(
+                    options
+                        .next()
+                        .context("missing initial window")?
+                        .parse::<usize>()?,
+                );
+            }
+            "--scheduled" if !scheduled => scheduled = true,
+            _ => bail!("invalid or repeated worker option: {flag}"),
+        }
+    }
+    ensure!(
+        !scheduled || directory.is_some(),
+        "scheduled work requires every latency sample"
+    );
+    let window = initial_window.unwrap_or(batch * datagrams);
+    ensure!(
+        (batch * datagrams..=1024).contains(&window),
+        "invalid initial window"
+    );
+    ensure!(
+        window.is_multiple_of(batch * datagrams),
+        "burst width must divide initial window"
+    );
     let producer: usize = if directory.is_some() {
         std::env::var("BURST_PRODUCER_INDEX")
             .unwrap_or_else(|_| "0".to_owned())
@@ -233,8 +329,8 @@ pub(super) fn main(args: &[String]) -> Result<()> {
         // Exclusive creation also prevents accidental reuse of prior evidence.
         std::fs::create_dir(path)?;
     }
-    let mut active = Peer::connect(port, batch * datagrams)?;
-    let mut quiet = match Peer::connect(port, batch * datagrams) {
+    let mut active = Peer::connect(port, window)?;
+    let mut quiet = match Peer::connect(port, window) {
         Ok(peer) => peer,
         Err(error) => {
             report_failure(0, &error, &active, None);
@@ -246,12 +342,13 @@ pub(super) fn main(args: &[String]) -> Result<()> {
         if directory.is_some() {
             prepare_latency(&mut active, producer, 0, warmup, batch, datagrams)?;
         }
-        run_phase(&mut active, &mut quiet, 0, warmup, batch, datagrams)?;
+        run_phase(&mut active, &mut quiet, 0, warmup, batch, datagrams, None)?;
         if let Some(path) = &directory {
             export_latency(&mut active, path, 0)?;
         }
         phase = 1;
         loop {
+            let mut run_at = None;
             let batches = if directory.is_some() {
                 let Some(batches) = prepare_command(&command_line()?, phase)? else {
                     break;
@@ -262,10 +359,17 @@ pub(super) fn main(args: &[String]) -> Result<()> {
                     json!({"phase": phase, "latency_ready": active.latency.as_ref().unwrap().metadata()})
                 );
                 std::io::stdout().flush()?;
-                ensure!(
-                    command(phase)? == Some(batches),
-                    "RUN differs from prepared latency work"
-                );
+                if scheduled {
+                    let line = command_line()?;
+                    let deadline = scheduled_command(&line, phase, batches, monotonic_ns()?)?;
+                    run_at = Some(deadline);
+                    wait_until(deadline)?;
+                } else {
+                    ensure!(
+                        command(phase)? == Some(batches),
+                        "RUN differs from prepared latency work"
+                    );
+                }
                 batches
             } else {
                 let Some(batches) = command(phase)? else {
@@ -273,8 +377,16 @@ pub(super) fn main(args: &[String]) -> Result<()> {
                 };
                 batches
             };
-            run_phase(&mut active, &mut quiet, phase, batches, batch, datagrams)
-                .with_context(|| format!("worker phase {phase}"))?;
+            run_phase(
+                &mut active,
+                &mut quiet,
+                phase,
+                batches,
+                batch,
+                datagrams,
+                run_at,
+            )
+            .with_context(|| format!("worker phase {phase}"))?;
             if let Some(path) = &directory {
                 export_latency(&mut active, path, phase)?;
             }
@@ -305,6 +417,45 @@ pub(super) fn main(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod peer_tests {
     use super::*;
+
+    #[test]
+    fn scheduled_commands_bind_phase_count_and_bounded_future_clock() {
+        assert_eq!(
+            scheduled_command("RUN 2 4096 101", 2, 4096, 100).unwrap(),
+            101
+        );
+        for line in [
+            "RUN 1 4096 101",
+            "RUN 2 4095 101",
+            "RUN 2 4096",
+            "STOP 101",
+            "RUN 2 4096 100",
+            "RUN 2 4096 99",
+            "RUN 2 4096 1000000101",
+            "RUN 2 4096 -1",
+        ] {
+            assert!(scheduled_command(line, 2, 4096, 100).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn partial_cold_bursts_require_exact_whole_credit_grants() {
+        for (completed, expected) in [
+            (0, 2048),
+            (1, 2048),
+            (1023, 2048),
+            (1024, 3072),
+            (1025, 3072),
+            (2047, 3072),
+            (2048, 4096),
+        ] {
+            assert_eq!(granted_stream_limit(2048, completed).unwrap(), expected);
+        }
+        for initial in [0, 1, 3] {
+            assert!(granted_stream_limit(initial, 1).is_err());
+        }
+        assert!(granted_stream_limit(2, u64::MAX).is_err());
+    }
 
     #[test]
     fn sampling_commands_require_separate_ordered_prepare_run_and_export() {

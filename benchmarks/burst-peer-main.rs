@@ -619,7 +619,7 @@ impl Peer {
             "fence packet not ACKed"
         );
         ensure!(
-            self.stream_limit == self.initial_limit + self.completed as u64,
+            self.stream_limit == granted_stream_limit(self.initial_limit, self.completed as u64)?,
             "incorrect exact stream credit after burst fence"
         );
         ensure!(self.max_data <= self.initial_max_data + self.sent_data);
@@ -663,6 +663,17 @@ impl Peer {
         self.send(&payload)?;
         Ok(())
     }
+}
+
+fn granted_stream_limit(initial: u64, completed: u64) -> Result<u64> {
+    ensure!(
+        initial > 0 && initial.is_multiple_of(2),
+        "invalid initial stream grant"
+    );
+    let step = initial / 2;
+    initial
+        .checked_add(completed / step * step)
+        .context("stream grant overflow")
 }
 
 fn main() -> Result<()> {

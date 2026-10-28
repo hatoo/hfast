@@ -128,7 +128,8 @@ def validate(path, meta, phase, first, count, width, producer=0):
     require(all(ends), 'missing burst')
     require(all(ends[i - 1] <= starts[i] for i in range(1, len(starts))),
             'overlapping or reversed serial bursts')
-    return dict(path=str(path), sha256=digest.hexdigest(), metadata=meta)
+    return dict(path=str(path), sha256=digest.hexdigest(), metadata=meta,
+                first_sent_ns=starts[0], last_complete_ns=ends[-1])
 
 
 def durations(file, evidence):
