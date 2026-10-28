@@ -104,6 +104,19 @@ jobs:
           name: coalesced-receive-failure
           path: ${{ runner.temp }}/coalesced*
           retention-days: 7
+      - name: QUIC sparse receive ACK boundaries and independent failure oracles
+        run: |
+          python -m unittest discover -s benchmarks -p test_receive_ack.py -v
+          python benchmarks/receive-ack-check.py target/release/hfast --output "$RUNNER_TEMP/receive-ack"
+          python benchmarks/receive-ack-check.py target/release/hfast --threads 2 --output "$RUNNER_TEMP/receive-ack-t2"
+          HFAST_GRO_BINARY="$PWD/target/release/hfast" python benchmarks/receive-ack-check.py benchmarks/without-udp-gro.py --threads 2 --output "$RUNNER_TEMP/receive-ack-denied-t2"
+      - name: Preserve sparse receive ACK evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receive-ack-evidence
+          path: ${{ runner.temp }}/receive-ack*
+          retention-days: 7
       - name: QUIC recovery oracle, deterministic impairments and failure controls
         run: |
           python -m unittest discover -s benchmarks -p test_quic_recovery.py -v
