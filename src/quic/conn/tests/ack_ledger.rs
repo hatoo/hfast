@@ -380,3 +380,143 @@ fn many_sparse_acks_preserve_late_original_and_retry_credit() {
         assert_eq!(conn.finished, 128, "late copies returned credit twice");
     }
 }
+
+// Place the same logical ledger at a specified physical head, without
+// acknowledging artificial packets or changing any stream/recovery state.
+fn rotated_ledger(packets: &[u64], head: usize) -> Connection {
+    let mut conn = connection();
+    conn.streams_credit.told = packets.len() as u64;
+    conn.unacked = VecDeque::with_capacity(packets.len());
+    let capacity = conn.unacked.capacity();
+    assert!(head < capacity);
+    conn.unacked.extend((0..head).map(|_| (0, u64::MAX)));
+    let first_len = packets.len().min(capacity - head);
+    for (i, &pn) in packets[..first_len].iter().enumerate() {
+        append(&mut conn, pn, i as u64 * 4);
+    }
+    for _ in 0..head {
+        assert_eq!(conn.unacked.pop_front(), Some((0, u64::MAX)));
+    }
+    for (i, &pn) in packets.iter().enumerate().skip(first_len) {
+        append(&mut conn, pn, i as u64 * 4);
+    }
+    assert_eq!(conn.unacked.capacity(), capacity);
+    assert_eq!(conn.unacked.as_slices().0.len(), first_len);
+    conn.send_credit.sent = packets.len() as u64 * RESPONSE.len() as u64;
+    conn
+}
+
+fn check_flat_ack(conn: &mut Connection, largest: u64, first: u64, rest: &[u8]) {
+    let before: Vec<_> = conn.unacked.iter().copied().collect();
+    let ranges: Vec<_> = frame::AckRanges::new(largest, first, rest).collect();
+    let mut expected = Vec::new();
+    let mut lost = conn.ready.clone();
+    let mut finished = conn.finished;
+    let mut acknowledged = false;
+    // Full vector scan and independent per-entry range membership: no ring
+    // indexing, monotone range cursor, prefix stopping or in-place compaction.
+    for &(pn, id) in &before {
+        if ranges.iter().any(|&(lo, hi)| lo <= pn && pn <= hi) {
+            finished += 1;
+            acknowledged = true;
+        } else if largest.checked_sub(pn).is_some_and(|gap| gap > 3) {
+            lost.push(id);
+        } else {
+            expected.push((pn, id));
+        }
+    }
+    let capacity = conn.unacked.capacity();
+    let charged = conn.send_credit.sent;
+    let suffix: Vec<_> = conn
+        .unacked
+        .iter()
+        .filter(|&&(pn, _)| pn > largest)
+        .map(|entry| (*entry, entry as *const (u64, u64)))
+        .collect();
+    let prefix_survivors = expected.iter().filter(|&&(pn, _)| pn <= largest).count();
+    assert_eq!(conn.on_ack(largest, first, rest), acknowledged);
+    assert_eq!(conn.unacked.iter().copied().collect::<Vec<_>>(), expected);
+    assert_eq!(conn.finished, finished);
+    assert_eq!(conn.ready, lost);
+    assert_eq!(conn.send_credit.sent, charged);
+    assert_eq!(conn.send_credit.responses.len(), lost.len());
+    assert_eq!(conn.unacked.capacity(), capacity);
+    for &id in &lost {
+        assert!(conn.send_credit.responses.contains_key(&id));
+        let req = conn.stream_mut(id).unwrap();
+        assert!(req.partial && req.queued && !req.send_done);
+    }
+    for &(_, id) in &expected {
+        let req = conn.stream_mut(id).unwrap();
+        assert!(!req.partial && !req.queued && !req.send_done);
+    }
+    // VecDeque drains the shorter side. A large newer suffix must remain at
+    // exactly the same addresses, even with many surviving streams per PN.
+    if suffix.len() > prefix_survivors {
+        for (entry, (value, address)) in conn
+            .unacked
+            .iter()
+            .filter(|&&(pn, _)| pn > largest)
+            .zip(suffix)
+        {
+            assert_eq!(*entry, value);
+            assert_eq!(entry as *const (u64, u64), address);
+        }
+    }
+}
+
+#[test]
+fn wrapped_shared_packet_survivors_match_flat_model() {
+    for group in [1, 4, 16] {
+        let packets: Vec<_> = (0..128).map(|i| 100 + i / group).collect();
+        let largest = packets[127] - 4;
+        for head in [0, 1, 32, 63, 96, 127] {
+            for mask in 0..8 {
+                let mut conn = rotated_ledger(&packets, head);
+                // Select among older, separated ranges without using the
+                // production range encoder. The highest range is always one PN.
+                let mut rest = Vec::new();
+                let mut previous = largest;
+                for (bit, offset) in [2, 4, 6].into_iter().enumerate() {
+                    if mask & (1 << bit) != 0 {
+                        let pn = largest - offset;
+                        rest.extend_from_slice(&[(previous - pn - 2) as u8, 0]);
+                        previous = pn;
+                    }
+                }
+                check_flat_ack(&mut conn, largest, 0, &rest);
+                check_flat_ack(&mut conn, largest, 0, &rest); // duplicate
+                check_flat_ack(&mut conn, largest - 1, 0, &[]); // older
+                check_flat_ack(&mut conn, packets[127], 0, &[]); // newer
+            }
+        }
+    }
+}
+
+#[test]
+fn wrapped_ack_prefix_boundaries_preserve_large_newer_suffix() {
+    let packets: Vec<_> = (0..4096).map(|i| 100 + i / 16).collect();
+    for head in [0, 1, 3984, 4000, 4016, 4095] {
+        for largest in [99, 100, 105, 106, 107, 355] {
+            for first in [0, largest] {
+                let mut conn = rotated_ledger(&packets, head);
+                check_flat_ack(&mut conn, largest, first, &[]);
+            }
+        }
+    }
+}
+
+#[test]
+fn wrapped_shared_packet_loss_boundary_at_numeric_limits() {
+    for base in [0, (1_u64 << 62) - 8, u64::MAX - 7] {
+        let packets: Vec<_> = (0..128).map(|i| base + i / 16).collect();
+        for head in [0, 1, 63, 96, 127] {
+            let mut conn = rotated_ledger(&packets, head);
+            check_flat_ack(&mut conn, base + 3, 0, &[]);
+            assert!(conn.ready.is_empty()); // exactly three PNs is not lost
+            check_flat_ack(&mut conn, base + 4, 0, &[]);
+            assert_eq!(conn.ready, (0..16).map(|i| i * 4).collect::<Vec<_>>());
+            check_flat_ack(&mut conn, base + 1, 0, &[]);
+        }
+    }
+}
