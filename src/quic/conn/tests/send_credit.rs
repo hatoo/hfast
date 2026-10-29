@@ -301,3 +301,146 @@ fn mixed_full_and_fragmented_responses_retire_across_table_shifts() {
     }
     assert_eq!(conn.send_credit.sent, 3 + 128 * RESPONSE.len() as u64);
 }
+
+#[test]
+fn whole_response_copy_window_preserves_late_ack_and_queued_probe() {
+    // The oracle retains the last eight actual transmissions, independently
+    // of the recovery representation. An unsent probe adds no identity.
+    for copies in [1_usize, 2, 8, 9, 17] {
+        for acknowledged_index in [0, copies.saturating_sub(8), copies - 1] {
+            for queued in [false, true] {
+                let mut conn = constrained(1024, RESPONSE.len() as u64);
+                conn.on_stream(0, 0, b"request", true).unwrap();
+                let (original, first) = send_data(&mut conn);
+                let mut transmissions = vec![original];
+                conn.on_timeout(conn.timeout().unwrap());
+                for _ in 1..copies {
+                    let (pn, plain) = send_data(&mut conn);
+                    assert_eq!(streams(&plain), streams(&first));
+                    transmissions.push(pn);
+                    if transmissions.len() < copies || queued {
+                        conn.on_timeout(conn.timeout().unwrap());
+                    }
+                }
+                let retained: std::collections::BTreeSet<_> =
+                    transmissions.iter().rev().take(8).copied().collect();
+                let acked = transmissions[acknowledged_index];
+                acknowledge(&mut conn, Space::Data, &[(acked, acked)]);
+                assert_eq!(conn.finished, u64::from(retained.contains(&acked)));
+                assert_eq!(conn.send_credit.sent, 3 + RESPONSE.len() as u64);
+                if retained.contains(&acked) {
+                    assert!(conn.ready.is_empty());
+                    assert!(conn.send_credit.responses.is_empty());
+                    idle(&mut conn);
+                }
+                let newest = *transmissions.last().unwrap();
+                acknowledge(&mut conn, Space::Data, &[(newest, newest)]);
+                acknowledge(&mut conn, Space::Data, &[(original, newest)]);
+                assert_eq!(conn.finished, 1, "duplicate copies returned stream credit");
+                assert_eq!(conn.send_credit.sent, 3 + RESPONSE.len() as u64);
+                idle(&mut conn);
+            }
+        }
+    }
+}
+
+#[test]
+fn whole_response_room_failure_cannot_forget_original_or_charge_credit() {
+    for id in [0, 60, 64, 252] {
+        let mut conn = constrained(1024, RESPONSE.len() as u64);
+        conn.on_stream(id, 0, b"request", true).unwrap();
+        let (original, _) = send_data(&mut conn);
+        conn.on_timeout(conn.timeout().unwrap());
+        let need = frame::stream_overhead(id, 0, RESPONSE.len()) + RESPONSE.len();
+        for pn in 100..120 {
+            let mut plain = Vec::new();
+            assert!(conn.write_partial_response(id, &mut plain, need - 1, pn));
+            assert!(plain.is_empty());
+            assert_eq!(conn.ready, [id]);
+            assert_eq!(conn.send_credit.sent, 3 + RESPONSE.len() as u64);
+        }
+        // If a failed send appended a packet number, twenty failures would
+        // evict this real copy and the response would incorrectly remain live.
+        acknowledge(&mut conn, Space::Data, &[(original, original)]);
+        assert_eq!(conn.finished, 1);
+        assert!(conn.send_credit.responses.is_empty());
+        idle(&mut conn);
+    }
+}
+
+#[test]
+fn whole_response_recovery_preserves_unfinished_sibling_and_respects_stop() {
+    for stopped in [false, true] {
+        for retry in [false, true] {
+            let mut conn = constrained(1024, 2 * RESPONSE.len() as u64);
+            conn.on_stream(0, 0, b"request", false).unwrap();
+            conn.on_stream(4, 0, b"request", true).unwrap();
+            let (original, first) = send_data(&mut conn);
+            assert_eq!(streams(&first), [(4, 0, RESPONSE.to_vec(), true)]);
+            conn.on_timeout(conn.timeout().unwrap());
+            if retry {
+                let (_, plain) = send_data(&mut conn);
+                assert_eq!(streams(&plain), streams(&first));
+                conn.on_timeout(conn.timeout().unwrap());
+            }
+            if stopped {
+                receive_stop(&mut conn, 4).unwrap();
+                assert!(conn.send_credit.responses.is_empty());
+            }
+            acknowledge(&mut conn, Space::Data, &[(original, original)]);
+            assert!(!conn.stream_mut(0).unwrap().answered);
+            if stopped {
+                assert_eq!(conn.finished, 0, "RESET_STREAM still needs its own ACK");
+                let (reset, plain) = send_data(&mut conn);
+                assert_reset(&plain, 4, RESPONSE.len() as u64);
+                assert!(streams(&plain).is_empty());
+                acknowledge(&mut conn, Space::Data, &[(reset, reset)]);
+            }
+            assert_eq!(conn.finished, 1);
+            assert_eq!(
+                conn.base_stream, 0,
+                "unfinished sibling must remain addressable"
+            );
+            assert_eq!(conn.send_credit.sent, 3 + RESPONSE.len() as u64);
+            assert!(conn.send_credit.responses.is_empty());
+            idle(&mut conn);
+            conn.on_stream(0, 7, b"", true).unwrap();
+            let (pn, plain) = send_data(&mut conn);
+            assert_eq!(streams(&plain), [(0, 0, RESPONSE.to_vec(), true)]);
+            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+            assert_eq!(conn.finished, 2);
+            assert_eq!(conn.send_credit.sent, 3 + 2 * RESPONSE.len() as u64);
+            idle(&mut conn);
+        }
+    }
+}
+
+#[test]
+fn every_response_credit_split_retains_prefix_until_original_ack() {
+    for split in 1..RESPONSE.len() as u64 {
+        let mut conn = constrained(split, split);
+        conn.on_stream(0, 0, b"request", true).unwrap();
+        let (original, first) = send_data(&mut conn);
+        assert_eq!(
+            streams(&first),
+            [(0, 0, RESPONSE[..split as usize].to_vec(), false)]
+        );
+        conn.on_timeout(conn.timeout().unwrap());
+        let (_, retry) = send_data(&mut conn);
+        assert_eq!(streams(&retry), streams(&first));
+        grant(&mut conn, 0, RESPONSE.len() as u64);
+        conn.on_max_data(3 + RESPONSE.len() as u64);
+        let (tail, plain) = send_data(&mut conn);
+        assert_eq!(
+            streams(&plain),
+            [(0, split, RESPONSE[split as usize..].to_vec(), true)]
+        );
+        acknowledge(&mut conn, Space::Data, &[(tail, tail)]);
+        assert_eq!(conn.finished, 0);
+        conn.on_timeout(conn.timeout().unwrap());
+        acknowledge(&mut conn, Space::Data, &[(original, original)]);
+        assert_eq!(conn.finished, 1);
+        assert_eq!(conn.send_credit.sent, 3 + RESPONSE.len() as u64);
+        idle(&mut conn);
+    }
+}
