@@ -174,6 +174,8 @@ def collect(workers, phase, timeout):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 worker['stdout'].write(chunk)
                 worker['stdout'].flush()
+                if not chunk:
+                    worker['stdout_eof'] = True
                 require(chunk, f'worker {index} exited in phase {phase}; see worker stderr')
                 worker['buffer'] += chunk
                 require(len(worker['buffer']) <= 65536, 'oversized worker report')

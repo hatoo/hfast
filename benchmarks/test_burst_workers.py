@@ -323,6 +323,54 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertEqual(peer['sockets']['status'], 'unavailable')
         self.assertIsNone(peer['socket_delta']['drops'])
 
+    def test_stdout_eof_before_waitable_exit_preserves_natural_status(self):
+        # Hold the child alive after EOF until capture explicitly waits. This
+        # reproduces the CI race without relying on scheduler timing or sleeps.
+        code = 'import os,sys; os.close(1); input(); sys.exit(7)'
+        wait = subprocess.Popen.wait
+
+        def release(process, *args, **kwargs):
+            if process.poll() is None:
+                process.stdin.write(b'exit\n')
+            return wait(process, *args, **kwargs)
+
+        with patch.object(subprocess.Popen, 'wait', release):
+            with self.assertRaisesRegex(RuntimeError, 'exited'):
+                self.coordinate([code], timeout=2)
+        peer = self.evidence()['workers'][0]
+        self.assertTrue(peer['stdout_eof'])
+        self.assertEqual(peer['exit_code'], 7)
+        self.assertEqual(peer['sockets']['status'], 'unavailable')
+        self.assertIsNone(peer['socket_delta']['drops'])
+        self.assertEqual(self.created[0].returncode, 7)
+
+    def test_stdout_eof_with_live_socket_keeps_evidence_and_bounds_wait(self):
+        code = ('import os,socket\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n'
+                's.bind(("127.0.0.1",0))\nos.close(1)\ninput()\n')
+        wait = subprocess.Popen.wait
+        waits = []
+
+        def short_wait(process, *args, **kwargs):
+            if not waits:
+                waits.append(kwargs['timeout'])
+                # Exercise a real timeout while keeping the regression fast.
+                return wait(process, timeout=.02)
+            return wait(process, *args, **kwargs)
+
+        with patch.object(subprocess.Popen, 'wait', short_wait):
+            with self.assertRaisesRegex(RuntimeError, 'exited'):
+                self.coordinate([code], timeout=2)
+        peer = self.evidence()['workers'][0]
+        self.assertTrue(peer['stdout_eof'])
+        self.assertIsNone(peer['exit_code'])
+        self.assertEqual(peer['sockets']['status'], 'available')
+        self.assertEqual(len(peer['sockets']['sockets']), 1)
+        self.assertIsNone(peer['socket_delta']['drops'])
+        self.assertEqual(len(waits), 1)
+        self.assertGreater(waits[0], 0)
+        self.assertLessEqual(waits[0], 5)
+        self.assertEqual(self.created[0].returncode, -9)
+
     def coordinate_failure_with_sibling(self, faulty, message):
         code = f'print({json.dumps(fixture())!r},flush=True); input()'
         with self.assertRaisesRegex(RuntimeError, message):
@@ -590,6 +638,53 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertTrue(row['sockets'])
         self.assertIn('udp', row['tables'])
         self.assertIsNone(b.failure.process_delta(row, row)['drops'])
+
+
+class ExitCaptureTests(unittest.TestCase):
+    def capture(self, workers):
+        state = dict(phase=0, stage='warmup', namespace_before={}, last_success=None,
+                     server_baseline={})
+        return b.failure.capture(100, workers, state)
+
+    def worker(self, pid, eof=False, exit_code=None):
+        process = Mock(pid=pid)
+        process.poll.return_value = exit_code
+        return dict(process=process, command=['peer'], buffer=b'', stdout_eof=eof)
+
+    def test_exit_waits_share_snapshot_budget_and_keep_all_peer_evidence(self):
+        workers = [self.worker(101, True), self.worker(102, True)]
+        events = []
+
+        def snapshot(pid, deadline):
+            events.append(('snapshot', pid, deadline))
+            return dict(status='available', sockets=[dict(inode=pid)])
+
+        def wait(timeout):
+            events.append(('wait', timeout))
+            raise subprocess.TimeoutExpired('peer', timeout)
+
+        workers[0]['process'].wait.side_effect = wait
+        # First worker consumes the two seconds left after all snapshots. The
+        # next worker gets no new budget even though its stdout also hit EOF.
+        with patch.object(b.failure.time, 'monotonic', side_effect=[10, 13, 15, 15]), \
+                patch.object(b.failure, 'namespace_snapshot', return_value={}), \
+                patch.object(b.failure, 'process_snapshot', side_effect=snapshot):
+            result = self.capture(workers)
+        self.assertEqual(events, [('snapshot', 100, 15), ('snapshot', 101, 15),
+                                  ('snapshot', 102, 15), ('wait', 2)])
+        workers[1]['process'].wait.assert_not_called()
+        for index, row in enumerate(result['workers']):
+            self.assertIsNone(row['exit_code'])
+            self.assertEqual(row['sockets']['sockets'], [dict(inode=101 + index)])
+
+    def test_open_stdout_and_already_exited_workers_are_not_waited_again(self):
+        workers = [self.worker(101), self.worker(102, True, 7)]
+        with patch.object(b.failure, 'namespace_snapshot', return_value={}), \
+                patch.object(b.failure, 'process_snapshot', return_value={}):
+            result = self.capture(workers)
+        for worker in workers:
+            worker['process'].wait.assert_not_called()
+        self.assertEqual([row['exit_code'] for row in result['workers']], [None, 7])
 
 
 if __name__ == '__main__':
