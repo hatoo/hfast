@@ -236,6 +236,7 @@ jobs:
           python -m unittest discover -s benchmarks -p test_burst_buffer.py -v
           python -m unittest discover -s benchmarks -p test_burst_latency.py -v
           python -m unittest discover -s benchmarks -p test_burst_schedule.py -v
+          python -m unittest discover -s benchmarks -p test_burst_sockets.py -v
       - name: Concurrent native producers with GRO and fallback delivery
         run: |
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' native-producers \
@@ -275,6 +276,19 @@ jobs:
             ${{ runner.temp }}/concurrent-producer-buffer-smoke
             ${{ runner.temp }}/burst-latency
             ${{ runner.temp }}/burst-schedule
+          retention-days: 7
+      - name: Native reference workers with exact owned sockets and failed processes
+        run: |
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' burst-reference \
+            "$(command -v python)" benchmarks/burst-reference-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/gso-peer/burst-peer" \
+            "$RUNNER_TEMP/burst-reference"
+      - name: Preserve reference socket evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: burst-reference-evidence
+          path: ${{ runner.temp }}/burst-reference
           retention-days: 7
       - name: Fixed CRYPTO churn transport
         uses: actions/checkout@v5

@@ -26,20 +26,23 @@ def flags(requested):
     return ['--udp-receive-buffer', str(requested)] if requested else []
 
 
-def observe(pid, port, requested):
+def observe(pid, port, requested, workers=1):
     validate(requested)
+    failure.require(type(workers) is int and workers in (1, 2), 'expected one or two workers')
     snapshot = failure.observe(failure.process_snapshot, pid)
     result = dict(requested_bytes=requested, effective_bytes=None,
                   below_doubled_request=None, status='unavailable', error=None,
-                  snapshot=snapshot)
+                  workers=workers, snapshot=snapshot)
     try:
         failure.require(snapshot['status'] == 'available',
                         snapshot.get('error') or 'socket snapshot unavailable')
         sockets = snapshot['sockets']
-        failure.require(len(sockets) == 1 and sockets[0]['port'] == port,
-                        'expected one server UDP socket on the requested port')
+        failure.require(len(sockets) == workers and all(s['port'] == port for s in sockets),
+                        'wrong number of server UDP sockets on the requested port')
         effective = sockets[0]['rcvbuf']
         failure.require(type(effective) is int and effective > 0, 'invalid receive capacity')
+        failure.require(all(type(s['rcvbuf']) is int and s['rcvbuf'] == effective for s in sockets),
+                        'server worker receive capacities differ')
         result.update(status='available', effective_bytes=effective,
                       below_doubled_request=(effective < 2 * requested if requested else None))
     except (KeyError, TypeError, ValueError) as error:
@@ -50,11 +53,12 @@ def observe(pid, port, requested):
 def interval(before, after):
     result = dict(requested_bytes=before['requested_bytes'], effective_bytes=None,
                   below_doubled_request=None, status='unavailable', error=None,
-                  before=before, after=after)
+                  workers=before.get('workers', 1), before=before, after=after)
     delta = failure.observe(failure.process_delta, before['snapshot'], after['snapshot'])
     result['socket_delta'] = delta
     if (before['status'] == after['status'] == delta['status'] == 'available'
             and before['requested_bytes'] == after['requested_bytes']
+            and before.get('workers', 1) == after.get('workers', 1)
             and before['effective_bytes'] == after['effective_bytes']):
         result.update(status='available', effective_bytes=after['effective_bytes'],
                       below_doubled_request=after['below_doubled_request'])
@@ -71,3 +75,5 @@ def require_equal(baseline, candidate):
     failure.require(all(baseline[key] == candidate[key]
                         for key in ('requested_bytes', 'effective_bytes')),
                     'server receive capacities differ; comparison excluded')
+    failure.require(baseline.get('workers', 1) == candidate.get('workers', 1),
+                    'server worker counts differ; comparison excluded')

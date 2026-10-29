@@ -107,6 +107,7 @@ def compare(baseline, candidate):
             and all(baseline[key] == candidate[key] for key in
                     ('producer_sha256', 'client_cpus', 'gro', 'smoke'))
             and len(baseline['cycles']) == len(candidate['cycles'])
+            and baseline.get('reference_workers') == candidate.get('reference_workers')
             and baseline['measured_requests'] == candidate['measured_requests'],
             'different fixed workloads')
     burst_buffer.require_equal(baseline['udp_receive_buffer'], candidate['udp_receive_buffer'])
