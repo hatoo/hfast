@@ -146,6 +146,16 @@ require stable identities. The baseline socket snapshots run before the first
 measured phase; failure snapshots run only after an error. Successful phase
 timers, request bytes and accounting gates are unchanged.
 
+If a `/proc` UDP read repeats an identical row, the controller retries the whole
+socket snapshot at most twice within the original diagnostic deadline. It keeps
+each rejected raw snapshot in `rejected_snapshots`. A retry must retain the same
+PID/start time, network namespace and complete owned inode/FD set. Conflicting
+duplicate rows, changed identities, other diagnostic errors and persistently
+repeated rows remain unavailable. The strict table parser never accepts duplicate
+inodes; the successful replacement read must still pass all cookie, capacity,
+queue and drop checks. This handles an observed non-atomic table read during
+producer startup without declaring incomplete evidence lossless.
+
 `run-failure.json` retains the server snapshot before its teardown. If a native
 worker exits first, its stderr contains a `burst_failure` JSON record with the
 original error, phase, partial peer ledgers and its still-owned socket counters

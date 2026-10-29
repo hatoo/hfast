@@ -30,6 +30,15 @@ def nl_message(payload, kind=20, flags=2, seq=1):
 
 
 class Parsing(unittest.TestCase):
+    def test_only_identical_duplicate_rows_are_retryable(self):
+        with self.assertRaises(udp.RepeatedUdpRow):
+            udp.parse_udp(HEADER + ROW + ROW, socket.AF_INET)
+        for conflicting in [ROW.replace(' 7\n', ' 8\n'), ROW.replace(':1234', ':1235'),
+                            ROW.replace('00000000:00000000', '00000000:00000001')]:
+            with self.subTest(row=conflicting), self.assertRaises(ValueError) as caught:
+                udp.parse_udp(HEADER + ROW + conflicting, socket.AF_INET)
+            self.assertNotIsInstance(caught.exception, udp.RepeatedUdpRow)
+
     def test_proc_ipv4_ipv6_and_same_port_distinct_inodes(self):
         other = ROW.replace('12345', '54321').replace(' 7\n', ' 0\n')
         result = udp.parse_udp(HEADER + ROW + other, socket.AF_INET)

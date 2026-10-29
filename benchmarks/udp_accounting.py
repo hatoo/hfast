@@ -17,11 +17,16 @@ def require(condition, message):
         raise ValueError(message)
 
 
+class RepeatedUdpRow(ValueError):
+    """An identical row repeated in a non-atomic /proc UDP table read."""
+
+
 def parse_udp(text, family):
     lines = text.splitlines()
     require(lines and 'inode' in lines[0].split() and 'drops' in lines[0].split(),
             'missing UDP table header')
     rows = {}
+    raw_rows = {}
     for line in lines[1:]:
         fields = line.split()
         require(len(fields) == 13, 'malformed UDP row')
@@ -35,7 +40,11 @@ def parse_udp(text, family):
             int(port, 16)
         if inode == 0:  # No process can own this unreferenced socket.
             continue
-        require(inode not in rows, 'duplicate UDP inode')
+        if inode in rows:
+            if fields == raw_rows[inode]:
+                raise RepeatedUdpRow('duplicate UDP inode')
+            raise ValueError('duplicate UDP inode with conflicting rows')
+        raw_rows[inode] = fields
         rows[inode] = dict(inode=inode, family=family, local=fields[1], remote=fields[2],
                            port=int(fields[1].split(':')[1], 16), drops=drops)
     return rows

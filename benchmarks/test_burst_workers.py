@@ -5,6 +5,7 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -405,6 +406,97 @@ class FailureEvidenceTests(unittest.TestCase):
         diagnostics.assert_not_called()
         self.assertEqual(row['status'], 'unavailable')
         self.assertIn('deadline expired', row['error'])
+
+    def repeated_table(self, repetitions, *, conflict=False):
+        """Replay the identical foreign row seen in post-merge CI40800271894."""
+        raw = ('8059: 0100007F:A19C 0100007F:94CE 01 00000000:00000000 '
+               '00:00000000 00000000 0 0 135952 2 ffff8c6b2853ee40 0\n')
+        duplicate = raw.replace('00000000:00000000', '00000000:00000001') if conflict else raw
+        read_text = Path.read_text
+        reads = []
+        target = Path(f'/proc/{os.getpid()}/net/udp')
+
+        def read(path, *args, **kwargs):
+            text = read_text(path, *args, **kwargs)
+            if path == target:
+                reads.append(text)
+                if len(reads) <= repetitions:
+                    return text + raw + duplicate
+            return text
+
+        return patch.object(Path, 'read_text', read), reads, raw + duplicate
+
+    def test_identical_foreign_row_retries_a_complete_snapshot_and_retains_evidence(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            before = b.failure.process_snapshot(os.getpid())
+            injection, reads, repeated = self.repeated_table(1)
+            with injection:
+                after = b.failure.process_snapshot(os.getpid())
+        self.assertEqual(after['status'], 'available', after)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(b.failure.process_delta(before, after)['drops'], 0)
+        rejected = after['rejected_snapshots']
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]['status'], 'unavailable')
+        self.assertTrue(rejected[0]['tables']['udp'].endswith(repeated))
+        self.assertIn('duplicate UDP inode', rejected[0]['error'])
+
+    def test_persistent_duplicate_rows_remain_unavailable_after_three_attempts(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            injection, reads, _ = self.repeated_table(100)
+            with injection:
+                row = b.failure.process_snapshot(os.getpid())
+        self.assertEqual(len(reads), 3)
+        self.assertEqual(row['status'], 'unavailable')
+        self.assertEqual(len(row['rejected_snapshots']), 2)
+        self.assertIsNone(b.failure.process_delta(row, row)['drops'])
+
+    def test_conflicting_duplicate_rows_are_not_retried(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            injection, reads, _ = self.repeated_table(1, conflict=True)
+            with injection:
+                row = b.failure.process_snapshot(os.getpid())
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(row['status'], 'unavailable')
+        self.assertIn('conflicting', row['error'])
+        self.assertNotIn('rejected_snapshots', row)
+
+    def test_duplicate_retry_uses_the_original_diagnostic_deadline(self):
+        injection, reads, _ = self.repeated_table(100)
+        with injection, patch.object(b.failure.time, 'monotonic', side_effect=[10, 10, 13]):
+            row = b.failure.process_snapshot(os.getpid())
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(row['status'], 'unavailable')
+        self.assertIn('deadline expired', row['error'])
+        self.assertEqual(len(row['rejected_snapshots']), 1)
+
+    def test_a_retry_cannot_hide_changed_process_or_socket_ownership(self):
+        first = dict(status='unavailable', error='RepeatedUdpRow: duplicate UDP inode',
+                     error_kind='RepeatedUdpRow', pid=123, start_ticks=456,
+                     netns='net:1', owned_inodes={789: [3]}, sockets=[])
+        for key, value in [('pid', 124), ('start_ticks', 457), ('netns', 'net:2'),
+                           ('owned_inodes', {790: [3]}), ('owned_inodes', {789: [4]})]:
+            good = {k: v for k, v in first.items() if k not in ('error', 'error_kind')}
+            good.update(status='available', error=None)
+            good[key] = value
+            with self.subTest(key=key, value=value), \
+                    patch.object(b.failure, '_process_snapshot', side_effect=[deepcopy(first), good]):
+                result = b.failure.process_snapshot(123)
+            self.assertEqual(result['status'], 'unavailable')
+            self.assertIn('identity changed', result['error'])
+            self.assertIsNone(b.failure.process_delta(result, result)['drops'])
+
+    def test_other_snapshot_failures_are_not_retried(self):
+        for error in ['socket diagnostic deadline expired', 'socket ownership changed',
+                      'UDP socket changed during snapshot', 'permission denied']:
+            failed = dict(status='unavailable', error=error, error_kind='ValueError')
+            with patch.object(b.failure, '_process_snapshot', return_value=failed) as capture:
+                result = b.failure.process_snapshot(123)
+            self.assertEqual(capture.call_count, 1)
+            self.assertIs(result, failed)
 
     def test_reused_or_missing_socket_identity_has_no_delta(self):
         import socket
