@@ -65,9 +65,41 @@ latency/failure suites also remain required.
 
 The example is a starting workload, not a guarantee of overlap on every host.
 Passing overlap is insufficient to establish producer headroom or a performance
-gain. The controller still requires one live server socket and checks every
-producer socket, queue and drop counter plus namespace UDP totals. A reference
-server with multiple workers requires a separate extension that audits every
-owned socket by inode/cookie; do not bypass the single-socket guard. Preserve
-the fixed workload and use alternating and independently reversed comparisons,
-ordinary-client guards, and every latency population before accepting a change.
+gain. Preserve the fixed workload and use alternating and independently reversed
+comparisons, ordinary-client guards, and every latency population before
+accepting a change.
+
+For a server capacity reference, explicitly add `--reference-workers 1` or
+`--reference-workers 2`. Use the same immutable server, producer, workload and
+client CPUs in both cases; server workers use CPUs 0 through N-1, which must be
+available and distinct from every producer CPU. This mode audits the exact set
+of process-owned sockets. It is a capacity diagnostic, not an optimization gain:
+the usual capacity and schedule comparators reject different worker counts.
+The default mode retains its strict single-server-socket/shared-port rejection.
+
+Every reference server socket must be owned by the expected PID/start-time and
+namespace, have a distinct inode/SOCK_DIAG cookie, and retain its FD, address and
+receive capacity. All sockets on the server port must belong to that exact set;
+foreign reuseport sockets cannot be counted as workers. Each producer must own
+exactly its active and quiet socket, on unique ports. Every audited socket must
+have zero drops and empty send/receive queues. Namespace UDP/error totals, native
+body/FIN/credit/fence counts, and every latency/overlap gate remain mandatory.
+The actual receive capacity is recorded for each socket; all server workers
+must have the same capacity. Missing or unavailable evidence fails the run.
+
+`reference-start.json` and `reference-end.json` retain server observations.
+`socket-audit.jsonl` contains the complete server and all producer observations
+after warmup and before/after each measured phase, including failed/partial
+snapshots. Detailed process/SOCK_DIAG inspection is outside the measured wall
+and CPU interval. Final settlement still checks exact live inodes, queues and
+drops in both UDP tables inside that interval. These are non-atomic boundary
+observations; they do not claim to detect every transient socket lifecycle.
+
+`burst-reference-check.py SERVER PEER NEW_OUTPUT` verifies one/two-worker uniform
+and sustained workloads, GRO/fallback, exact exported populations, and bounded
+cleanup after real server/producer termination. `test_burst_sockets.py` also
+closes, replaces, adds and overflows actual reuseport sockets, introduces a
+foreign owner, and checks corrupted identities/capacities and unavailable
+diagnostics. Its smoke timings do not establish producer headroom. More workers
+can change cold completion times; an unsuitable fixed schedule keeps all samples
+but must still fail rather than silently shorten the required overlap.
