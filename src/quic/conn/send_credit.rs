@@ -368,6 +368,61 @@ impl Connection {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sparse_ack_and_partial_retry_preserve_each_fragment_boundary() {
+        let data = b"abcdefghijk";
+        let mut fragments = Fragments::default();
+        let mut sent = 0;
+        let mut body = Vec::new();
+        for (pn, limit) in [(10, 1), (11, 4), (12, 11)] {
+            body.clear();
+            assert!(!fragments.write(64, data, true, &mut sent, limit, 11, &mut body, 4096, pn));
+        }
+        // Retaining the first and last ranges moves the last range over the
+        // removed middle one. Their distinct byte bounds must move with them.
+        assert!(fragments.on_ack(11, 0, &[]));
+        fragments.on_timeout();
+        for pn in 13..30 {
+            body.clear();
+            assert!(fragments.write(64, data, true, &mut sent, 11, 0, &mut body, 5, pn));
+            assert!(body.is_empty());
+        }
+        // Six bytes fit only the first range: type, two-byte ID, offset, length, data.
+        assert!(fragments.write(64, data, true, &mut sent, 11, 0, &mut body, 6, 30));
+        let mut frames = frame::Frames::new(&body);
+        assert!(matches!(
+            frames.next().unwrap().unwrap(),
+            frame::Frame::Stream {
+                id: 64,
+                offset: 0,
+                data: b"a",
+                fin: false
+            }
+        ));
+        assert!(frames.next().is_none());
+        body.clear();
+        assert!(!fragments.write(64, data, true, &mut sent, 11, 0, &mut body, 4096, 31));
+        let mut frames = frame::Frames::new(&body);
+        assert!(matches!(
+            frames.next().unwrap().unwrap(),
+            frame::Frame::Stream {
+                id: 64,
+                offset: 4,
+                data: b"efghijk",
+                fin: true
+            }
+        ));
+        assert!(frames.next().is_none());
+        assert_eq!(sent, 11, "retries must not consume fresh credit");
+        assert!(fragments.on_ack(12, 0, &[]));
+        assert!(fragments.on_ack(10, 0, &[]));
+        fragments.on_timeout();
+        body.clear();
+        assert!(!fragments.write(64, data, true, &mut sent, 11, 0, &mut body, 4096, 32));
+        assert!(body.is_empty());
+        assert!(!fragments.pending());
+    }
+
     fn stream_frames(body: &[u8]) -> Vec<(u64, u64, Vec<u8>, bool)> {
         frame::Frames::new(body)
             .map(|frame| match frame.unwrap() {

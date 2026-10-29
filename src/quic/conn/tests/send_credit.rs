@@ -36,6 +36,104 @@ fn idle(conn: &mut Connection) {
 }
 
 #[test]
+fn late_fragment_ack_cancels_only_pending_range_with_unacked_siblings() {
+    for id in [0, 64] {
+        let mut conn = constrained(1, 4096);
+        conn.on_stream(id, 0, b"request", true).unwrap();
+        conn.on_stream(id + 4, 0, b"unfinished", false).unwrap();
+        let mut originals = Vec::new();
+        let mut start = 0;
+        for end in [1, 3, 7, 9] {
+            grant(&mut conn, id, end);
+            let (pn, plain) = send_data(&mut conn);
+            let parts = streams(&plain);
+            assert_eq!(
+                parts,
+                [(
+                    id,
+                    start,
+                    RESPONSE[start as usize..end as usize].to_vec(),
+                    false
+                )]
+            );
+            originals.push(pn);
+            start = end;
+        }
+        // Only the earliest range reaches the packet-loss threshold.
+        acknowledge(&mut conn, Space::Data, &[(originals[3], originals[3])]);
+        assert_eq!(conn.ready, [id]);
+        acknowledge(&mut conn, Space::Data, &[(originals[0], originals[0])]);
+        assert!(
+            conn.ready.is_empty(),
+            "an ACKed pending range cannot keep a retry queued"
+        );
+        assert!(!conn.stream_mut(id).unwrap().queued);
+        assert!(!conn.poll_transmit(&mut Vec::new()).unwrap());
+        assert_eq!(conn.finished, 0);
+        // Duplicate ACKs do not create work; two unacknowledged ranges remain.
+        acknowledge(&mut conn, Space::Data, &[(originals[0], originals[0])]);
+        assert!(conn.ready.is_empty());
+        acknowledge(&mut conn, Space::Data, &[(originals[1], originals[2])]);
+        grant(&mut conn, id, RESPONSE.len() as u64);
+        let (pn, plain) = send_data(&mut conn);
+        assert_eq!(streams(&plain), [(id, 9, RESPONSE[9..].to_vec(), true)]);
+        acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+        assert_eq!(conn.finished, 1);
+        let sibling = conn.streams.get(((id + 4) / 4 - conn.base_stream) as usize);
+        assert!(matches!(sibling, Some(StreamSlot::Active(req)) if !req.fin && req.size == 10));
+    }
+}
+
+#[test]
+fn fragment_ack_keeps_later_pending_range_after_partial_retry() {
+    let mut conn = constrained(1, 4096);
+    conn.on_stream(0, 0, b"request", true).unwrap();
+    let mut originals = Vec::new();
+    for end in [1, 4, 9] {
+        grant(&mut conn, 0, end);
+        originals.push(send_data(&mut conn).0);
+    }
+    let charged = conn.send_credit.sent;
+    conn.on_send_credit_timeout();
+    let mut body = Vec::new();
+    let retry = conn.spaces[Space::Data as usize].next_pn;
+    // Two STREAM headers (type, ID, offset, length) and four payload bytes.
+    assert!(conn.write_partial_response(0, &mut body, 12, retry));
+    conn.spaces[Space::Data as usize].next_pn += 1;
+    assert_eq!(
+        streams(&body),
+        [
+            (0, 0, RESPONSE[..1].to_vec(), false),
+            (0, 1, RESPONSE[1..4].to_vec(), false),
+        ]
+    );
+    assert_eq!(conn.send_credit.sent, charged);
+    acknowledge(&mut conn, Space::Data, &[(originals[0], originals[0])]);
+    assert_eq!(
+        conn.ready,
+        [0],
+        "the later pending range still needs a retry"
+    );
+    acknowledge(&mut conn, Space::Data, &[(originals[2], originals[2])]);
+    assert!(
+        conn.ready.is_empty(),
+        "only a nonpending retransmitted range survives"
+    );
+    assert!(!conn.poll_transmit(&mut Vec::new()).unwrap());
+    acknowledge(&mut conn, Space::Data, &[(originals[1], originals[1])]);
+    grant(&mut conn, 0, RESPONSE.len() as u64);
+    let (pn, plain) = send_data(&mut conn);
+    assert_eq!(streams(&plain), [(0, 9, RESPONSE[9..].to_vec(), true)]);
+    acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+    assert_eq!(conn.finished, 1);
+    assert_eq!(
+        conn.send_credit.sent,
+        CONTROL_PRELUDE.len() as u64 + RESPONSE.len() as u64
+    );
+    idle(&mut conn);
+}
+
+#[test]
 fn zero_stale_and_sparse_grants_do_not_spin_or_wake_other_streams() {
     let mut conn = constrained(0, 1024);
     for id in (0..32).map(|i| i * 4) {
