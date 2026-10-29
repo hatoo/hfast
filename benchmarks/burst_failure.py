@@ -11,7 +11,7 @@ import sys
 import time
 import traceback
 
-from udp_accounting import (namespace_delta, namespace_snapshot, owned_inodes,
+from udp_accounting import (RepeatedUdpRow, namespace_delta, namespace_snapshot, owned_inodes,
                             parse_udp, process_delta, process_identity,
                             require, socket_diagnostics)
 
@@ -25,9 +25,27 @@ def observe(function, *args):
 
 def process_snapshot(pid, deadline=None):
     """Discover sockets even when a worker has not produced its first report."""
+    deadline = time.monotonic() + 2 if deadline is None else deadline
+    rejected = []
+    for attempt in range(3):
+        result = _process_snapshot(pid, deadline)
+        if result['status'] == 'available' and rejected:
+            # A fresh table is useful only for the same process and owned FD
+            # set. In particular, retry cannot turn replacement sockets into
+            # an apparently clean, zero-drop observation.
+            identity = ('pid', 'start_ticks', 'netns', 'owned_inodes')
+            if any(any(old[k] != result[k] for k in identity) for old in rejected):
+                result.update(status='unavailable', error='identity changed across UDP table retry')
+        if result.get('error_kind') != RepeatedUdpRow.__name__ or attempt == 2:
+            if rejected:
+                result['rejected_snapshots'] = rejected
+            return result
+        rejected.append(result)
+
+
+def _process_snapshot(pid, deadline):
     result = dict(status='unavailable', error=None, pid=pid, port=None, sockets=[])
     try:
-        deadline = time.monotonic() + 2 if deadline is None else deadline
         require(time.monotonic() < deadline, 'socket diagnostic deadline expired')
         proc = Path(f'/proc/{pid}')
         identity = process_identity(proc)
@@ -64,6 +82,7 @@ def process_snapshot(pid, deadline=None):
         result['status'] = 'available'
     except Exception as error:
         result['error'] = f'{type(error).__name__}: {error}'
+        result['error_kind'] = type(error).__name__
     return result
 
 
