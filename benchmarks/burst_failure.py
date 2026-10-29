@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -102,12 +103,25 @@ def capture(server_pid, workers, state):
         sockets = observe(process_snapshot, process.pid, deadline)
         peers.append(dict(index=index, pid=process.pid, command=worker['command'],
                           exit_code=process.poll(), sockets=sockets,
+                          stdout_eof=worker.get('stdout_eof', False),
                           socket_baseline=worker.get('socket_baseline'),
                           socket_delta=observe(process_delta, worker.get('socket_baseline'), sockets),
                           report=worker.get('report'),
                           report_line_hex=worker.get('report_line', b'').hex(),
                           partial_stdout_hex=worker['buffer'].hex(),
                           stdout=f'worker-{index}.jsonl', stderr=f'worker-{index}.stderr'))
+    # Closing stdout precedes a child's waitable exit, so a poll immediately
+    # after EOF can still return None. Capture every live socket first, then
+    # reap EOF workers within the same diagnostic budget. A worker can also
+    # close stdout and stay alive; EOF alone must never imply an exit code.
+    for worker, peer in zip(workers, peers):
+        if peer['stdout_eof'] and peer['exit_code'] is None:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    peer['exit_code'] = worker['process'].wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
     return dict(schema=1, timing_evidence=False, observed_monotonic=time.monotonic(),
                 phase=state['phase'], stage=state['stage'],
                 namespace_before=state['namespace_before'], namespace_failure=namespace,
