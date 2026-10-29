@@ -1544,6 +1544,7 @@ mod tests {
     use super::*;
 
     mod ack_ledger;
+    mod crypto_handshake;
     mod datagram_budget;
     mod key_updates;
     mod receive_headers;
