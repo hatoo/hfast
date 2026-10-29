@@ -368,6 +368,210 @@ impl Connection {
 mod tests {
     use super::*;
 
+    fn stream_frames(body: &[u8]) -> Vec<(u64, u64, Vec<u8>, bool)> {
+        frame::Frames::new(body)
+            .map(|frame| match frame.unwrap() {
+                frame::Frame::Stream {
+                    id,
+                    offset,
+                    data,
+                    fin,
+                } => (id, offset, data.to_vec(), fin),
+                other => panic!("unexpected frame: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blocked_fresh_ranges_do_not_allocate_or_consume_credit() {
+        for (data, fin) in [(RESPONSE, true), (CONTROL_PRELUDE, false)] {
+            for (id, id_bytes) in [(0, 1), (3, 1), (64, 2), (16384, 4), (1 << 30, 8)] {
+                for end in 1..=data.len() as u8 {
+                    let mut fragments = Fragments::default();
+                    let mut sent = 0;
+                    // An existing frame in the packet must also count as room.
+                    let mut body = vec![frame::PING as u8];
+                    // PING, STREAM type, stream ID, one-byte offset and length,
+                    // then payload. Compute the wire size independently.
+                    let need = 1 + 1 + id_bytes + 1 + 1 + end as usize;
+                    for (limit, available, room, full) in [
+                        (0, u64::from(end), need, false),
+                        (end, 0, need, false),
+                        (end, u64::from(end), need - 1, true),
+                    ] {
+                        assert_eq!(
+                            fragments.write(
+                                id, data, fin, &mut sent, limit, available, &mut body, room, 7
+                            ),
+                            full
+                        );
+                        assert_eq!(body, [frame::PING as u8]);
+                        assert_eq!(sent, 0);
+                        assert_eq!(fragments.flights.capacity(), 0);
+                        assert!(!fragments.pending());
+                    }
+                    assert!(!fragments.write(
+                        id,
+                        data,
+                        fin,
+                        &mut sent,
+                        end,
+                        u64::from(end),
+                        &mut body,
+                        need,
+                        8
+                    ));
+                    assert_eq!(sent, end);
+                    assert_eq!(
+                        stream_frames(&body[1..]),
+                        [(
+                            id,
+                            0,
+                            data[..end as usize].to_vec(),
+                            fin && end as usize == data.len()
+                        )]
+                    );
+                    assert_eq!(fragments.flights.len(), 1);
+                    assert_eq!(fragments.flights[0].delivery.sent_in, [8]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bytewise_grants_reuse_storage_after_late_original_acks() {
+        for (id, data, fin) in [(0, RESPONSE, true), (3, CONTROL_PRELUDE, false)] {
+            let mut fragments = Fragments::default();
+            let mut sent = 0;
+            let mut storage = None;
+            let mut received = Vec::new();
+            for end in 1..=data.len() as u8 {
+                let original = u64::from(end) * 4;
+                let mut body = Vec::new();
+                assert!(
+                    !fragments.write(id, data, fin, &mut sent, end, 1, &mut body, 4096, original)
+                );
+                let expected = [(
+                    id,
+                    u64::from(end - 1),
+                    vec![data[end as usize - 1]],
+                    fin && end as usize == data.len(),
+                )];
+                assert_eq!(stream_frames(&body), expected);
+                received.push(data[end as usize - 1]);
+                assert_eq!(
+                    *storage
+                        .get_or_insert((fragments.flights.as_ptr(), fragments.flights.capacity())),
+                    (fragments.flights.as_ptr(), fragments.flights.capacity())
+                );
+                fragments.on_timeout();
+                body.clear();
+                // A failed retry cannot consume a packet identity or new credit.
+                assert!(fragments.write(
+                    id,
+                    data,
+                    fin,
+                    &mut sent,
+                    end,
+                    0,
+                    &mut body,
+                    0,
+                    original + 1
+                ));
+                assert!(body.is_empty());
+                assert_eq!(fragments.flights[0].delivery.sent_in, [original]);
+                assert!(!fragments.write(
+                    id,
+                    data,
+                    fin,
+                    &mut sent,
+                    end,
+                    0,
+                    &mut body,
+                    4096,
+                    original + 2
+                ));
+                assert_eq!(stream_frames(&body), expected);
+                assert_eq!(sent, end);
+                assert!(!fragments.on_ack(original - 4, 0, &[]));
+                assert!(fragments.on_ack(original, 0, &[]));
+                assert!(!fragments.on_ack(original + 2, 0, &[]));
+                assert!(fragments.flights.is_empty());
+                assert!(!fragments.pending());
+                assert_eq!(
+                    storage.unwrap(),
+                    (fragments.flights.as_ptr(), fragments.flights.capacity())
+                );
+            }
+            assert_eq!(received, data);
+        }
+    }
+
+    #[test]
+    fn growing_fragment_storage_preserves_sparse_survivors_and_fin() {
+        for (id, data, fin) in [(0, RESPONSE, true), (3, CONTROL_PRELUDE, false)] {
+            let mut fragments = Fragments::default();
+            let mut sent = 0;
+            for end in 1..=data.len() as u8 {
+                let mut body = Vec::new();
+                assert!(!fragments.write(
+                    id,
+                    data,
+                    fin,
+                    &mut sent,
+                    end,
+                    1,
+                    &mut body,
+                    4096,
+                    u64::from(end) * 4
+                ));
+                assert_eq!(
+                    stream_frames(&body),
+                    [(
+                        id,
+                        u64::from(end - 1),
+                        vec![data[end as usize - 1]],
+                        fin && end as usize == data.len()
+                    )]
+                );
+            }
+            assert_eq!(fragments.flights.len(), data.len());
+            let storage = fragments.flights.as_ptr();
+            let capacity = fragments.flights.capacity();
+            // ACK alternate original packets, leaving disjoint byte ranges.
+            for end in (2..=data.len() as u8).step_by(2).rev() {
+                assert!(fragments.on_ack(u64::from(end) * 4, 0, &[]));
+            }
+            fragments.on_timeout();
+            let mut body = Vec::new();
+            assert!(!fragments.write(
+                id,
+                data,
+                fin,
+                &mut sent,
+                data.len() as u8,
+                0,
+                &mut body,
+                4096,
+                1000
+            ));
+            let expected: Vec<_> = (0..data.len())
+                .step_by(2)
+                .map(|i| (id, i as u64, vec![data[i]], fin && i + 1 == data.len()))
+                .collect();
+            assert_eq!(stream_frames(&body), expected);
+            assert_eq!(sent as usize, data.len());
+            assert_eq!(fragments.flights.as_ptr(), storage);
+            for end in (1..=data.len() as u8).step_by(2).rev() {
+                assert!(fragments.on_ack(u64::from(end) * 4, 0, &[]));
+            }
+            assert!(fragments.flights.is_empty());
+            assert!(!fragments.on_ack(1000, 0, &[]));
+            assert_eq!(fragments.flights.capacity(), capacity);
+            assert_eq!(fragments.flights.as_ptr(), storage);
+        }
+    }
+
     #[test]
     fn promoted_response_history_is_bounded_and_acks_newest_copy() {
         let mut fragments = Fragments::lost_response(10);
