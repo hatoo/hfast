@@ -120,6 +120,50 @@ fn control_ack_sparse_large_history() {
 }
 
 #[test]
+fn decoded_ack_sparse_range_boundaries_match_set() {
+    let max = (1_u64 << 62) - 1;
+    // Include both sides of the short-list cutoff and binary search splits.
+    for len in [
+        1, 2, 3, 4, 5, 7, 8, 9, 31, 32, 33, 63, 64, 65, 511, 512, 513,
+    ] {
+        for base in [0, max - 4 * len - 3] {
+            let packets: BTreeSet<_> = (0..len)
+                .flat_map(|i| [base + 4 * i + 1, base + 4 * i + 2])
+                .collect();
+            // Inclusive endpoints, both sides of every gap, and identities
+            // older/newer than all ranges. The oracle is packet membership.
+            for pn in base..=base + 4 * len + 3 {
+                check(&[pn], &packets, false);
+                check(&[pn], &packets, true);
+            }
+            check(&[], &packets, false);
+            check(&[], &packets, true);
+            // A late original must deliver a flight even after several newer
+            // copies, while a matching newer copy must survive older misses.
+            for pn in [base + 1, base + 4 * (len / 2) + 1, base + 4 * len - 2] {
+                check(&[pn, max, max], &packets, true);
+                check(&[base, base, pn], &packets, false);
+            }
+        }
+    }
+}
+
+#[test]
+fn decoded_ack_empty_ranges_preserve_history_and_loss_rules() {
+    for pending in [false, true] {
+        for largest in [0, 32, 33] {
+            let mut flight = Flight::<sent_packets::SentPackets>::new();
+            flight.sent(10);
+            flight.sent(30);
+            flight.pending = pending;
+            assert!(!flight.on_ack_ranges(largest, &[]));
+            assert_eq!(&*flight.sent_in, &[10, 30]);
+            assert_eq!(flight.pending, pending || largest >= 33);
+        }
+    }
+}
+
+#[test]
 fn control_ack_varint_and_packet_number_boundaries() {
     let max = (1_u64 << 62) - 1;
     let history = [0, 63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, max];

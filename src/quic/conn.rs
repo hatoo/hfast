@@ -176,10 +176,26 @@ impl<H: PacketHistory> Flight<H> {
     }
 
     fn on_ack_ranges(&mut self, largest: u64, ranges: &[(u64, u64)]) -> bool {
-        let acknowledged = self
-            .sent_in
-            .iter()
-            .any(|&pn| ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi));
+        let acknowledged = if ranges.len() <= 4 {
+            self.sent_in
+                .iter()
+                .any(|&pn| ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi))
+        } else {
+            // Decoded ACK ranges are disjoint and descending. The first range
+            // starting at or below this packet is the only possible match.
+            // Fresh copies often fall in the newest range even when old gaps
+            // leave a long sparse tail. Keep those hits (and newer misses)
+            // constant-time before searching the older ranges.
+            let newest = ranges[0];
+            let ranges = &ranges[1..];
+            self.sent_in.iter().any(|&pn| {
+                if pn >= newest.0 {
+                    return pn <= newest.1;
+                }
+                let at = ranges.partition_point(|&(lo, _)| lo > pn);
+                ranges.get(at).is_some_and(|&(_, hi)| pn <= hi)
+            })
+        };
         self.on_acknowledged(largest, acknowledged)
     }
 
