@@ -13,7 +13,7 @@ jobs:
   correctness:
     name: ci
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -324,3 +324,34 @@ jobs:
             "$(command -v python)" benchmarks/persistent-peer-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/persistent-peer/persistent-peer" \
             "$RUNNER_TEMP/persistent-smoke"
+      - name: Fixed native response-credit transport
+        uses: actions/checkout@v5
+        with:
+          repository: hatoo/shb
+          ref: 3a13d87922f9fd92e19ea2de8c3375dcd7a48e11
+          path: .response-credit-shb
+          persist-credentials: false
+      - name: Native response-credit ledgers and independent wire faults
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: |
+          rustfmt --edition 2024 --config skip_children=true --check benchmarks/response-credit-peer-main.rs benchmarks/response-credit-ledger.rs
+          python -m unittest discover -s benchmarks -p test_response_credit_reports.py -v
+          python benchmarks/build-response-credit-peer.py .response-credit-shb "$RUNNER_TEMP/response-credit-peer"
+          python benchmarks/response-credit-peer-interop.py "$RUNNER_TEMP/response-credit-peer/response-credit-peer" "$RUNNER_TEMP/response-credit-interop"
+      - name: Native small response-credit, sparse ACKs and reliable grants
+        run: |
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' response-credit \
+            "$(command -v python)" benchmarks/response-credit-native-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/response-credit-peer/response-credit-peer" \
+            "$RUNNER_TEMP/response-credit-native" --cpu 1
+      - name: Preserve native response-credit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: response-credit-evidence
+          path: |
+            ${{ runner.temp }}/response-credit-native
+            ${{ runner.temp }}/response-credit-interop
+            ${{ runner.temp }}/response-credit-peer/manifest.json
+          retention-days: 7
