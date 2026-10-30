@@ -369,6 +369,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fresh_credit_after_partial_retry_preserves_pending_work() {
+        for (data, fin) in [(RESPONSE, true), (CONTROL_PRELUDE, false)] {
+            let mut fragments = Fragments::default();
+            let mut sent = 0;
+            let mut body = Vec::new();
+            let end = data.len() as u8;
+            for (pn, limit) in [(100, 1), (101, 2)] {
+                body.clear();
+                assert!(!fragments.write(64, data, fin, &mut sent, limit, 1, &mut body, 6, pn));
+                assert!(!fragments.pending());
+            }
+            body.clear();
+            assert!(fragments.write(64, data, fin, &mut sent, end, 100, &mut body, 0, 102));
+            assert!(body.is_empty());
+            assert!(
+                !fragments.pending(),
+                "blocked fresh bytes are not lost bytes"
+            );
+
+            fragments.on_timeout();
+            assert!(fragments.pending());
+            // The first retry fits, but the second retry and new credit do not.
+            assert!(fragments.write(64, data, fin, &mut sent, end, 100, &mut body, 6, 110));
+            assert_eq!(stream_frames(&body), [(64, 0, data[..1].to_vec(), false)]);
+            assert_eq!(sent, 2);
+            assert!(fragments.pending());
+            assert!(fragments.on_ack(100, 0, &[]));
+            assert!(!fragments.on_ack(100, 0, &[]));
+            assert!(fragments.pending(), "a later retry still needs output");
+
+            body.clear();
+            // Finishing retries clears pending even when fresh bytes cannot fit.
+            assert!(fragments.write(64, data, fin, &mut sent, end, 100, &mut body, 6, 111));
+            assert_eq!(stream_frames(&body), [(64, 1, data[1..2].to_vec(), false)]);
+            assert_eq!(sent, 2);
+            assert!(!fragments.pending());
+            body.clear();
+            assert!(fragments.write(64, data, fin, &mut sent, end, 100, &mut body, 0, 112));
+            assert!(body.is_empty());
+            assert!(!fragments.pending());
+            assert!(!fragments.write(
+                64,
+                data,
+                fin,
+                &mut sent,
+                end,
+                100,
+                &mut body,
+                5 + data.len() - 2,
+                113
+            ));
+            assert_eq!(stream_frames(&body), [(64, 2, data[2..].to_vec(), fin)]);
+            assert_eq!(sent, end);
+            assert!(!fragments.pending());
+
+            assert!(fragments.on_ack(101, 0, &[]));
+            assert!(!fragments.pending());
+            assert!(!fragments.on_ack(116, 0, &[]));
+            assert!(fragments.pending(), "ACK of a later packet declares loss");
+            body.clear();
+            assert!(fragments.write(64, data, fin, &mut sent, end, 0, &mut body, 0, 117));
+            assert!(fragments.pending());
+            assert!(fragments.on_ack(113, 0, &[]));
+            assert!(!fragments.on_ack(113, 0, &[]));
+            assert!(
+                !fragments.pending(),
+                "a late original ACK cancels the retry"
+            );
+            fragments.on_timeout();
+            assert!(!fragments.pending());
+            assert!(!fragments.write(64, data, fin, &mut sent, end, 0, &mut body, 4096, 118));
+            assert!(body.is_empty());
+            assert_eq!(sent, end);
+        }
+    }
+
+    #[test]
     fn sparse_ack_and_partial_retry_preserve_each_fragment_boundary() {
         let data = b"abcdefghijk";
         let mut fragments = Fragments::default();
