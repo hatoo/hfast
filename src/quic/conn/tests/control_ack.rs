@@ -15,7 +15,7 @@ fn ranges(packets: &BTreeSet<u64>) -> Vec<(u64, u64)> {
     ranges
 }
 
-fn apply(flight: &mut ControlFlight, packets: &BTreeSet<u64>) -> bool {
+fn apply<H: PacketHistory>(flight: &mut Flight<H>, packets: &BTreeSet<u64>) -> bool {
     let mut bytes = Vec::new();
     frame::put_ack(&mut bytes, &ranges(packets), 0);
     let frame::Frame::Ack {
@@ -31,20 +31,37 @@ fn apply(flight: &mut ControlFlight, packets: &BTreeSet<u64>) -> bool {
 }
 
 fn check(history: &[u64], packets: &BTreeSet<u64>, pending: bool) {
-    let mut flight = ControlFlight::new();
+    // Both storage policies must agree with the independent set model,
+    // including empty, inline and spilled fragment histories.
+    check_storage::<Vec<u64>>(history, packets, pending, Vec::capacity);
+    check_storage::<sent_packets::SentPackets>(
+        history,
+        packets,
+        pending,
+        sent_packets::SentPackets::capacity,
+    );
+}
+
+fn check_storage<H: PacketHistory>(
+    history: &[u64],
+    packets: &BTreeSet<u64>,
+    pending: bool,
+    capacity: impl Fn(&H) -> usize,
+) {
+    let mut flight = Flight::<H>::new();
     for &pn in history {
         flight.sent(pn);
     }
     flight.pending = pending;
-    let capacity = flight.sent_in.capacity();
+    let before_capacity = capacity(&flight.sent_in);
     let hit = history.iter().any(|pn| packets.contains(pn));
     let loss = history
         .last()
         .is_some_and(|pn| *packets.last().unwrap() >= pn + Connection::LOSS_THRESHOLD);
     assert_eq!(apply(&mut flight, packets), hit, "{history:?} {packets:?}");
     assert_eq!(flight.pending, !hit && (pending || loss));
-    assert_eq!(flight.sent_in, if hit { &[][..] } else { history });
-    assert_eq!(flight.sent_in.capacity(), capacity);
+    assert_eq!(&*flight.sent_in, if hit { &[][..] } else { history });
+    assert_eq!(capacity(&flight.sent_in), before_capacity);
     assert!(!apply(&mut flight, packets), "duplicate ACK made progress");
     assert_eq!(flight.pending, !hit && (pending || loss));
 }

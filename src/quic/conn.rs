@@ -21,6 +21,9 @@ use super::{MAX_DATAGRAM, TAG_LEN, assemble::Assembler, frame, transport};
 
 use crate::h3::{CONTROL_PRELUDE, RESPONSE};
 
+mod sent_packets;
+use sent_packets::PacketHistory;
+
 mod stream_credit;
 use stream_credit::{MAX_STREAM_OFFSET, StreamCredits};
 mod send_credit;
@@ -135,8 +138,11 @@ struct CryptoFlight {
 
 /// A fixed control payload, retained until any transmission is acknowledged.
 /// Earlier packet numbers remain valid when a probe is queued or retransmitted.
-struct ControlFlight {
-    sent_in: Vec<u64>,
+type ControlFlight = Flight<Vec<u64>>;
+
+/// Delivery rules are shared; only fragments use inline packet histories.
+struct Flight<H> {
+    sent_in: H,
     pending: bool,
 }
 
@@ -149,10 +155,10 @@ struct ResetFlight {
     flight: ControlFlight,
 }
 
-impl ControlFlight {
+impl<H: PacketHistory> Flight<H> {
     fn new() -> Self {
         Self {
-            sent_in: Vec::new(),
+            sent_in: H::default(),
             pending: true,
         }
     }

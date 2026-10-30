@@ -3,7 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::sent_packets::SentPackets;
 use super::*;
+
+type FragmentFlight = Flight<SentPackets>;
 
 // The fixed messages fit in byte-sized offsets. Changing their size must not
 // silently truncate either flow-control accounting or RESET_STREAM final sizes.
@@ -47,7 +50,7 @@ impl SendCredit {
 struct RangeFlight {
     start: u8,
     end: u8,
-    delivery: ControlFlight,
+    delivery: FragmentFlight,
 }
 
 impl RangeFlight {
@@ -62,7 +65,7 @@ impl RangeFlight {
         // Bounded history still lets a late original ACK cancel a probe. If
         // an ancient copy is forgotten, a newer copy remains recoverable.
         if self.delivery.sent_in.len() == MAX_COPIES {
-            self.delivery.sent_in.remove(0);
+            self.delivery.sent_in.remove_first();
         }
         self.delivery.sent(pn);
     }
@@ -86,8 +89,8 @@ impl Fragments {
             flights: vec![RangeFlight {
                 start: 0,
                 end: RESPONSE.len() as u8,
-                delivery: ControlFlight {
-                    sent_in: vec![pn],
+                delivery: FragmentFlight {
+                    sent_in: SentPackets::one(pn),
                     pending: true,
                 },
             }],
@@ -139,7 +142,7 @@ impl Fragments {
             let mut flight = RangeFlight {
                 start: *sent,
                 end: *sent + fresh,
-                delivery: ControlFlight::new(),
+                delivery: FragmentFlight::new(),
             };
             if !flight.fits(id, body.len(), room) {
                 return true;
@@ -564,7 +567,7 @@ mod tests {
                         )]
                     );
                     assert_eq!(fragments.flights.len(), 1);
-                    assert_eq!(fragments.flights[0].delivery.sent_in, [8]);
+                    assert_eq!(fragments.flights[0].delivery.sent_in.as_slice(), [8]);
                 }
             }
         }
@@ -611,7 +614,7 @@ mod tests {
                     original + 1
                 ));
                 assert!(body.is_empty());
-                assert_eq!(fragments.flights[0].delivery.sent_in, [original]);
+                assert_eq!(fragments.flights[0].delivery.sent_in.as_slice(), [original]);
                 assert!(!fragments.write(
                     id,
                     data,
@@ -728,7 +731,7 @@ mod tests {
             assert!(fragments.flights[0].delivery.sent_in.len() <= MAX_COPIES);
         }
         assert_eq!(
-            fragments.flights[0].delivery.sent_in,
+            fragments.flights[0].delivery.sent_in.as_slice(),
             (32..40).collect::<Vec<_>>()
         );
         assert!(!fragments.on_ack(10, 0, &[]));
