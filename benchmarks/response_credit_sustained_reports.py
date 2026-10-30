@@ -13,6 +13,7 @@ def validate(row, count, window, schedule, mode):
     require(row['phase'] == 'done' and row['error'] is None, f'native failure: {row.get("error")}')
     require((row['count'], row['window'], row['schedule'], row['mode']) == (count, window, schedule, mode), 'workload changed')
     require(row['completed'] == row['retired'] == row['request_acks'] == len(row['samples']) == count, 'missing completion/sample/request ACK')
+    require(not row['active_streams'], 'unretired live streams')
     require(row['response_bytes'] == count * 25, 'missing bytes')
     require(row['request_bytes_reserved'] == 5 + 18 * count <= row['max_data'] and count <= row['max_streams'], 'request credit exceeded')
     grants = count * (len(limits(schedule)) - 1)
@@ -81,3 +82,23 @@ def validate(row, count, window, schedule, mode):
                 elapsed_seconds=interval['elapsed_ns']/1e9, peer_cpu_seconds=interval['cpu_elapsed_ns']/1e9,
                 peer_cpu_cores=interval['cpu_elapsed_ns']/interval['elapsed_ns'],
                 sent_packets=row['sent_packets'], ack_packets=row['ack_packets'], received_packets=row['received_packets'])
+
+
+def validate_failed_samples(row):
+    """Retain successful response timestamps even when an ACK gate times out."""
+    require(row['phase'] == 'failed' and row['error'], 'expected explicit failure')
+    require(len(row['samples']) == row['retired'], 'retired sample lost')
+    samples = list(row['samples'])
+    for i, stream in enumerate(row['active_streams']):
+        require(stream['id'] == (row['retired'] + i) * 4, 'active generation alias')
+        start, end = stream['started_ns'], stream['completed_ns']
+        if start is not None:
+            require(type(start) is int and row['workload_start_ns'] <= start <= row['workload_end_ns'], 'active start outside workload')
+        if end is not None:
+            require(stream['seen'] == (1 << 25) - 1 and stream['fin'], 'partial response sample')
+            samples.append([stream['id'], start, end])
+    require(len(samples) == row['completed'], 'completed active sample lost')
+    require(len({s[0] for s in samples}) == len(samples), 'duplicate failed sample')
+    for _, start, end in samples:
+        require(type(start) is int and type(end) is int and row['workload_start_ns'] <= start < end <= row['workload_end_ns'], 'failed sample timestamp lost')
+    return len(samples)

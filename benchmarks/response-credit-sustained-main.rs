@@ -729,6 +729,9 @@ impl Peer {
             "udp":udp_evidence::interval(&self.udp_before,&self.socket),"port":self.socket.local_addr().unwrap().port(),
             "control_bytes":self.control.count_ones(),"bootstrap_acked":self.bootstrap_acked,"fence_acked":self.fence_acked,
             "samples":self.waves.samples.iter().map(|s|(s.stream,s.started_ns,s.completed_ns)).collect::<Vec<_>>(),
+            "active_streams":self.waves.slots.iter().enumerate().map(|(i,s)|json!({
+                "id":(self.waves.retired+i as u64)*4,"started_ns":s.started,"completed_ns":s.completed,
+                "seen":s.seen,"fin":s.fin,"limit":s.limit,"request_acked":s.request_acked,"grant_acked":s.grant_acked})).collect::<Vec<_>>(),
             "sent_work":self.sent,"frames":self.frames,"acked_work":self.acked_work,"unacked_work":self.flights.len(),
             "received_ranges":self.seen.0,"acked_packet_ranges":self.acked_wire.0,"server_ack_ranges":self.acked_by_server.0,"withheld_ranges":self.withheld.0,
             "sent_packets":self.sent_packets,"received_packets":self.received_packets,"handshake_sent":self.handshake_sent,"handshake_received":self.handshake_received,

@@ -13,7 +13,7 @@ from aioquic.asyncio import serve
 from aioquic.buffer import Buffer
 from aioquic.quic.packet import push_ack_frame, pull_quic_transport_parameters
 
-from response_credit_sustained_reports import limits, validate
+from response_credit_sustained_reports import limits, validate, validate_failed_samples
 from response_credit_reports import RESPONSE
 from udp_accounting import require
 
@@ -175,6 +175,7 @@ async def check(peer, output, schedule='byte', mode='each', scenario='ordinary',
         row = json.loads(stdout)
         if hostile:
             require(process.returncode != 0 and row['phase'] == 'failed', f'fault accepted: {fault or scenario}')
+            validate_failed_samples(row)
             expected = {'wrong-byte':'wire bytes differ', 'premature-fin':'wire premature/control FIN',
                         'credit-overrun':'wire length/credit exceeded'}.get(fault, 'timeout')
             require(expected in row['error'], f'wrong failure: {row["error"]}')
@@ -182,6 +183,7 @@ async def check(peer, output, schedule='byte', mode='each', scenario='ordinary',
                 require(len(p.headers) == window and row['blocked_streams'] > 0, 'request sent without stream credit')
             if scenario == 'no-request-ack':
                 require(row['request_acks'] == 0 and row['retired'] == 0 and row['retries'] > 0, 'response inferred request ACK')
+                require(row['completed'] == len(row['active_streams']) == window, 'completed unacknowledged samples absent')
             result = dict(rejected=True, error=row['error'], scenario=scenario, fault=fault)
         else:
             require(process.returncode == 0, stderr.decode())

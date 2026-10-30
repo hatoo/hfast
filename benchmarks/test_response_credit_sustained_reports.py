@@ -1,7 +1,7 @@
 """Handwritten two-wave transcript and negative accounting controls."""
 import copy
 import unittest
-from response_credit_sustained_reports import validate
+from response_credit_sustained_reports import validate, validate_failed_samples
 from response_credit_reports import RESPONSE
 
 
@@ -12,7 +12,7 @@ def complete():
         bootstrap_acked=True, control_bytes=3, fence_acked=True, unacked_work=0,
         udp=dict(status='available', drops=0), workload_start_ns=5, workload_end_ns=95,
         interval=dict(start_monotonic_ns=100, end_monotonic_ns=200, elapsed_ns=100, cpu_elapsed_ns=80),
-        samples=[[0,10,20],[4,10,21],[8,30,40],[12,30,42]],
+        active_streams=[], samples=[[0,10,20],[4,10,21],[8,30,40],[12,30,42]],
         trace=True, sent_work=[[1,0,3,3,True,False],*[ [2+i//2,1,i*4,0,True,False] for i in range(4)],
                               *[[4+i//2,2,i*4,25,True,False] for i in range(4)], [6,4,0,0,True,False]],
         acked_work=[[0,3,3],*[[1,i*4,0] for i in range(4)],*[[2,i*4,25] for i in range(4)],[4,0,0]],
@@ -66,6 +66,21 @@ class Reports(unittest.TestCase):
         self.assertEqual(check(row)['completed'],4)
         row['frames'][-1][3][0]^=1
         with self.assertRaises(ValueError): check(row)
+
+    def test_failed_completed_live_sample_is_preserved_before_request_ack(self):
+        row=complete()
+        row.update(phase='failed',error='ACK timeout',retired=2,samples=row['samples'][:2],
+                   active_streams=[dict(id=sid,started_ns=30,completed_ns=40,seen=(1<<25)-1,fin=True)
+                                   for sid in (8,12)])
+        self.assertEqual(validate_failed_samples(row),4)
+        for fault in ('lost','timestamp','alias','bytes','fin'):
+            changed=copy.deepcopy(row)
+            if fault=='lost':changed['active_streams'].pop()
+            if fault=='timestamp':changed['active_streams'][0]['completed_ns']=None
+            if fault=='alias':changed['active_streams'][0]['id']=0
+            if fault=='bytes':changed['active_streams'][0]['seen']=0
+            if fault=='fin':changed['active_streams'][0]['fin']=False
+            with self.subTest(fault=fault), self.assertRaises(ValueError):validate_failed_samples(changed)
 
     def test_missing_bytes_fin_and_drop_evidence(self):
         for fault in ('bytes','fin','drop','unavailable','ack'):

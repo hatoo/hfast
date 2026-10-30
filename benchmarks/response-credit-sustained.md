@@ -54,7 +54,9 @@ and explicit deadlines. It is not a general-purpose QUIC implementation.
 With `--trace`, bounded transcripts retain every sent work item and received
 STREAM frame for an independent Python set/byte oracle. Without it, the peer
 still validates every byte/FIN and retains every sample, while omitting only
-per-frame/per-work traces. It emits all samples after measurement. No latency
+per-frame/per-work traces. It emits all samples after measurement. Failed reports
+also retain live byte/FIN/ACK state and timestamps, including complete responses
+whose request or grant ACK has not arrived. No latency
 sampling, overwritten history, stream-ID reuse, per-wave TLS restart, or
 per-wave process startup is used.
 
