@@ -355,3 +355,29 @@ jobs:
             ${{ runner.temp }}/response-credit-interop
             ${{ runner.temp }}/response-credit-peer/manifest.json
           retention-days: 7
+      - name: Sustained response-credit generations and independent wire faults
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: |
+          rustfmt --edition 2024 --config skip_children=true --check benchmarks/response-credit-sustained-main.rs benchmarks/response-credit-waves.rs
+          python -m unittest discover -s benchmarks -p test_response_credit_sustained_reports.py -v
+          python benchmarks/build-response-credit-sustained.py .response-credit-shb "$RUNNER_TEMP/response-credit-sustained"
+          python benchmarks/response-credit-sustained-interop.py "$RUNNER_TEMP/response-credit-sustained/response-credit-sustained" "$RUNNER_TEMP/response-credit-sustained-interop"
+      - name: Native bounded response-credit waves with exact socket evidence
+        run: |
+          for schedule in byte two-byte two-fragment full; do
+            sudo unshare --net sh -c 'ip link set lo up && exec "$@"' credit-waves \
+              "$(command -v python)" benchmarks/response-credit-sustained-check.py \
+              "$PWD/target/release/hfast" "$RUNNER_TEMP/response-credit-sustained/response-credit-sustained" \
+              "$RUNNER_TEMP/credit-waves-$schedule" --count 1024 --window 512 --schedule "$schedule" --cpu 1 --trace
+          done
+      - name: Preserve sustained response-credit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sustained-response-credit-evidence
+          path: |
+            ${{ runner.temp }}/credit-waves-*
+            ${{ runner.temp }}/response-credit-sustained-interop
+            ${{ runner.temp }}/response-credit-sustained/manifest.json
+          retention-days: 7
