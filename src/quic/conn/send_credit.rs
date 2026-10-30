@@ -101,11 +101,17 @@ impl Fragments {
         self.flights.iter().any(|f| f.delivery.pending)
     }
 
-    fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) -> bool {
+    fn on_ack_ranges(&mut self, largest: u64, ranges: &[(u64, u64)]) -> bool {
         let before = self.flights.len();
         self.flights
-            .retain_mut(|f| !f.delivery.on_ack(largest, first_range, rest));
+            .retain_mut(|f| !f.delivery.on_ack_ranges(largest, ranges));
         self.flights.len() < before
+    }
+
+    #[cfg(test)]
+    fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) -> bool {
+        let ranges: Vec<_> = frame::AckRanges::new(largest, first_range, rest).collect();
+        self.on_ack_ranges(largest, &ranges)
     }
 
     fn on_timeout(&mut self) {
@@ -294,9 +300,24 @@ impl Connection {
         first_range: u64,
         rest: &[u8],
     ) -> bool {
+        if self.send_credit.control_fragments.is_none() && self.send_credit.responses.is_empty() {
+            return false;
+        }
+        // Every fragment and retransmitted copy sees the same ACK. Decode its
+        // ranges once for this pass, reusing the ordinary response ACK buffer.
+        // A contiguous ACK needs no scratch allocation, even on a new connection.
+        let first = [(largest.saturating_sub(first_range), largest)];
+        let ranges = if rest.is_empty() {
+            first.as_slice()
+        } else {
+            self.ack_ranges.clear();
+            self.ack_ranges
+                .extend(frame::AckRanges::new(largest, first_range, rest));
+            self.ack_ranges.as_slice()
+        };
         let mut progress = false;
         if let Some(control) = &mut self.send_credit.control_fragments {
-            progress |= control.on_ack(largest, first_range, rest);
+            progress |= control.on_ack_ranges(largest, ranges);
             if control.flights.is_empty()
                 && self.send_credit.control_sent as usize == CONTROL_PRELUDE.len()
             {
@@ -309,7 +330,7 @@ impl Connection {
         let available = self.send_credit.available();
         let mut retired = false;
         self.send_credit.responses.retain(|&id, fragments| {
-            progress |= fragments.on_ack(largest, first_range, rest);
+            progress |= fragments.on_ack_ranges(largest, ranges);
             let i = ((id >> 2) - self.base_stream) as usize;
             let StreamSlot::Active(req) = &mut self.streams[i] else {
                 unreachable!()

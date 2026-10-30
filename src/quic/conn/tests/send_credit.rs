@@ -36,6 +36,80 @@ fn idle(conn: &mut Connection) {
 }
 
 #[test]
+fn decoded_fragment_acks_replace_scratch_across_mixed_histories() {
+    let mut conn = constrained(1024, 4096);
+    conn.spaces[Space::Data as usize].next_pn = 100;
+    for (id, pn) in [(0, 10), (4, 10), (8, 20), (12, 30), (16, 40)] {
+        *conn.stream_mut(id).unwrap() = Request {
+            fin: true,
+            answered: true,
+            sent: RESPONSE.len() as u8,
+            send_limit: RESPONSE.len() as u8,
+            partial: id != 16,
+            ..Request::default()
+        };
+        if id == 16 {
+            conn.unacked.push_back((pn, id));
+        } else {
+            conn.send_credit
+                .responses
+                .insert(id, Fragments::lost_response(pn));
+        }
+    }
+    // Scratch is not delivery state. Even an old view covering every live
+    // packet must be discarded before handling the current sparse ACK.
+    conn.ack_ranges = vec![(0, 100)];
+    acknowledge(&mut conn, Space::Data, &[(50, 50), (22, 22), (18, 18)]);
+    assert_eq!(conn.finished, 0);
+    assert_eq!(conn.send_credit.responses.len(), 5); // ordinary 40 declared lost
+    assert!(conn.unacked.is_empty());
+    let allocation = conn.ack_ranges.as_ptr();
+    let capacity = conn.ack_ranges.capacity();
+
+    // Contiguous ACKs must not read the previous three-range view.
+    acknowledge(&mut conn, Space::Data, &[(40, 40)]);
+    assert_eq!(conn.finished, 1);
+    assert_eq!(conn.send_credit.responses.len(), 4);
+    acknowledge(&mut conn, Space::Data, &[(30, 30), (10, 10)]);
+    assert_eq!(conn.finished, 4, "both fragments in packet 10 complete");
+    assert_eq!(
+        conn.send_credit
+            .responses
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        [8]
+    );
+    acknowledge(&mut conn, Space::Data, &[(30, 30), (10, 10)]);
+    assert_eq!(conn.finished, 4, "duplicate sparse ACK makes no progress");
+    acknowledge(&mut conn, Space::Data, &[(20, 20)]);
+    assert_eq!(conn.finished, 5);
+    assert_eq!(conn.ack_ranges.as_ptr(), allocation);
+    assert_eq!(conn.ack_ranges.capacity(), capacity);
+    assert!(conn.send_credit.responses.is_empty());
+    assert!(conn.ready.is_empty());
+}
+
+#[test]
+fn contiguous_fragment_acks_need_no_scratch_allocation() {
+    let mut conn = constrained(1, 4096);
+    conn.ack_ranges = Vec::new();
+    conn.on_stream(0, 0, b"request", true).unwrap();
+    let (first, plain) = send_data(&mut conn);
+    assert_eq!(streams(&plain), [(0, 0, RESPONSE[..1].to_vec(), false)]);
+    acknowledge(&mut conn, Space::Data, &[(first, first)]);
+    assert_eq!(conn.ack_ranges.capacity(), 0);
+    grant(&mut conn, 0, RESPONSE.len() as u64);
+    let (last, plain) = send_data(&mut conn);
+    assert_eq!(streams(&plain), [(0, 1, RESPONSE[1..].to_vec(), true)]);
+    acknowledge(&mut conn, Space::Data, &[(last, last)]);
+    assert_eq!(conn.finished, 1);
+    assert_eq!(conn.ack_ranges.capacity(), 0);
+    assert_eq!(conn.send_credit.sent, 3 + RESPONSE.len() as u64);
+    idle(&mut conn);
+}
+
+#[test]
 fn late_fragment_ack_cancels_only_pending_range_with_unacked_siblings() {
     for id in [0, 64] {
         let mut conn = constrained(1, 4096);
