@@ -169,9 +169,22 @@ impl<H: PacketHistory> Flight<H> {
     }
 
     fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) -> bool {
-        if self.sent_in.iter().any(|&pn| {
+        let acknowledged = self.sent_in.iter().any(|&pn| {
             frame::AckRanges::new(largest, first_range, rest).any(|(lo, hi)| pn >= lo && pn <= hi)
-        }) {
+        });
+        self.on_acknowledged(largest, acknowledged)
+    }
+
+    fn on_ack_ranges(&mut self, largest: u64, ranges: &[(u64, u64)]) -> bool {
+        let acknowledged = self
+            .sent_in
+            .iter()
+            .any(|&pn| ranges.iter().any(|&(lo, hi)| pn >= lo && pn <= hi));
+        self.on_acknowledged(largest, acknowledged)
+    }
+
+    fn on_acknowledged(&mut self, largest: u64, acknowledged: bool) -> bool {
+        if acknowledged {
             self.sent_in.clear();
             self.pending = false;
             return true;

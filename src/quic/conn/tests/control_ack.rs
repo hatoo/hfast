@@ -15,7 +15,11 @@ fn ranges(packets: &BTreeSet<u64>) -> Vec<(u64, u64)> {
     ranges
 }
 
-fn apply<H: PacketHistory>(flight: &mut Flight<H>, packets: &BTreeSet<u64>) -> bool {
+fn apply_with<H: PacketHistory>(
+    flight: &mut Flight<H>,
+    packets: &BTreeSet<u64>,
+    decoded: bool,
+) -> bool {
     let mut bytes = Vec::new();
     frame::put_ack(&mut bytes, &ranges(packets), 0);
     let frame::Frame::Ack {
@@ -27,7 +31,16 @@ fn apply<H: PacketHistory>(flight: &mut Flight<H>, packets: &BTreeSet<u64>) -> b
     else {
         panic!("expected ACK");
     };
-    flight.on_ack(largest, first_range, rest)
+    if decoded {
+        let ranges: Vec<_> = frame::AckRanges::new(largest, first_range, rest).collect();
+        flight.on_ack_ranges(largest, &ranges)
+    } else {
+        flight.on_ack(largest, first_range, rest)
+    }
+}
+
+fn apply<H: PacketHistory>(flight: &mut Flight<H>, packets: &BTreeSet<u64>) -> bool {
+    apply_with(flight, packets, false)
 }
 
 fn check(history: &[u64], packets: &BTreeSet<u64>, pending: bool) {
@@ -48,22 +61,31 @@ fn check_storage<H: PacketHistory>(
     pending: bool,
     capacity: impl Fn(&H) -> usize,
 ) {
-    let mut flight = Flight::<H>::new();
-    for &pn in history {
-        flight.sent(pn);
+    for decoded in [false, true] {
+        let mut flight = Flight::<H>::new();
+        for &pn in history {
+            flight.sent(pn);
+        }
+        flight.pending = pending;
+        let before_capacity = capacity(&flight.sent_in);
+        let hit = history.iter().any(|pn| packets.contains(pn));
+        let loss = history
+            .last()
+            .is_some_and(|pn| *packets.last().unwrap() >= pn + Connection::LOSS_THRESHOLD);
+        assert_eq!(
+            apply_with(&mut flight, packets, decoded),
+            hit,
+            "{history:?} {packets:?}"
+        );
+        assert_eq!(flight.pending, !hit && (pending || loss));
+        assert_eq!(&*flight.sent_in, if hit { &[][..] } else { history });
+        assert_eq!(capacity(&flight.sent_in), before_capacity);
+        assert!(
+            !apply_with(&mut flight, packets, decoded),
+            "duplicate ACK made progress"
+        );
+        assert_eq!(flight.pending, !hit && (pending || loss));
     }
-    flight.pending = pending;
-    let before_capacity = capacity(&flight.sent_in);
-    let hit = history.iter().any(|pn| packets.contains(pn));
-    let loss = history
-        .last()
-        .is_some_and(|pn| *packets.last().unwrap() >= pn + Connection::LOSS_THRESHOLD);
-    assert_eq!(apply(&mut flight, packets), hit, "{history:?} {packets:?}");
-    assert_eq!(flight.pending, !hit && (pending || loss));
-    assert_eq!(&*flight.sent_in, if hit { &[][..] } else { history });
-    assert_eq!(capacity(&flight.sent_in), before_capacity);
-    assert!(!apply(&mut flight, packets), "duplicate ACK made progress");
-    assert_eq!(flight.pending, !hit && (pending || loss));
 }
 
 #[test]
