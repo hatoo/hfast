@@ -1547,6 +1547,7 @@ mod tests {
     mod control_ack;
     mod crypto_handshake;
     mod datagram_budget;
+    mod flight_history;
     mod key_updates;
     mod receive_headers;
     mod response_recovery;
