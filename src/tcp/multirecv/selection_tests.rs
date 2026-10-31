@@ -3,7 +3,7 @@ use super::*;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+pub(super) fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     let mut bytes = ((payload.len() as u32) << 8 | u32::from(kind))
         .to_be_bytes()
         .to_vec();
@@ -13,7 +13,7 @@ fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn settings() -> Vec<u8> {
+pub(super) fn settings() -> Vec<u8> {
     frame(
         4,
         0,
@@ -22,7 +22,7 @@ fn settings() -> Vec<u8> {
     )
 }
 
-fn h2_response(stream: u32) -> Vec<u8> {
+pub(super) fn h2_response(stream: u32) -> Vec<u8> {
     [
         frame(
             1,
@@ -36,7 +36,7 @@ fn h2_response(stream: u32) -> Vec<u8> {
 }
 
 #[test]
-fn every_preface_byte_and_h2_request_stays_on_single_reads() {
+fn every_preface_byte_uses_single_reads_then_h2_switches_once() {
     let mut worker = Worker::new(ring(2));
     let epoch = worker.io.pool.epoch;
     let (key, mut peer) = pair(&mut worker);
@@ -44,33 +44,42 @@ fn every_preface_byte_and_h2_request_stays_on_single_reads() {
     assert!(worker.receives.is_empty());
     for (i, byte) in crate::h2::PREFACE.iter().enumerate() {
         peer.write_all(&[*byte]).unwrap();
-        until(&mut worker, |w| w.receives.len() == i + 1);
+        until(&mut worker, |w| w.receives.len() > i);
         let socket = worker.socket(key).unwrap();
-        assert!(!socket.recv_active && socket.poll_active);
         if i + 1 < crate::h2::PREFACE.len() {
+            assert!(!socket.recv_active && socket.poll_active);
             assert!(matches!(socket.conn.proto, Proto::Unknown));
             assert_eq!(socket.conn.inbuf, &crate::h2::PREFACE[..i + 1]);
         } else {
             assert!(matches!(socket.conn.proto, Proto::H2(_)));
+            assert!(socket.recv_active && !socket.poll_active);
         }
     }
+    assert_eq!(
+        worker.receives,
+        [(key, false); crate::h2::PREFACE.len()]
+            .into_iter()
+            .chain([(key, true)])
+            .collect::<Vec<_>>()
+    );
     let mut bytes = vec![0; settings().len()];
     peer.read_exact(&mut bytes).unwrap();
     assert_eq!(bytes, settings());
     for stream in [1, 3, 5] {
-        let before = worker.receives.len();
+        let before = worker.io.pool.epoch;
         peer.write_all(&frame(1, 5, stream, b"\x82\x84\x86"))
             .unwrap();
-        until(&mut worker, |w| w.receives.len() > before);
+        until(&mut worker, |w| w.io.pool.epoch > before);
         let mut bytes = vec![0; h2_response(stream).len()];
         peer.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, h2_response(stream));
     }
-    assert!(worker.receives.iter().all(|&(k, multi)| k == key && !multi));
-    assert_eq!(
-        worker.io.pool.epoch, epoch,
-        "H2 must not consume the H1 buffer pool"
+    assert!(
+        worker.receives[crate::h2::PREFACE.len()..]
+            .iter()
+            .all(|&(k, multi)| k == key && multi)
     );
+    assert!(worker.io.pool.epoch > epoch);
     peer.shutdown(std::net::Shutdown::Write).unwrap();
     until(&mut worker, |w| w.sockets.get(key).is_none());
     assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
@@ -162,7 +171,7 @@ fn mixed_protocols_drain_queued_input_and_half_close_with_two_buffers() {
     }
     assert!(worker.sockets.is_empty());
     assert!(worker.io.pool.owned.iter().all(|&b| !b));
-    for (i, (key, ..)) in peers.iter().enumerate() {
+    for (key, ..) in &peers {
         let ops: Vec<bool> = worker
             .receives
             .iter()
@@ -170,11 +179,7 @@ fn mixed_protocols_drain_queued_input_and_half_close_with_two_buffers() {
             .map(|&(_, multi)| multi)
             .collect();
         assert!(!ops[0]);
-        if i % 2 == 0 {
-            assert!(ops.len() >= 2 && ops[1..].iter().all(|&multi| multi));
-        } else {
-            assert!(ops.iter().all(|&multi| !multi));
-        }
+        assert!(ops.len() >= 2 && ops[1..].iter().all(|&multi| multi));
     }
 }
 

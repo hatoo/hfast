@@ -1,7 +1,7 @@
-# HTTP/1 multishot receive validation
+# TCP multishot receive validation
 
-Classified HTTP/1 connections use bounded io_uring multishot receives. Unknown
-and HTTP/2 connections retain poll/single-read batches. The worker completes its
+Classified HTTP/1 and HTTP/2 connections use bounded io_uring multishot receives.
+Unknown connections retain poll/single-read batches. The worker completes its
 read and send batches before changing connection storage or parsing additional
 multishot input. A real operation probe falls back to the original worker when
 provided buffers or multishot receives are unavailable.
@@ -17,10 +17,17 @@ The worker reserves 2 MiB of provided payload and 2 MiB of single-read scratch,
 compared with the original worker's 2 MiB scratch. This memory cost is per worker.
 There can be at most 2^24 live or permanently retired identity slots per worker.
 
-## Measured workload and scope
+The H2 extension is experimental until its native performance is independently
+confirmed. Its tests cover byte-by-byte classification, two-buffer exhaustion,
+split HEADERS/CONTINUATION, zero stream credit, fragmented WINDOW_UPDATE,
+late completions, send-buffer borrows and GOAWAY behind partial output. The
+existing mixed-protocol and half-close tests also exercise H2 multishot input.
+The buffer sizes, slot identities and send barriers are unchanged.
+
+## Historical HTTP/1 measured workload and scope
 
 Experiment c150, WSL2, 2026-10-14. Immutable default hfast `debbdbd` (production
-source identical to `1aa46b9`) versus this implementation; fixed shb `39aa8c0`.
+source identical to `1aa46b9`) versus the H1 slot implementation; fixed shb `39aa8c0`.
 Rustc 1.98.0, release optimization, fat LTO, one codegen unit, matching dependency
 and compiler fingerprints. One server worker on CPU1 and one client worker on
 CPU8; fresh processes, 16,384 warmup requests, alternating pairs and independent
