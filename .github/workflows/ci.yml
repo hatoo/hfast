@@ -28,6 +28,8 @@ jobs:
         run: cargo test --release --locked
       - name: Build server
         run: cargo build --release --locked
+      - name: HTTP/2 response cohort accounting oracle
+        run: python -m unittest discover -s benchmarks -p test_h2_response_cohort.py -v
       - name: Install independent protocol clients
         run: python -m pip install -r benchmarks/interop-requirements.txt
       - name: Protocol interoperability

@@ -1,5 +1,5 @@
-//! Bounded provided-buffer receives for classified HTTP/1 connections. Unknown
-//! and HTTP/2 sockets retain poll/single-read batches; all sends keep their barrier.
+//! Bounded provided-buffer receives for classified HTTP/1 and HTTP/2 connections.
+//! Unknown sockets retain poll/single-read batches; all sends keep their barrier.
 use super::{BATCH, Conn, Proto, arm_poll, consume, push, submit};
 use crate::sys;
 use io_uring::{IoUring, cqueue, opcode, types};
@@ -275,6 +275,10 @@ struct Socket {
 }
 
 impl Socket {
+    fn multishot(&self) -> bool {
+        matches!(self.conn.proto, Proto::H1 { .. } | Proto::H2(_))
+    }
+
     fn closing(&self) -> bool {
         self.conn.closing()
     }
@@ -347,7 +351,7 @@ impl Worker {
         let Some(s) = self.socket(key) else {
             return;
         };
-        if !matches!(s.conn.proto, Proto::H1 { .. }) || s.recv_active || s.starved || s.closing() {
+        if !s.multishot() || s.recv_active || s.starved || s.closing() {
             return;
         }
         s.recv_active = true;
@@ -455,7 +459,7 @@ impl Worker {
                 alive = e.result >= 0
                     && e.result & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i32 == 0;
                 if alive && e.result & libc::POLLIN as i32 != 0 {
-                    assert!(!s.recv_active && !matches!(s.conn.proto, Proto::H1 { .. }));
+                    assert!(!s.recv_active && !s.multishot());
                     self.single.push(key);
                 }
             }
@@ -551,7 +555,7 @@ impl Worker {
         }
         // Classification occurs only after the old poll and single read have
         // completed. The switch cannot leave a second input operation alive.
-        let flags = if !s.closing() && !matches!(s.conn.proto, Proto::H1 { .. }) {
+        let flags = if !s.closing() && !s.multishot() {
             libc::POLLIN
         } else {
             0
@@ -675,3 +679,6 @@ mod tests;
 
 #[cfg(test)]
 mod selection_tests;
+
+#[cfg(test)]
+mod h2_tests;
