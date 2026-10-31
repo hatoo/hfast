@@ -17,12 +17,70 @@ The worker reserves 2 MiB of provided payload and 2 MiB of single-read scratch,
 compared with the original worker's 2 MiB scratch. This memory cost is per worker.
 There can be at most 2^24 live or permanently retired identity slots per worker.
 
-The H2 extension is experimental until its native performance is independently
-confirmed. Its tests cover byte-by-byte classification, two-buffer exhaustion,
-split HEADERS/CONTINUATION, zero stream credit, fragmented WINDOW_UPDATE,
-late completions, send-buffer borrows and GOAWAY behind partial output. The
-existing mixed-protocol and half-close tests also exercise H2 multishot input.
-The buffer sizes, slot identities and send barriers are unchanged.
+## HTTP/2 extension: c313, 2026-10-31
+
+Established H2 connections now use the same bounded receive path as H1. Unknown
+connections switch only after their classification read retires. Buffer sizes,
+slot generations, send barriers and protocol/accounting code are unchanged.
+Tests cover byte-by-byte classification, two-buffer exhaustion, split
+HEADERS/CONTINUATION, zero stream credit, fragmented WINDOW_UPDATE, stale CQEs,
+output-vector borrows and GOAWAY behind partial output.
+
+Immutable hfast `cb0621b` (SHA256 `e491abce`) versus this change (`25c67677`),
+with fixed shb `5e8827a` (`d5ad7a0c`). Both server builds use Rust 1.99.1,
+release optimization, fat LTO and one codegen unit. One server worker on CPU1;
+two shb processes on CPU8/9, each c8/p128/t1, batch1, 134,217,728 requests and
+4,194,304 warmup requests. Every request contributes a latency sample. Rates
+use a common monotonic interval through both complete reports. The active
+server interval remained above 0.978 core, all one-second bins above 0.908,
+and active producers below 0.641 core in primary/confirmation runs.
+
+| Phase / pair | Baseline RPS | Candidate RPS | RPS change | Server CPU/request change |
+|---|---:|---:|---:|---:|
+| primary 0 | 7,166,252 | 7,569,058 | +5.621% | -5.065% |
+| primary 1 | 7,028,715 | 7,589,577 | +7.980% | -5.973% |
+| primary 2 | 6,933,264 | 7,309,738 | +5.430% | -4.922% |
+| primary 3 | 7,370,049 | 7,429,909 | +0.812% | -1.578% |
+| confirm 0 | 7,602,827 | 8,002,772 | +5.260% | -5.211% |
+| confirm 1 | 7,573,741 | 7,937,711 | +4.806% | -4.804% |
+| confirm 2 | 7,805,859 | 8,237,905 | +5.535% | -5.599% |
+
+Median paired throughput gains are **+5.525% primary / +5.260% confirmation**;
+server CPU/request medians are **-4.993% / -5.211%**. First identical-binary
+controls were -1.204% and +0.191%, both inside the unchanged 3% gate. No control
+retry, configuration sweep or statistical-significance claim. This establishes
+a gain for this saturated H2 workload. Serial/H1 workloads have correctness
+guards, not a new speed claim. Worst-child p99 and p99.9 varied (one primary
+p99.9 +20.0%, one confirmation p99 +8.21%); no general latency improvement or
+latency equivalence is claimed. Percentiles from separate clients are not pooled.
+
+Separate instrumented AB/BA counts, each with 2,097,152 requests, found:
+
+| Operation | Baseline | Candidate |
+|---|---:|---:|
+| Input poll SQEs | 16,404 | 16 |
+| Single receive SQEs | 16,404 | 16 |
+| Multishot receive SQEs | 0 | 16 |
+| Send SQEs | 16,388 | 16,388 |
+| All SQEs, including teardown | 49,197 | 16,453 |
+| All CQEs | 49,197 | 32,841 |
+| io_uring_enter calls, first / second pair | 3,095 / 3,081 | 2,059 / 2,058 |
+
+Both variants receive exactly 60,818,848 bytes and send 104,858,096 bytes,
+including the client's 17-byte teardown GOAWAY on each of 16 connections.
+There are no buffer-exhaustion or EAGAIN completions in these count runs.
+They establish operation removal; their timings are excluded from speed claims.
+The kernel system-time fraction alone does not identify a kernel hotspot.
+
+Validation: 364 Rust tests in each debug/release profile, fmt, strict production
+Clippy, 17 independent H1/H2/H3/TCP invocations, six forced-fallback invocations,
+and 16 ordinary native accounting guards pass. The fallback build deliberately
+rejects the real multishot probe with MSG_WAITALL. Eleven controller oracle tests
+also pass. The replayed qualification/primary/confirmation/control and smoke
+reports contain 5,536,615,168 exact requests/latency samples and zero errors.
+Reproduce the comparison with [the counted cohort runner](h2-response-cohort.md).
+Raw reports, source/binary manifests and count-only instrumentation are retained
+in `hfast/optimization-results/c313/` in the optimization workspace.
 
 ## Historical HTTP/1 measured workload and scope
 
