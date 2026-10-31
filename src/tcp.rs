@@ -138,9 +138,34 @@ fn settle(buf: &[u8]) -> Which {
 /// [`sys::attach_reuseport_cbpf`] for why each worker has one of its own and
 /// why it is pinned.
 pub fn worker(lfd: RawFd, cpu: usize) {
-    let ring = io_uring::IoUring::new(BATCH as u32).expect("TCP workers require io_uring");
+    // The creator also submits and drains this ring for its entire lifetime.
+    let ring = build_ring(BATCH as u32).expect("TCP workers require io_uring");
     let ring = multirecv::worker(lfd, cpu, ring);
     worker_ring(lfd, cpu, ring);
+}
+
+fn build_ring(entries: u32) -> std::io::Result<io_uring::IoUring> {
+    build_ring_with(|deferred| {
+        let mut builder = io_uring::IoUring::builder();
+        if deferred {
+            builder
+                .setup_single_issuer()
+                .setup_coop_taskrun()
+                .setup_defer_taskrun();
+        }
+        builder.build(entries)
+    })
+}
+
+fn build_ring_with(
+    mut build: impl FnMut(bool) -> std::io::Result<io_uring::IoUring>,
+) -> std::io::Result<io_uring::IoUring> {
+    match build(true) {
+        // Older kernels reject unsupported setup flags with EINVAL. Resource
+        // and permission errors still fail visibly, including on the fallback.
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => build(false),
+        result => result,
+    }
 }
 
 /// Bound accepts so established connections keep making progress.
@@ -331,10 +356,27 @@ fn worker_ring(lfd: RawFd, cpu: usize, mut ring: io_uring::IoUring) -> ! {
     }
 }
 
-/// Submit queued entries even when readiness completions are already available.
+/// Submit queued entries and run completion work even with an existing backlog.
 fn submit(ring: &mut io_uring::IoUring, count: usize) {
     loop {
-        match ring.submit_and_wait(count) {
+        // Dropping the SQ view publishes its tail. Re-read it on EINTR, since
+        // an interrupted enter may already have consumed some submissions.
+        let queued = ring.submission().len();
+        // submit_and_wait(0) omits GETEVENTS without overflow. Deferred polls
+        // and multishot receives still need task work in this no-wait path,
+        // including when push() encounters a full submission queue.
+        // SAFETY: the creator owns this non-polling, unregistered ring; queued
+        // is its published SQ length. Existing read/send barriers retain all
+        // buffer borrows, and ReceiveRing owns the provided-buffer mappings.
+        let result = unsafe {
+            ring.submitter().enter::<libc::sigset_t>(
+                queued as u32,
+                count as u32,
+                io_uring::EnterFlags::GETEVENTS.bits(),
+                None,
+            )
+        };
+        match result {
             Ok(_) => return,
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
             Err(e) => panic!("io_uring submit: {e}"),
@@ -394,6 +436,9 @@ mod h1_body_tests;
 
 #[cfg(test)]
 mod h1_header_tests;
+
+#[cfg(test)]
+mod ring_tests;
 
 #[cfg(test)]
 mod tests {

@@ -682,3 +682,6 @@ mod selection_tests;
 
 #[cfg(test)]
 mod h2_tests;
+
+#[cfg(test)]
+mod taskrun_tests;

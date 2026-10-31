@@ -4,7 +4,9 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 pub(super) fn ring(count: usize) -> ReceiveRing {
-    ReceiveRing::new(IoUring::new(8).unwrap(), count)
+    // Exercise the production setup policy, including deferred task work, in
+    // every generation, buffer, classification and H2 lifetime regression.
+    ReceiveRing::new(crate::tcp::build_ring(8).unwrap(), count)
         .ok()
         .unwrap()
 }
