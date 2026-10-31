@@ -150,12 +150,18 @@ def process_snapshot(pid):
                              timeslices=sched[2]))
         except (FileNotFoundError, ProcessLookupError):
             pass  # A worker can exit while the process is producing its report.
+    if not tids:
+        # The process can exit after task enumeration but before any task read.
+        # Treat this exactly like its /proc directory disappearing during sampling.
+        raise ProcessLookupError(f'no surviving tasks for pid {pid}')
     return dict(pid=pid, tids=tids, timestamp_ns=time.monotonic_ns())
 
 
 def assert_affinity(snapshot, core):
-    require(snapshot['tids'] and all(t['affinity'] == [core] for t in snapshot['tids']),
-            'unexpected task affinity')
+    if not (snapshot['tids'] and all(t['affinity'] == [core] for t in snapshot['tids'])):
+        observed = [(t['tid'], t['affinity']) for t in snapshot['tids']]
+        raise ValueError(f"unexpected task affinity for pid {snapshot['pid']}: "
+                         f'expected [{core}], observed {observed}')
 
 
 def validate_snapshot(snapshot):
@@ -283,6 +289,22 @@ def child_pid(wrapper):
         return None
 
 
+def sample_client(wrapper, binary, index):
+    pid = child_pid(wrapper)
+    if pid is None:
+        return None
+    try:
+        # taskset has to exec the fixed client before qualification.
+        if Path(f'/proc/{pid}/exe').resolve() != binary:
+            return None
+        client = process_snapshot(pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    assert_affinity(client, CLIENT_CPUS[index])
+    client['index'] = index
+    return client
+
+
 def run_clients(binary, server, port, folder, count, timeout=300, inject_failure=None):
     folder.mkdir()
     metadata = dict(client=str(binary), port=port, requests_per_child=count, children=[])
@@ -324,18 +346,9 @@ def run_clients(binary, server, port, folder, count, timeout=300, inject_failure
                     snap = dict(timestamp_ns=time.monotonic_ns(), server=process_snapshot(server.pid), clients=[])
                     assert_affinity(snap['server'], SERVER_CPU)
                     for index in range(len(CLIENT_CPUS)):
-                        pid = child_pid(processes[index])
-                        if pid is not None:
-                            try:
-                                # taskset has to exec the fixed client before qualification.
-                                if Path(f'/proc/{pid}/exe').resolve() != binary:
-                                    continue
-                                client = process_snapshot(pid)
-                                assert_affinity(client, CLIENT_CPUS[index])
-                                client['index'] = index
-                                snap['clients'].append(client)
-                            except (FileNotFoundError, ProcessLookupError):
-                                pass
+                        client = sample_client(processes[index], binary, index)
+                        if client is not None:
+                            snap['clients'].append(client)
                     snap['complete_ns'] = time.monotonic_ns()
                     samples.append(snap)
                     next_sample = time.monotonic() + .25
