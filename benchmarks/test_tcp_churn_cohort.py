@@ -263,6 +263,88 @@ class CohortOracle(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 cohort.qualification(bad)
 
+    def test_disappeared_client_cannot_create_a_hole_in_the_active_interval(self):
+        samples = self.samples()
+        samples[-1]['clients'].pop()
+        active = cohort.active_cpu(samples)
+        self.assertEqual(active['seconds'], 18)
+        self.assertEqual(active['end_ns'], 19_000_000_000)
+        samples[10]['clients'].pop()
+        with self.assertRaisesRegex(ValueError, 'discontinuous shared worker interval'):
+            cohort.active_cpu(samples)
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Linux process snapshots')
+class SnapshotOracle(unittest.TestCase):
+    def child(self):
+        process = subprocess.Popen(['/bin/sleep', '20'], start_new_session=True)
+        self.addCleanup(cohort.stop, [process])
+        core = min(os.sched_getaffinity(0))
+        os.sched_setaffinity(process.pid, {core})
+        return process, core
+
+    def exit_after_task_listing(self, process):
+        iterdir = Path.iterdir
+
+        def listed(path):
+            entries = list(iterdir(path))
+            if path == Path(f'/proc/{process.pid}/task'):
+                self.assertTrue(entries)
+                process.terminate()
+                process.wait(timeout=2)
+            return iter(entries)
+
+        return patch.object(Path, 'iterdir', listed)
+
+    def test_exit_between_task_listing_and_read_is_process_disappearance(self):
+        process, _ = self.child()
+        with self.exit_after_task_listing(process), self.assertRaises(ProcessLookupError):
+            cohort.process_snapshot(process.pid)
+
+    def test_finished_client_is_omitted_from_cpu_sample(self):
+        process, core = self.child()
+        with patch.object(cohort, 'child_pid', return_value=process.pid), \
+             patch.object(cohort, 'CLIENT_CPUS', (core,)), \
+             self.exit_after_task_listing(process):
+            self.assertIsNone(cohort.sample_client(None, Path('/bin/sleep').resolve(), 0))
+
+    def test_live_client_wrong_affinity_is_still_fatal_and_identified(self):
+        process, core = self.child()
+        with patch.object(cohort, 'child_pid', return_value=process.pid), \
+             patch.object(cohort, 'CLIENT_CPUS', (core + 1,)), \
+             self.assertRaisesRegex(ValueError, f'unexpected task affinity.*{process.pid}') as error:
+            cohort.sample_client(None, Path('/bin/sleep').resolve(), 0)
+        self.assertIn(f'expected [{core + 1}]', str(error.exception))
+        self.assertIn(str([core]), str(error.exception))
+        self.assertIsNone(process.poll())
+
+    def test_live_client_and_non_disappearance_errors(self):
+        process, core = self.child()
+        with patch.object(cohort, 'child_pid', return_value=process.pid), \
+             patch.object(cohort, 'CLIENT_CPUS', (core,)):
+            snapshot = cohort.sample_client(None, Path('/bin/sleep').resolve(), 0)
+            self.assertEqual(snapshot['pid'], process.pid)
+            self.assertEqual(snapshot['index'], 0)
+            self.assertEqual([t['affinity'] for t in snapshot['tids']], [[core]])
+            cohort.validate_snapshot(snapshot)
+            for error in (PermissionError('denied'), ValueError('invalid counter')):
+                with patch.object(cohort, 'process_snapshot', side_effect=error), \
+                     self.assertRaises(type(error)):
+                    cohort.sample_client(None, Path('/bin/sleep').resolve(), 0)
+        with self.assertRaises(ValueError):
+            cohort.assert_affinity(dict(pid=process.pid, tids=[]), core)
+
+    def test_server_disappearance_still_invalidates_the_cohort(self):
+        process, _ = self.child()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / 'cohort'
+            with self.exit_after_task_listing(process), self.assertRaises(ProcessLookupError):
+                cohort.run_clients(Path('/bin/sleep'), process, 30000, folder, 1)
+            failure = json.loads((folder / 'failure.json').read_text())
+            self.assertIn('ProcessLookupError', failure['error'])
+            self.assertFalse((folder / 'summary.json').exists())
+            self.assertEqual(json.loads((folder / 'cleanup.json').read_text())['owned_groups'], [])
+
 
 @unittest.skipUnless(sys.platform == 'linux', 'Linux process group cleanup')
 class CleanupOracle(unittest.TestCase):

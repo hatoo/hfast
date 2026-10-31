@@ -34,7 +34,10 @@ complete command, CPU, errors, status codes, bytes, latency sample count and
 latency ordering are validated. GNU time counters and `/proc` task samples are
 retained. A separate interval in which all request workers remain alive excludes
 report-generation tails; affinity, task identities and monotonic CPU counters
-are checked. Failed, missing or stalled children invalidate the cohort. Process
+are checked. A child that exits during `/proc` task enumeration is omitted from
+that CPU observation. Missing observations cannot create a hole inside the shared
+active interval; live-task affinity violations and server disappearance still
+invalidate the run. Failed, missing or stalled children invalidate the cohort. Process
 groups are terminated even when their wrapper has already exited.
 
 Qualification requires both common and active intervals of at least 10 seconds,
