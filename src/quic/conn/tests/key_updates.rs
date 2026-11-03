@@ -1,20 +1,20 @@
 use super::*;
 
-struct Peer {
+pub(in crate::quic) struct Peer {
     keys: Keys,
     next: Secrets,
     phase: bool,
 }
 
 impl Peer {
-    fn update(&mut self) {
+    pub(in crate::quic) fn update(&mut self) {
         let next = self.next.next_packet_keys();
         self.keys.local.packet = next.local;
         self.keys.remote.packet = next.remote;
         self.phase = !self.phase;
     }
 
-    fn packet(&self, conn: &Connection, pn: u32, body: &[u8]) -> Vec<u8> {
+    pub(in crate::quic) fn packet(&self, conn: &Connection, pn: u32, body: &[u8]) -> Vec<u8> {
         let mut packet = vec![0x43 | (u8::from(self.phase) << 2)];
         packet.extend_from_slice(conn.local_cid.as_slice());
         let pn_offset = packet.len();
@@ -37,11 +37,24 @@ impl Peer {
         let pn = conn.spaces[Space::Data as usize].next_pn;
         let mut packet = Vec::new();
         assert!(conn.poll_transmit(&mut packet).unwrap());
+        (pn, self.decrypt(conn, &mut packet, pn))
+    }
+
+    pub(in crate::quic) fn decrypt(
+        &self,
+        conn: &Connection,
+        packet: &mut [u8],
+        pn: u64,
+    ) -> Vec<u8> {
         assert!(packet.len() <= MAX_DATAGRAM);
         let offset = 1 + conn.peer_cid.as_slice().len();
         let (first, len) =
-            unprotect_header(self.keys.remote.header.as_ref(), &mut packet, offset).unwrap();
+            unprotect_header(self.keys.remote.header.as_ref(), packet, offset).unwrap();
         assert_eq!(first & 0x04 != 0, self.phase);
+        let truncated = packet[offset..offset + len]
+            .iter()
+            .fold(0u64, |n, b| (n << 8) | u64::from(*b));
+        assert_eq!(truncated, pn & ((1 << (8 * len)) - 1));
         let (header, payload) = packet.split_at_mut(offset + len);
         let plain = self
             .keys
@@ -49,11 +62,11 @@ impl Peer {
             .packet
             .decrypt_in_place(pn, header, payload)
             .unwrap();
-        (pn, plain.to_vec())
+        plain.to_vec()
     }
 }
 
-fn pair(finish: bool) -> (Connection, Peer, Vec<u8>) {
+pub(in crate::quic) fn pair(finish: bool) -> (Connection, Peer, Vec<u8>) {
     pair_with_provider(finish, rustls::crypto::ring::default_provider())
 }
 

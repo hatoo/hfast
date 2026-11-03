@@ -1575,15 +1575,16 @@ impl Connection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     mod ack_ledger;
     mod control_ack;
     mod crypto_handshake;
     mod datagram_budget;
+    pub(in crate::quic) mod endpoint_timers;
     mod flight_history;
-    mod key_updates;
+    pub(in crate::quic) mod key_updates;
     mod receive_headers;
     mod response_recovery;
     mod send_credit;
