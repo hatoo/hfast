@@ -107,7 +107,10 @@ impl Endpoint {
     /// Give every connection that is waiting on something a chance to send it
     /// again, and forget the ones that have gone away
     fn tick(&mut self) {
-        let now = Instant::now();
+        self.tick_at(Instant::now());
+    }
+
+    fn tick_at(&mut self, now: Instant) {
         let due: Vec<SocketAddr> = self
             .conns
             .iter()
@@ -248,6 +251,7 @@ pub(super) fn tls_config() -> rustls::ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    mod timers;
     use super::super::{TAG_LEN, frame, wire};
     use super::*;
     use rustls::quic::{Keys, Version};
