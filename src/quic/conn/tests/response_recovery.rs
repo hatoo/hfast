@@ -95,7 +95,7 @@ fn late_original_ack_cancels_response_queued_by_packet_loss() {
     let mut conn = settled();
     let original = request(&mut conn, 0, true);
     let mut later = original;
-    for _ in 0..4 {
+    for _ in 0..3 {
         conn.path_response = Some([7; 8]);
         later = send_data(&mut conn).0;
     }
@@ -104,6 +104,47 @@ fn late_original_ack_cancels_response_queued_by_packet_loss() {
     wire_ack(&mut conn, &[(original, original)]);
     assert_eq!(conn.finished, 1);
     idle(&mut conn);
+}
+
+#[test]
+fn packet_threshold_retry_preserves_fin_credit_and_late_original_completion() {
+    for ack_original in [true, false] {
+        let mut conn = settled();
+        let original = request(&mut conn, 0, true);
+        let charged = conn.send_credit.sent;
+        conn.peer.initial_max_data = charged;
+        conn.send_credit.initialize(&conn.peer);
+        assert_eq!(conn.send_credit.available(), 0);
+        for distance in 1..=3 {
+            conn.path_response = Some([7; 8]);
+            let (pn, _) = send_data(&mut conn);
+            assert_eq!(pn, original + distance);
+            wire_ack(&mut conn, &[(pn, pn)]);
+            assert_eq!(conn.finished, 0);
+            assert_eq!(conn.send_credit.sent, charged);
+            if distance < 3 {
+                assert!(conn.ready.is_empty());
+                assert!(conn.send_credit.responses.is_empty());
+                assert!(!conn.poll_transmit(&mut Vec::new()).unwrap());
+            }
+        }
+        assert_eq!(conn.ready, [0]);
+        let (retry, plain) = send_data(&mut conn);
+        assert_eq!(retry, original + 4);
+        assert_eq!(responses(&plain), [0]); // Exact bytes, offset zero, FIN.
+        assert_eq!(conn.send_credit.sent, charged);
+        assert_eq!(conn.pto_count, 0); // No timeout was invoked.
+        let acked = if ack_original { original } else { retry };
+        wire_ack(&mut conn, &[(acked, acked)]);
+        assert_eq!(conn.finished, 1);
+        assert_eq!(conn.base_stream, 1);
+        assert!(conn.send_credit.responses.is_empty());
+        idle(&mut conn);
+        wire_ack(&mut conn, &[(original, retry)]);
+        assert_eq!(conn.finished, 1);
+        assert_eq!(conn.send_credit.sent, charged);
+        idle(&mut conn);
+    }
 }
 
 #[test]

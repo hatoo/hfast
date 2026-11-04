@@ -251,6 +251,7 @@ pub(super) fn tls_config() -> rustls::ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    mod loss_threshold;
     mod timers;
     use super::super::{TAG_LEN, frame, wire};
     use super::*;

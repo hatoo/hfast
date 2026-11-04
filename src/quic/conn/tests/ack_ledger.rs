@@ -26,6 +26,43 @@ fn ack(conn: &mut Connection, ranges: &[(u64, u64)]) -> bool {
 }
 
 #[test]
+fn loss_threshold_includes_distance_three_without_losing_packet_zero_early() {
+    for pn in [0, 1, 100, (1_u64 << 62) - 5, u64::MAX - 4] {
+        for distance in 0..=4 {
+            let mut conn = connection();
+            // Two responses in the boundary packet and an untouched suffix.
+            append(&mut conn, pn, 0);
+            append(&mut conn, pn, 4);
+            append(&mut conn, pn + 4, 8);
+            let largest = pn + distance;
+            conn.on_ack(largest, 0, &[]);
+            let expected_ready: &[u64] = if distance >= 3 { &[0, 4] } else { &[] };
+            assert_eq!(conn.ready, expected_ready, "PN {pn}, gap {distance}");
+            assert_eq!(conn.send_credit.responses.len(), expected_ready.len());
+            assert_eq!(
+                conn.finished,
+                if distance == 0 {
+                    2
+                } else {
+                    u64::from(distance == 4)
+                }
+            );
+            let expected: Vec<_> = [(pn, 0), (pn, 4), (pn + 4, 8)]
+                .into_iter()
+                .filter(|&(number, _)| {
+                    number != largest && u128::from(largest) < u128::from(number) + 3
+                })
+                .collect();
+            assert_eq!(conn.unacked.iter().copied().collect::<Vec<_>>(), expected);
+            // Replay cannot duplicate a queued retry or completion.
+            assert!(!conn.on_ack(largest, 0, &[]));
+            assert_eq!(conn.ready, expected_ready);
+            assert_eq!(conn.unacked.iter().copied().collect::<Vec<_>>(), expected);
+        }
+    }
+}
+
+#[test]
 fn ascending_acks_leave_newer_responses_in_place() {
     for group in [1_usize, 16] {
         let mut conn = connection();
@@ -68,8 +105,8 @@ fn sparse_ack_keeps_boundary_groups_and_wrapped_suffix() {
     let last = conn.unacked.back().unwrap() as *const (u64, u64);
     assert!(ack(&mut conn, &[(109, 109), (107, 107)]));
     assert_eq!(conn.finished, 8);
-    assert_eq!(conn.unacked.front(), Some(&(106, 24))); // exactly largest - 3
-    assert!(conn.ready.is_empty());
+    assert_eq!(conn.unacked.front(), Some(&(108, 32)));
+    assert_eq!(conn.ready, [24]); // 106 is exactly largest - 3
     assert_eq!(conn.unacked.back().unwrap() as *const (u64, u64), last);
     assert!(conn.on_ack(112, 0, &[]));
     assert_eq!(conn.finished, 12); // every response in packet 112
@@ -134,7 +171,7 @@ fn ack_classification_matches_full_scan_model() {
                     finished += 1;
                     delivered = true;
                     false
-                } else if number < largest.saturating_sub(3) {
+                } else if u128::from(largest) >= u128::from(number) + 3 {
                     ready.push(id);
                     false
                 } else {
@@ -166,14 +203,14 @@ fn loss_boundary_handles_zero_and_maximum_packet_numbers() {
             append(&mut conn, base + n, n * 4);
         }
         assert!(conn.on_ack(base + 3, 0, &[]));
-        assert!(conn.ready.is_empty(), "strict loss boundary changed");
-        assert!(conn.on_ack(base + 4, 0, &[]));
         assert_eq!(conn.ready, [0]);
+        assert!(conn.on_ack(base + 4, 0, &[]));
+        assert_eq!(conn.ready, [0, 4]);
         assert_eq!(
             conn.unacked.iter().map(|&(pn, _)| pn).collect::<Vec<_>>(),
-            [base + 1, base + 2, base + 5, base + 6, base + 7]
+            [base + 2, base + 5, base + 6, base + 7]
         );
-        assert!(conn.on_ack(base + 1, 0, &[]));
+        assert!(conn.on_ack(base + 2, 0, &[]));
         assert_eq!(conn.finished, 3);
     }
 }
@@ -248,7 +285,7 @@ fn many_ranges_match_full_scan_with_packet_groups_and_gaps() {
                         append(&mut conn, pn, id);
                         if ranges.iter().any(|&(a, b)| (a..=b).contains(&pn)) {
                             finished += 1;
-                        } else if pn < largest.saturating_sub(Connection::LOSS_THRESHOLD) {
+                        } else if u128::from(largest) >= u128::from(pn) + 3 {
                             ready.push(id);
                         } else {
                             model.push((pn, id));
@@ -285,16 +322,16 @@ fn sparse_range_cursor_restarts_for_older_acks_at_numeric_limits() {
         // the wire format's 62-bit packet-number limit.
         assert!(conn.on_ack(base + 10, 0, &[2, 0, 2, 0]));
         assert_eq!(conn.finished, 3);
-        assert_eq!(conn.ready, [0, 4, 12, 16, 20]);
-        assert_eq!(conn.unacked.front(), Some(&(base + 7, 28)));
+        assert_eq!(conn.ready, [0, 4, 12, 16, 20, 28]);
+        assert_eq!(conn.unacked.front(), Some(&(base + 8, 32)));
         assert!(!conn.on_ack(base + 10, 0, &[2, 0, 2, 0]));
         // The cursor belongs to one ACK, not to the connection. An older ACK
         // still covers survivors on each side of its own gaps.
         assert!(conn.on_ack(base + 9, 0, &[0, 0]));
-        assert_eq!(conn.finished, 5);
+        assert_eq!(conn.finished, 4);
         assert_eq!(conn.unacked.front(), Some(&(base + 8, 32)));
         assert_eq!(conn.unacked.back(), Some(&(base + 15, 60)));
-        assert_eq!(conn.ready, [0, 4, 12, 16, 20]);
+        assert_eq!(conn.ready, [0, 4, 12, 16, 20, 28]);
     }
 }
 
@@ -342,7 +379,7 @@ fn many_sparse_acks_preserve_late_original_and_retry_credit() {
             .collect();
         acknowledge(&mut conn, Space::Data, &selected);
         assert_eq!(conn.finished, 64);
-        assert_eq!(conn.unacked.len(), 3); // largest - 3, largest - 1, newest
+        assert_eq!(conn.unacked.len(), 2); // largest - 1, newest
         conn.on_timeout(conn.timeout().unwrap());
         assert!(conn.unacked.is_empty());
         let mut retries = Vec::new();
@@ -419,7 +456,7 @@ fn check_flat_ack(conn: &mut Connection, largest: u64, first: u64, rest: &[u8]) 
         if ranges.iter().any(|&(lo, hi)| lo <= pn && pn <= hi) {
             finished += 1;
             acknowledged = true;
-        } else if largest.checked_sub(pn).is_some_and(|gap| gap > 3) {
+        } else if u128::from(largest) >= u128::from(pn) + 3 {
             lost.push(id);
         } else {
             expected.push((pn, id));
@@ -513,9 +550,9 @@ fn wrapped_shared_packet_loss_boundary_at_numeric_limits() {
         for head in [0, 1, 63, 96, 127] {
             let mut conn = rotated_ledger(&packets, head);
             check_flat_ack(&mut conn, base + 3, 0, &[]);
-            assert!(conn.ready.is_empty()); // exactly three PNs is not lost
-            check_flat_ack(&mut conn, base + 4, 0, &[]);
             assert_eq!(conn.ready, (0..16).map(|i| i * 4).collect::<Vec<_>>());
+            check_flat_ack(&mut conn, base + 4, 0, &[]);
+            assert_eq!(conn.ready, (0..32).map(|i| i * 4).collect::<Vec<_>>());
             check_flat_ack(&mut conn, base + 1, 0, &[]);
         }
     }

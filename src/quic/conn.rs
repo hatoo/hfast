@@ -1042,10 +1042,9 @@ impl Connection {
     /// Retire every answer the peer has acknowledged, and send again the ones
     /// far enough behind an acknowledged packet to be lost
     ///
-    /// RFC 9002 Section 6.1.1: three packets acknowledged after one is enough
-    /// to call it lost, and waiting for the probe timer instead is the
-    /// difference between recovering in a round trip and recovering in tens of
-    /// milliseconds.
+    /// RFC 9002 Section 6.1.1: an acknowledged packet number at least three
+    /// higher is enough to call an unacknowledged packet lost. Waiting for the
+    /// probe timer instead can delay recovery by tens of milliseconds.
     const LOSS_THRESHOLD: u64 = 3;
 
     fn on_ack(&mut self, largest: u64, first_range: u64, rest: &[u8]) -> bool {
@@ -1054,7 +1053,9 @@ impl Connection {
         ranges.extend(frame::AckRanges::new(largest, first_range, rest));
         let mut retired = false;
         let mut acknowledged = false;
-        let lost_before = largest.saturating_sub(Self::LOSS_THRESHOLD);
+        // Inclusive boundary, as for Flight. No packet is threshold-lost
+        // before the largest ACK reaches LOSS_THRESHOLD (including PN 0).
+        let lost_through = largest.checked_sub(Self::LOSS_THRESHOLD);
         let ready = &mut self.ready;
         let responses = &mut self.send_credit.responses;
         let streams = &mut self.streams;
@@ -1094,7 +1095,7 @@ impl Connection {
                 (lo, hi) = ranges[range];
             }
             if pn < lo {
-                if pn < lost_before {
+                if lost_through.is_some_and(|last| pn <= last) {
                     if let Some(StreamSlot::Active(req)) =
                         streams.get_mut(((id >> 2) - base) as usize)
                         && !req.stopped
