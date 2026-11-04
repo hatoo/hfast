@@ -467,12 +467,12 @@ def run(server, peer, output, cpus, *, batch=32, datagrams=8, batches=4096,
                                    env=dict(os.environ, HFAST_GRO_BINARY=str(server)))
         primary = None
         try:
-            time.sleep(.2)
-            require(process.poll() is None, 'server failed at startup')
-            capacity_before = burst_buffer.observe(process.pid, port, udp_receive_buffer,
-                                                    workers=server_workers)
+            capacity_before = burst_buffer.wait_ready(process, port, udp_receive_buffer,
+                                                       workers=server_workers)
             with (output / 'receive-buffer.json').open('x') as evidence:
                 evidence.write(json.dumps(capacity_before, indent=2) + '\n')
+            require(capacity_before['status'] == 'available',
+                    f'server not ready: {capacity_before["error"]}')
             reference = None
             if reference_workers is not None:
                 initial = burst_sockets.capture(process.pid, port, server_workers, [], [])
