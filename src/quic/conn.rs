@@ -28,6 +28,8 @@ mod stream_credit;
 use stream_credit::{MAX_STREAM_OFFSET, StreamCredits};
 mod send_credit;
 use send_credit::{Fragments, SendCredit};
+mod handshake_close;
+use handshake_close::HandshakeClose;
 
 /// The uni stream this server opens for its control stream. Server-initiated
 /// unidirectional streams are 3, 7, 11 (RFC 9000 Section 2.1) and this opens
@@ -382,6 +384,7 @@ pub struct Connection {
     /// A PATH_CHALLENGE waiting to be answered
     path_response: Option<[u8; 8]>,
     pub closed: bool,
+    handshake_close: Option<Box<HandshakeClose>>,
 
     // ---- streams ----
     /// Client bidirectional streams, which requests are, indexed by number
@@ -481,6 +484,7 @@ impl Connection {
             handshake_done: ControlFlight::new(),
             path_response: None,
             closed: false,
+            handshake_close: None,
             streams: VecDeque::new(),
             base_stream: 0,
             uni_sizes: [0; transport::MAX_STREAMS_UNI],
@@ -581,6 +585,13 @@ impl Connection {
 
     /// Take in one datagram, which may hold several packets
     pub fn recv(&mut self, datagram: &mut [u8]) -> Result<()> {
+        if self.closed {
+            return Err(Error);
+        }
+        if let Some(close) = &mut self.handshake_close {
+            close.receive(datagram, self.local_cid);
+            return Ok(());
+        }
         let mut at = 0;
         while at < datagram.len() {
             // A datagram is padded to its end once a packet fails to parse,
@@ -588,9 +599,9 @@ impl Connection {
             if datagram[at] == 0 {
                 break;
             }
-            let (end, kind) = {
+            let (end, kind, dcid) = {
                 let h = packet::parse(datagram, at)?;
-                (h.end, h.kind)
+                (h.end, h.kind, h.dcid)
             };
             if kind == Kind::Retry || kind == Kind::ZeroRtt {
                 at = end;
@@ -606,7 +617,12 @@ impl Connection {
                 at = end;
                 continue;
             }
-            if !self.recv_packet(&mut datagram[at..end], space)? {
+            let received = self.recv_packet(&mut datagram[at..end], space);
+            if received.is_err() && self.handshake_close.is_some() {
+                self.prepare_handshake_close(dcid)?;
+                return Err(Error);
+            }
+            if !received? {
                 at = end;
                 continue;
             }
@@ -775,7 +791,7 @@ impl Connection {
                     let bytes = st.crypto_in.read().to_vec();
                     st.crypto_in.consume(taken);
                     self.tls.read_hs(&bytes).map_err(|_| Error)?;
-                    self.pump_tls();
+                    self.pump_tls()?;
                 }
             }
             frame::Frame::Ack {
@@ -1139,7 +1155,7 @@ impl Connection {
     }
 
     /// Collect whatever rustls now has to say, and the keys it hands over
-    fn pump_tls(&mut self) {
+    fn pump_tls(&mut self) -> Result<()> {
         loop {
             let space = if self.handshake.is_none() {
                 Space::Initial
@@ -1156,25 +1172,35 @@ impl Connection {
             match change {
                 Some(KeyChange::Handshake { keys }) => self.handshake = Some(keys),
                 Some(KeyChange::OneRtt { keys, next }) => {
+                    let peer = self
+                        .tls
+                        .quic_transport_parameters()
+                        .ok_or(Error)
+                        .and_then(transport::decode)
+                        .inspect_err(|_| {
+                            self.handshake_close = Some(Box::new(HandshakeClose::new(self.pto())));
+                        })?;
+                    self.peer = peer;
+                    self.send_credit.initialize(&peer);
                     self.key_updates = Some(Box::new(KeyUpdates::new(next)));
                     self.one_rtt_local = Some(keys.local);
                     self.one_rtt_remote = Some(keys.remote);
-                    if let Some(p) = self.tls.quic_transport_parameters()
-                        && let Ok(peer) = transport::decode(p)
-                    {
-                        self.peer = peer;
-                        self.send_credit.initialize(&peer);
-                    }
                     self.connected = true;
-                    return;
+                    return Ok(());
                 }
-                None => return,
+                None => return Ok(()),
             }
         }
     }
 
     /// Whether anything is waiting to go out
     pub fn wants_send(&self) -> bool {
+        if self.closed {
+            return false;
+        }
+        if let Some(close) = &self.handshake_close {
+            return close.pending;
+        }
         !self.ready.is_empty()
             || self.resets.iter().any(|reset| reset.flight.pending)
             || self.path_response.is_some()
@@ -1188,6 +1214,12 @@ impl Connection {
 
     /// Fill `out` with one datagram's worth of packets
     pub fn poll_transmit(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        if self.closed {
+            return Ok(false);
+        }
+        if let Some(close) = &mut self.handshake_close {
+            return Ok(close.transmit(out));
+        }
         let start = out.len();
         for space in [Space::Initial, Space::Handshake, Space::Data] {
             if self.local_keys(space).is_none() {
@@ -1460,6 +1492,12 @@ impl Connection {
     /// left in flight to trigger that does not sit there. Making it tight
     /// instead turns every quiet moment into a resend of everything.
     pub fn timeout(&self) -> Option<Instant> {
+        if self.closed {
+            return None;
+        }
+        if let Some(close) = &self.handshake_close {
+            return Some(close.deadline);
+        }
         let key_deadline = self
             .key_updates
             .as_ref()
@@ -1479,6 +1517,10 @@ impl Connection {
     /// Discard expired receive keys and put back flight data only when its own
     /// PTO expires. Key retirement alone must not trigger retransmissions.
     pub fn on_timeout(&mut self, now: Instant) {
+        if let Some(close) = &self.handshake_close {
+            self.closed |= now >= close.deadline;
+            return;
+        }
         if let Some(keys) = self.key_updates.as_mut()
             && keys
                 .previous
@@ -1660,7 +1702,7 @@ pub(super) mod tests {
 
     fn finish_handshake(conn: &mut Connection, finished: &[u8]) {
         conn.tls.read_hs(finished).unwrap();
-        conn.pump_tls();
+        conn.pump_tls().unwrap();
         conn.discard(Space::Handshake);
         conn.handshake = None;
         assert!(!conn.tls.is_handshaking());
@@ -1671,7 +1713,7 @@ pub(super) mod tests {
         let mut bytes = Vec::new();
         client.write_hs(&mut bytes);
         conn.tls.read_hs(&bytes).unwrap();
-        conn.pump_tls();
+        conn.pump_tls().unwrap();
         for space in [Space::Initial, Space::Handshake] {
             client
                 .read_hs(&conn.spaces[space as usize].crypto_out)

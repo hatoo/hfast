@@ -128,6 +128,10 @@ impl Endpoint {
                 continue;
             }
             conn.on_timeout(now);
+            if conn.closed {
+                self.conns.remove(&addr);
+                continue;
+            }
             self.flush(addr);
         }
     }
@@ -149,7 +153,8 @@ impl Endpoint {
             return;
         };
         *last = Instant::now();
-        if conn.recv(datagram).is_err() || conn.closed {
+        let received = conn.recv(datagram);
+        if conn.closed || (received.is_err() && !conn.is_closing_handshake()) {
             self.conns.remove(&from);
             return;
         }
@@ -295,6 +300,51 @@ mod tests {
         out.extend_from_slice(tag.as_ref());
         wire::protect_header(keys.local.header.as_ref(), &mut out, pn_offset, 1).unwrap();
         out
+    }
+
+    #[test]
+    fn malformed_handshake_sends_close_and_expires_without_extending_on_replay() {
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"h3".to_vec()];
+        let mut tls = rustls::quic::ClientConnection::new(
+            Arc::new(config),
+            Version::V1,
+            "localhost".try_into().unwrap(),
+            vec![3, 1, 0x40],
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        assert!(tls.write_hs(&mut hello).is_none());
+        let mut body = Vec::new();
+        frame::put_crypto(&mut body, 0, &hello);
+        let original = initial(0, &body);
+        let (mut ep, client) = endpoint();
+        let from = client.local_addr().unwrap();
+        ep.datagram(&mut original.clone(), from);
+        let conn = &ep.conns[&from].0;
+        assert!(conn.is_closing_handshake() && !conn.connected);
+        let cid = conn.local_cid;
+        let deadline = conn.timeout().unwrap();
+        ep.flush_ready();
+        ep.out.flush(&ep.socket).unwrap();
+        let mut buf = [0; MIN_INITIAL];
+        let n = client.recv(&mut buf).unwrap();
+        assert!(n > 0 && n <= original.len());
+        ep.datagram(&mut original.clone(), from);
+        assert_eq!(ep.conns[&from].0.local_cid, cid);
+        assert_eq!(ep.conns[&from].0.timeout(), Some(deadline));
+        ep.tick_at(deadline - Duration::from_nanos(1));
+        assert!(ep.conns.contains_key(&from));
+        ep.tick_at(deadline);
+        assert!(!ep.conns.contains_key(&from));
+        ep.flush_ready(); // stale ready entries cannot resurrect the connection
+        assert!(ep.conns.is_empty());
     }
 
     fn endpoint() -> (Endpoint, UdpSocket) {

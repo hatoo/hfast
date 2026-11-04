@@ -78,7 +78,7 @@ fn pair_with_provider(
     let mut bytes = Vec::new();
     assert!(client.write_hs(&mut bytes).is_none());
     conn.tls.read_hs(&bytes).unwrap();
-    conn.pump_tls();
+    conn.pump_tls().unwrap();
     let mut peer = None;
     for space in [Space::Initial, Space::Handshake] {
         client
