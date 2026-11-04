@@ -27,8 +27,32 @@ impl StoresServerSessions for CountedStorage {
 // Retain the production policy, replacing only its randomly generated
 // certificate so the client can use ordinary certificate verification.
 pub(super) fn production_pair(
+    config: rustls::ServerConfig,
+    ticket_request: bool,
+) -> (Connection, rustls::quic::ClientConnection) {
+    production_pair_with_params(config, ticket_request, client_params())
+}
+
+pub(super) fn client_params() -> Vec<u8> {
+    let mut params = Vec::new();
+    for (id, value) in [
+        (4, 1 << 30),
+        (5, 1 << 24),
+        (6, 1 << 24),
+        (7, 1 << 24),
+        (9, 8),
+    ] {
+        put_varint(&mut params, id);
+        put_varint(&mut params, varint_len(value) as u64);
+        put_varint(&mut params, value);
+    }
+    params
+}
+
+pub(super) fn production_pair_with_params(
     mut config: rustls::ServerConfig,
     ticket_request: bool,
+    params: Vec<u8>,
 ) -> (Connection, rustls::quic::ClientConnection) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
@@ -54,18 +78,6 @@ pub(super) fn production_pair(
             new_session_count: 255,
             resumption_count: 255,
         });
-    }
-    let mut params = Vec::new();
-    for (id, value) in [
-        (4, 1 << 30),
-        (5, 1 << 24),
-        (6, 1 << 24),
-        (7, 1 << 24),
-        (9, 8),
-    ] {
-        put_varint(&mut params, id);
-        put_varint(&mut params, varint_len(value) as u64);
-        put_varint(&mut params, value);
     }
     let client = rustls::quic::ClientConnection::new(
         Arc::new(client_config),

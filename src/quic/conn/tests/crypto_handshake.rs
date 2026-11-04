@@ -13,9 +13,12 @@ struct Peer {
 }
 
 impl Peer {
-    fn pair() -> (Connection, Self) {
-        let (mut conn, tls) =
-            tls_tickets::production_pair(crate::quic::endpoint::tls_config(), false);
+    fn unstarted(params: Vec<u8>) -> (Connection, Self) {
+        let (conn, tls) = tls_tickets::production_pair_with_params(
+            crate::quic::endpoint::tls_config(),
+            false,
+            params,
+        );
         let rustls::SupportedCipherSuite::Tls13(suite) =
             rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256;
         let initial = Keys::initial(
@@ -25,7 +28,7 @@ impl Peer {
             &[1; 8],
             Side::Client,
         );
-        let mut peer = Self {
+        let peer = Self {
             tls,
             keys: [Some(initial), None, None],
             received: [0; 3],
@@ -34,6 +37,15 @@ impl Peer {
             data_receipts: Vec::new(),
             next_pn: 0,
         };
+        (conn, peer)
+    }
+
+    fn pair() -> (Connection, Self) {
+        Self::pair_with_params(tls_tickets::client_params())
+    }
+
+    fn pair_with_params(params: Vec<u8>) -> (Connection, Self) {
+        let (mut conn, mut peer) = Self::unstarted(params);
         let mut hello = Vec::new();
         assert!(peer.tls.write_hs(&mut hello).is_none());
         let mut body = Vec::new();
@@ -51,6 +63,11 @@ impl Peer {
     }
 
     fn send(&mut self, conn: &mut Connection, space: Space, body: &[u8]) {
+        let mut out = self.packet(conn, space, body);
+        conn.recv(&mut out).unwrap();
+    }
+
+    fn packet(&mut self, conn: &Connection, space: Space, body: &[u8]) -> Vec<u8> {
         let keys = &self.keys[space as usize].as_ref().unwrap().local;
         let mut out = Vec::new();
         let length_at = match space {
@@ -92,7 +109,7 @@ impl Peer {
             .unwrap();
         out.extend_from_slice(tag.as_ref());
         protect_header(keys.header.as_ref(), &mut out, pn_offset, 4).unwrap();
-        conn.recv(&mut out).unwrap();
+        out
     }
 
     /// Return authenticated packet numbers and plaintext, including ACK-only
@@ -276,4 +293,111 @@ fn encrypted_finished_retires_retries_before_accepting_application_data() {
     // encryption level may retain a timer or emit CRYPTO afterwards.
     conn.on_timeout(conn.timeout().unwrap());
     peer.complete(&mut conn);
+}
+
+#[test]
+fn encrypted_malformed_transport_parameters_never_activate_application_keys() {
+    for malformed in [
+        vec![0x3f, 3, 1], // truncated unknown parameter body
+        vec![0x40],       // truncated parameter id
+        vec![0x3f],       // missing length
+        vec![3, 1, 0x40], // truncated integer
+        vec![3, 0],       // empty integer
+    ] {
+        for reorder in [false, true] {
+            let mut params = tls_tickets::client_params();
+            params.extend_from_slice(&malformed);
+            let (mut conn, mut peer) = Peer::unstarted(params);
+            let mut hello = Vec::new();
+            assert!(peer.tls.write_hs(&mut hello).is_none());
+            let mut body = Vec::new();
+            let end = if reorder {
+                let split = hello.len() / 2;
+                frame::put_crypto(&mut body, split as u64, &hello[split..]);
+                peer.send(&mut conn, Space::Initial, &body);
+                peer.send(&mut conn, Space::Initial, &body);
+                assert!(!conn.connected);
+                body.clear();
+                split
+            } else {
+                hello.len()
+            };
+            frame::put_crypto(&mut body, 0, &hello[..end]);
+            let mut packet = peer.packet(&conn, Space::Initial, &body);
+            let original = packet.clone();
+            let received = conn.recv(&mut packet);
+            assert!(
+                !conn.connected,
+                "malformed parameters activated the connection"
+            );
+            assert!(received.is_err());
+            assert!(conn.is_closing_handshake());
+            assert!(conn.one_rtt_local.is_none() && conn.one_rtt_remote.is_none());
+            assert!(conn.key_updates.is_none());
+            assert_eq!(conn.peer.initial_max_data, 0);
+            assert!(conn.streams.is_empty());
+
+            let deadline = conn.timeout().unwrap();
+            let mut out = Vec::new();
+            assert!(conn.poll_transmit(&mut out).unwrap());
+            assert!(out.len() <= original.len());
+            let header = packet::parse(&out, 0).unwrap();
+            assert_eq!(header.kind, Kind::Initial);
+            assert_eq!(
+                packet::parse(&out, header.end).unwrap().kind,
+                Kind::Handshake
+            );
+            // Authenticate and decode the close independently of the server's
+            // keys/state. The TLS peer has not received ServerHello.
+            let keys = &peer.keys[0].as_ref().unwrap().remote;
+            let mut initial = out[..header.end].to_vec();
+            let (_, pn_len) =
+                unprotect_header(keys.header.as_ref(), &mut initial, header.pn_offset).unwrap();
+            let pn = initial[header.pn_offset..header.pn_offset + pn_len]
+                .iter()
+                .fold(0, |pn, b| (pn << 8) | u64::from(*b));
+            let (head, payload) = initial.split_at_mut(header.pn_offset + pn_len);
+            let plain = keys.packet.decrypt_in_place(pn, head, payload).unwrap();
+            assert_eq!(plain, [0x1c, 0x08, 0, 0]);
+            out.clear();
+            assert!(!conn.poll_transmit(&mut out).unwrap());
+            assert!(!conn.wants_send());
+
+            // An exact encrypted replay and fresh CRYPTO with another packet
+            // number cannot revive TLS or retain ordinary flight timers.
+            conn.recv(&mut original.clone()).unwrap();
+            peer.send(&mut conn, Space::Initial, &body);
+            assert!(!conn.connected);
+            assert_eq!(conn.timeout(), Some(deadline));
+            assert!(
+                conn.spaces
+                    .iter()
+                    .all(|s| s.crypto_out.is_empty() && s.crypto_flight.is_empty())
+            );
+            conn.on_timeout(deadline);
+            assert!(conn.closed);
+            assert!(conn.timeout().is_none());
+            assert!(conn.recv(&mut original.clone()).is_err());
+            assert!(!conn.wants_send());
+            assert!(!conn.poll_transmit(&mut out).unwrap());
+            assert!(out.is_empty());
+        }
+    }
+}
+
+#[test]
+fn encrypted_valid_and_unknown_transport_parameters_complete_normally() {
+    for unknown in [false, true] {
+        let mut params = tls_tickets::client_params();
+        if unknown {
+            // Unknown opaque data need not encode an integer, and an empty
+            // unknown parameter is valid too.
+            params.extend_from_slice(&[0x3f, 3, 0xff, 0xff, 0xff, 0x3e, 0]);
+        }
+        let (mut conn, mut peer) = Peer::pair_with_params(params);
+        assert!(conn.connected && !conn.is_closing_handshake());
+        assert_eq!(conn.peer.initial_max_data, 1 << 30);
+        assert_eq!(conn.peer.initial_max_stream_data_uni, 1 << 24);
+        peer.complete(&mut conn);
+    }
 }
