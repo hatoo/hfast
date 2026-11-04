@@ -3,7 +3,7 @@
 //! They ride inside the TLS handshake as an extension, so rustls carries them
 //! and this only says what they mean.
 
-use super::wire::{ConnectionId, Reader, Result, put_varint};
+use super::wire::{ConnectionId, Error, Reader, Result, put_varint};
 
 const ORIGINAL_DESTINATION_CONNECTION_ID: u64 = 0x00;
 const MAX_IDLE_TIMEOUT: u64 = 0x01;
@@ -78,7 +78,13 @@ pub fn decode(buf: &[u8]) -> Result<Peer> {
             MAX_ACK_DELAY => p.max_ack_delay = v.varint()?,
             // Everything else is either about a path this server does not
             // change or an id it does not hand out
-            _ => {}
+            _ => continue,
+        }
+        // A recognized scalar body contains exactly one integer (RFC 9000
+        // Section 18.2). Its encoding may be nonminimal, but extra bytes are
+        // not another parameter or padding. Unknown bodies remain opaque.
+        if !v.is_empty() {
+            return Err(Error);
         }
     }
     Ok(p)
@@ -144,6 +150,112 @@ fn put_cid(out: &mut Vec<u8>, id: u64, cid: &ConnectionId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SCALARS: [u64; 9] = [
+        INITIAL_MAX_DATA,
+        INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+        INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+        INITIAL_MAX_STREAM_DATA_UNI,
+        INITIAL_MAX_STREAMS_BIDI,
+        INITIAL_MAX_STREAMS_UNI,
+        MAX_UDP_PAYLOAD_SIZE,
+        ACK_DELAY_EXPONENT,
+        MAX_ACK_DELAY,
+    ];
+
+    fn scalar_body(id: u64, body: &[u8]) -> Vec<u8> {
+        let mut params = Vec::new();
+        put_varint(&mut params, id);
+        put_varint(&mut params, body.len() as u64);
+        params.extend_from_slice(body);
+        params
+    }
+
+    fn integer(value: u64, width: usize) -> Vec<u8> {
+        let mut bytes = value.to_be_bytes()[8 - width..].to_vec();
+        bytes[0] |= (width.trailing_zeros() as u8) << 6;
+        bytes
+    }
+
+    #[test]
+    fn scalar_parameters_accept_exact_and_nonminimal_encodings() {
+        for (index, id) in SCALARS.into_iter().enumerate() {
+            let value = if id == MAX_UDP_PAYLOAD_SIZE { 1200 } else { 7 };
+            for width in [1, 2, 4, 8] {
+                if width < super::super::wire::varint_len(value) {
+                    continue;
+                }
+                // Nonminimal ID and Length encodings are legal as well.
+                let mut params = integer(id, 2);
+                params.extend(integer(width as u64, 4));
+                params.extend(integer(value, width));
+                let peer = decode(&params).unwrap();
+                let values = [
+                    peer.initial_max_data,
+                    peer.initial_max_stream_data_bidi_local,
+                    peer.initial_max_stream_data_bidi_remote,
+                    peer.initial_max_stream_data_uni,
+                    peer.initial_max_streams_bidi,
+                    peer.initial_max_streams_uni,
+                    peer.max_udp_payload_size,
+                    u64::from(peer.ack_delay_exponent),
+                    peer.max_ack_delay,
+                ];
+                assert_eq!(values[index], value, "id={id}, width={width}");
+            }
+        }
+        for value in [63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, (1 << 62) - 1] {
+            let mut body = Vec::new();
+            put_varint(&mut body, value);
+            assert_eq!(
+                decode(&scalar_body(INITIAL_MAX_DATA, &body))
+                    .unwrap()
+                    .initial_max_data,
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_parameters_reject_trailing_bytes() {
+        for id in SCALARS {
+            for width in [1, 2, 4, 8] {
+                for tail in [&[0][..], &[0x40][..], &[0x3f, 0][..]] {
+                    let mut body = integer(7, width);
+                    body.extend_from_slice(tail);
+                    let mut params = scalar_body(id, &body);
+                    // A valid following parameter cannot absorb the surplus.
+                    params.extend_from_slice(&[0x3f, 0]);
+                    assert!(
+                        decode(&params).is_err(),
+                        "id={id}, width={width}, tail={tail:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_parameters_reject_every_truncated_integer_prefix() {
+        for id in SCALARS {
+            for width in [1, 2, 4, 8] {
+                let body = integer(7, width);
+                for end in 0..width {
+                    assert!(decode(&scalar_body(id, &body[..end])).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_parameter_bodies_remain_opaque() {
+        for body in [&[][..], &[0x40][..], &[0xff, 0xff, 0xff][..], &[7, 0][..]] {
+            let mut params = scalar_body(0x3fff, body);
+            params.extend(scalar_body(INITIAL_MAX_DATA, &[7]));
+            params.extend(scalar_body(0x3ffe, body));
+            assert_eq!(decode(&params).unwrap().initial_max_data, 7);
+        }
+    }
 
     #[test]
     fn what_is_encoded_can_be_read_back() {
