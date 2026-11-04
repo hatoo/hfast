@@ -587,10 +587,11 @@ class FailureEvidenceTests(unittest.TestCase):
         waits = []
 
         def spawn(_command, **kwargs):
+            port = int(_command[_command.index('--quic') + 1])
             code = ('import signal,socket,time\n'
                     'signal.signal(signal.SIGTERM,signal.SIG_IGN)\n'
                     's=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n'
-                    's.bind(("127.0.0.1",0))\ntime.sleep(30)\n')
+                    f's.bind(("127.0.0.1",{port}))\ntime.sleep(30)\n')
             process = popen([sys.executable, '-c', code], **kwargs)
             wait = process.wait
 

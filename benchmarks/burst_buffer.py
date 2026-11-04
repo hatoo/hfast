@@ -1,5 +1,6 @@
 """Untimed server receive-capacity evidence shared by both burst controllers."""
 import argparse
+import time
 
 import burst_failure as failure
 
@@ -26,10 +27,10 @@ def flags(requested):
     return ['--udp-receive-buffer', str(requested)] if requested else []
 
 
-def observe(pid, port, requested, workers=1):
+def observe(pid, port, requested, workers=1, deadline=None):
     validate(requested)
     failure.require(type(workers) is int and workers in (1, 2), 'expected one or two workers')
-    snapshot = failure.observe(failure.process_snapshot, pid)
+    snapshot = failure.observe(failure.process_snapshot, pid, deadline)
     result = dict(requested_bytes=requested, effective_bytes=None,
                   below_doubled_request=None, status='unavailable', error=None,
                   workers=workers, snapshot=snapshot)
@@ -48,6 +49,57 @@ def observe(pid, port, requested, workers=1):
     except (KeyError, TypeError, ValueError) as error:
         result['error'] = str(error)
     return result
+
+
+def wait_ready(process, port, requested, workers=1, timeout=5):
+    """Wait before workload launch, without retrying lost measurement evidence.
+
+    A GRO-denial wrapper may still be importing Python modules after a fixed
+    startup sleep. Only absent sockets or an incomplete set of server workers
+    are retryable. Keep every observation, process identity and any sockets
+    already found; permission/diagnostic failures and replacements stay errors.
+    """
+    deadline = time.monotonic() + timeout
+    history = []
+    identity = None
+    seen = {}
+    while True:
+        row = observe(process.pid, port, requested, workers, deadline=deadline)
+        snapshot = row['snapshot']
+        try:
+            failure.require(process.poll() is None, 'server exited during startup')
+            failure.require(all(k in snapshot for k in ('pid', 'start_ticks', 'netns')),
+                            row.get('error') or 'startup process identity unavailable')
+            current = tuple(snapshot[k] for k in ('pid', 'start_ticks', 'netns'))
+            failure.require(identity is None or current == identity,
+                            'server identity changed during startup')
+            identity = current
+            sockets = snapshot['sockets']
+            by_inode = {s['inode']: s for s in sockets}
+            for inode, prior in seen.items():
+                current_socket = by_inode.get(inode, {})
+                failure.require(all(current_socket.get(k) == prior[k] for k in
+                    ('family', 'port', 'local', 'remote', 'fds', 'cookie', 'rcvbuf')),
+                    'server socket changed during startup')
+                failure.require(current_socket['drops'] >= prior['drops'],
+                                'server socket drops decreased during startup')
+            if row['status'] == 'available':
+                failure.require(time.monotonic() < deadline, 'server UDP startup deadline expired')
+                row['startup_observations'] = history
+                return row
+            absent = (snapshot.get('error') == 'ValueError: no owned UDP sockets remain'
+                      and not sockets)
+            partial = (snapshot['status'] == 'available' and 0 < len(sockets) < workers
+                       and all(s['port'] == port for s in sockets))
+            failure.require(absent or partial, row.get('error') or 'startup evidence unavailable')
+            seen.update(by_inode)
+            failure.require(time.monotonic() < deadline, 'server UDP startup deadline expired')
+        except (KeyError, TypeError, ValueError) as error:
+            row.update(status='unavailable', effective_bytes=None, below_doubled_request=None,
+                       error=str(error), startup_observations=history)
+            return row
+        history.append(row)
+        time.sleep(min(.01, max(0, deadline - time.monotonic())))
 
 
 def interval(before, after):

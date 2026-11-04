@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -127,7 +128,138 @@ class CapacityTests(unittest.TestCase):
                 child.wait(timeout=5)
 
 
+class StartupTests(unittest.TestCase):
+    @staticmethod
+    def absent():
+        return dict(snapshot(), status='unavailable', sockets=[], owned_inodes={},
+                    error='ValueError: no owned UDP sockets remain')
+
+    def test_delayed_exec_keeps_startup_observations(self):
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        with patch.object(capacity.failure, 'process_snapshot',
+                          side_effect=[self.absent(), self.absent(), snapshot()]), \
+                patch.object(capacity.time, 'sleep'):
+            row = capacity.wait_ready(process, 9999, 0)
+        self.assertEqual(row['status'], 'available')
+        self.assertEqual(len(row['startup_observations']), 2)
+        self.assertTrue(all(s['status'] == 'unavailable' for s in row['startup_observations']))
+
+    def test_partial_workers_must_retain_existing_socket(self):
+        initial = snapshot()
+        full = deepcopy(initial)
+        full['sockets'].append(dict(full['sockets'][0], inode=9, cookie=[10, 0], fds=[4]))
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        with patch.object(capacity.failure, 'process_snapshot', side_effect=[initial, full]), \
+                patch.object(capacity.time, 'sleep'):
+            row = capacity.wait_ready(process, 9999, 0, workers=2)
+        self.assertEqual(row['status'], 'available')
+        for field, value in [('inode', 88), ('cookie', [88, 0]), ('fds', [8]), ('rcvbuf', 1)]:
+            changed = deepcopy(full)
+            changed['sockets'][0][field] = value
+            with self.subTest(field=field), \
+                    patch.object(capacity.failure, 'process_snapshot', side_effect=[initial, changed]), \
+                    patch.object(capacity.time, 'sleep'):
+                bad = capacity.wait_ready(process, 9999, 0, workers=2)
+            self.assertEqual(bad['status'], 'unavailable')
+            self.assertIn('socket changed', bad['error'])
+
+    def test_permission_wrong_port_and_process_replacement_are_not_retried(self):
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        wrong = snapshot()
+        wrong['sockets'][0]['port'] = 8888
+        for bad in [dict(status='unavailable', error='denied'), wrong]:
+            with patch.object(capacity.failure, 'process_snapshot', return_value=bad) as observe:
+                row = capacity.wait_ready(process, 9999, 0)
+            self.assertEqual(row['status'], 'unavailable')
+            self.assertEqual(observe.call_count, 1)
+        for field, value in [('pid', 124), ('start_ticks', 457), ('netns', 'net:8')]:
+            with patch.object(capacity.failure, 'process_snapshot',
+                              side_effect=[self.absent(), dict(snapshot(), **{field: value})]), \
+                    patch.object(capacity.time, 'sleep'):
+                row = capacity.wait_ready(process, 9999, 0)
+            self.assertEqual(row['status'], 'unavailable')
+            self.assertIn('identity changed', row['error'])
+
+    def test_exit_and_timeout_stay_unavailable(self):
+        process = Mock(pid=123)
+        process.poll.return_value = 7
+        with patch.object(capacity.failure, 'process_snapshot', return_value=self.absent()):
+            exited = capacity.wait_ready(process, 9999, 0)
+        self.assertEqual(exited['status'], 'unavailable')
+        self.assertIn('exited', exited['error'])
+        process.poll.return_value = None
+        with patch.object(capacity.failure, 'process_snapshot', return_value=self.absent()):
+            started = time.monotonic()
+            expired = capacity.wait_ready(process, 9999, 0, timeout=.03)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(expired['status'], 'unavailable')
+        self.assertIn('deadline', expired['error'])
+        self.assertGreater(len(expired['startup_observations']), 0)
+
+    def test_live_delayed_socket_and_actual_receive_capacity(self):
+        code = ('import socket,sys\n'
+                'print("starting",flush=True)\nsys.stdin.readline()\n'
+                's=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n'
+                's.bind(("127.0.0.1",int(sys.argv[1])))\n'
+                'print(s.getsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF),flush=True)\n'
+                'sys.stdin.readline()\n')
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+            reserve.bind(('127.0.0.1', 0))
+            port = reserve.getsockname()[1]
+        with subprocess.Popen([sys.executable, '-c', code, str(port)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True) as child:
+            try:
+                self.assertEqual(child.stdout.readline(), 'starting\n')
+                # This is the failed CI observation: wrapper alive, socket absent.
+                self.assertEqual(capacity.observe(child.pid, port, 0)['status'], 'unavailable')
+                observe = capacity.observe
+                released = False
+
+                def start_after_observation(*args, **kwargs):
+                    nonlocal released
+                    row = observe(*args, **kwargs)
+                    if not released:
+                        self.assertEqual(row['status'], 'unavailable')
+                        released = True
+                        child.stdin.write('start\n')
+                        child.stdin.flush()
+                    return row
+
+                with patch.object(capacity, 'observe', side_effect=start_after_observation):
+                    before = capacity.wait_ready(child, port, 0)
+                self.assertEqual(before['status'], 'available', before)
+                self.assertEqual(before['effective_bytes'], int(child.stdout.readline()))
+                self.assertTrue(before['startup_observations'])
+                interval = capacity.interval(before, capacity.observe(child.pid, port, 0))
+                self.assertEqual(interval['status'], 'available', interval)
+                self.assertEqual(interval['socket_delta']['drops'], 0)
+            finally:
+                child.stdin.write('stop\n')
+                child.stdin.flush()
+                child.wait(timeout=5)
+
+
 class CommandTests(unittest.TestCase):
+    def test_unready_server_never_starts_producers_and_is_reaped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'run'
+            process = Mock(pid=123)
+            process.poll.return_value = None
+            bad = dict(observation(), status='unavailable', error='deliberately unavailable')
+            with patch.object(workers.subprocess, 'Popen', return_value=process), \
+                    patch.object(capacity, 'wait_ready', return_value=bad), \
+                    patch.object(workers, 'coordinate') as coordinate, \
+                    self.assertRaisesRegex(RuntimeError, 'server not ready'):
+                workers.run(Path(sys.executable), Path(sys.executable), output,
+                            [min(os.sched_getaffinity(0))], allow_shared_cpus=True)
+            coordinate.assert_not_called()
+            process.terminate.assert_called_once()
+            self.assertEqual(json.loads((output/'receive-buffer.json').read_text())['error'],
+                             'deliberately unavailable')
+
     def test_comparator_excludes_unavailable_unequal_and_between_pair_changes(self):
         before = observation()
         good = capacity.interval(before, before)

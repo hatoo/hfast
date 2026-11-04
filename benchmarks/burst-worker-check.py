@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import socket
 import subprocess
-import time
 
 import burst_workers as b
 import burst_buffer
@@ -43,10 +42,11 @@ def main(args):
                                    *burst_buffer.flags(args.udp_receive_buffer)],
                                   stdout=log, stderr=log)
         try:
-            time.sleep(.2)
-            capacity_before = burst_buffer.observe(server.pid, port, args.udp_receive_buffer)
+            capacity_before = burst_buffer.wait_ready(server, port, args.udp_receive_buffer)
             with (args.output / 'legacy.receive-buffer.json').open('x') as evidence:
                 evidence.write(json.dumps(capacity_before, indent=2) + '\n')
+            b.require(capacity_before['status'] == 'available',
+                      f'legacy server not ready: {capacity_before["error"]}')
             command = ['taskset', '-c', str(cpus[0]), str(args.peer), str(port),
                        str(server.pid), '32', '8', '16', '2', '8', '1']
             peer = subprocess.run(command, capture_output=True, text=True, timeout=30)

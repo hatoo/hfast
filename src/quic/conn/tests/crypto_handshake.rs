@@ -1,4 +1,5 @@
 use super::*;
+use crate::quic::wire::Reader;
 
 /// A rustls peer which consumes only authenticated wire output. The server's
 /// TLS, flight, packet-number and timer state is never seeded by the fixture.
@@ -307,80 +308,7 @@ fn encrypted_malformed_transport_parameters_never_activate_application_keys() {
         for reorder in [false, true] {
             let mut params = tls_tickets::client_params();
             params.extend_from_slice(&malformed);
-            let (mut conn, mut peer) = Peer::unstarted(params);
-            let mut hello = Vec::new();
-            assert!(peer.tls.write_hs(&mut hello).is_none());
-            let mut body = Vec::new();
-            let end = if reorder {
-                let split = hello.len() / 2;
-                frame::put_crypto(&mut body, split as u64, &hello[split..]);
-                peer.send(&mut conn, Space::Initial, &body);
-                peer.send(&mut conn, Space::Initial, &body);
-                assert!(!conn.connected);
-                body.clear();
-                split
-            } else {
-                hello.len()
-            };
-            frame::put_crypto(&mut body, 0, &hello[..end]);
-            let mut packet = peer.packet(&conn, Space::Initial, &body);
-            let original = packet.clone();
-            let received = conn.recv(&mut packet);
-            assert!(
-                !conn.connected,
-                "malformed parameters activated the connection"
-            );
-            assert!(received.is_err());
-            assert!(conn.is_closing_handshake());
-            assert!(conn.one_rtt_local.is_none() && conn.one_rtt_remote.is_none());
-            assert!(conn.key_updates.is_none());
-            assert_eq!(conn.peer.initial_max_data, 0);
-            assert!(conn.streams.is_empty());
-
-            let deadline = conn.timeout().unwrap();
-            let mut out = Vec::new();
-            assert!(conn.poll_transmit(&mut out).unwrap());
-            assert!(out.len() <= original.len());
-            let header = packet::parse(&out, 0).unwrap();
-            assert_eq!(header.kind, Kind::Initial);
-            assert_eq!(
-                packet::parse(&out, header.end).unwrap().kind,
-                Kind::Handshake
-            );
-            // Authenticate and decode the close independently of the server's
-            // keys/state. The TLS peer has not received ServerHello.
-            let keys = &peer.keys[0].as_ref().unwrap().remote;
-            let mut initial = out[..header.end].to_vec();
-            let (_, pn_len) =
-                unprotect_header(keys.header.as_ref(), &mut initial, header.pn_offset).unwrap();
-            let pn = initial[header.pn_offset..header.pn_offset + pn_len]
-                .iter()
-                .fold(0, |pn, b| (pn << 8) | u64::from(*b));
-            let (head, payload) = initial.split_at_mut(header.pn_offset + pn_len);
-            let plain = keys.packet.decrypt_in_place(pn, head, payload).unwrap();
-            assert_eq!(plain, [0x1c, 0x08, 0, 0]);
-            out.clear();
-            assert!(!conn.poll_transmit(&mut out).unwrap());
-            assert!(!conn.wants_send());
-
-            // An exact encrypted replay and fresh CRYPTO with another packet
-            // number cannot revive TLS or retain ordinary flight timers.
-            conn.recv(&mut original.clone()).unwrap();
-            peer.send(&mut conn, Space::Initial, &body);
-            assert!(!conn.connected);
-            assert_eq!(conn.timeout(), Some(deadline));
-            assert!(
-                conn.spaces
-                    .iter()
-                    .all(|s| s.crypto_out.is_empty() && s.crypto_flight.is_empty())
-            );
-            conn.on_timeout(deadline);
-            assert!(conn.closed);
-            assert!(conn.timeout().is_none());
-            assert!(conn.recv(&mut original.clone()).is_err());
-            assert!(!conn.wants_send());
-            assert!(!conn.poll_transmit(&mut out).unwrap());
-            assert!(out.is_empty());
+            assert_transport_parameters_rejected(params, reorder);
         }
     }
 }
@@ -398,6 +326,146 @@ fn encrypted_valid_and_unknown_transport_parameters_complete_normally() {
         assert!(conn.connected && !conn.is_closing_handshake());
         assert_eq!(conn.peer.initial_max_data, 1 << 30);
         assert_eq!(conn.peer.initial_max_stream_data_uni, 1 << 24);
+        peer.complete(&mut conn);
+    }
+}
+
+fn assert_transport_parameters_rejected(params: Vec<u8>, reorder: bool) {
+    let (mut conn, mut peer) = Peer::unstarted(params);
+    let mut hello = Vec::new();
+    assert!(peer.tls.write_hs(&mut hello).is_none());
+    let mut body = Vec::new();
+    let end = if reorder {
+        let split = hello.len() / 2;
+        frame::put_crypto(&mut body, split as u64, &hello[split..]);
+        peer.send(&mut conn, Space::Initial, &body);
+        peer.send(&mut conn, Space::Initial, &body);
+        assert!(!conn.connected);
+        body.clear();
+        split
+    } else {
+        hello.len()
+    };
+    frame::put_crypto(&mut body, 0, &hello[..end]);
+    let mut packet = peer.packet(&conn, Space::Initial, &body);
+    let original = packet.clone();
+    let received = conn.recv(&mut packet);
+    assert!(
+        !conn.connected,
+        "malformed parameters activated the connection"
+    );
+    assert!(received.is_err());
+    assert!(conn.is_closing_handshake());
+    assert!(conn.one_rtt_local.is_none() && conn.one_rtt_remote.is_none());
+    assert!(conn.key_updates.is_none());
+    assert_eq!(conn.peer.initial_max_data, 0);
+    assert!(conn.streams.is_empty());
+
+    let deadline = conn.timeout().unwrap();
+    let mut out = Vec::new();
+    assert!(conn.poll_transmit(&mut out).unwrap());
+    assert!(out.len() <= original.len());
+    let header = packet::parse(&out, 0).unwrap();
+    assert_eq!(header.kind, Kind::Initial);
+    assert_eq!(
+        packet::parse(&out, header.end).unwrap().kind,
+        Kind::Handshake
+    );
+    // Authenticate and decode the close independently of the server's
+    // keys/state. The TLS peer has not received ServerHello.
+    let keys = &peer.keys[0].as_ref().unwrap().remote;
+    let mut initial = out[..header.end].to_vec();
+    let (_, pn_len) =
+        unprotect_header(keys.header.as_ref(), &mut initial, header.pn_offset).unwrap();
+    let pn = initial[header.pn_offset..header.pn_offset + pn_len]
+        .iter()
+        .fold(0, |pn, b| (pn << 8) | u64::from(*b));
+    let (head, payload) = initial.split_at_mut(header.pn_offset + pn_len);
+    let plain = keys.packet.decrypt_in_place(pn, head, payload).unwrap();
+    assert_eq!(plain, [0x1c, 0x08, 0, 0]);
+    out.clear();
+    assert!(!conn.poll_transmit(&mut out).unwrap());
+    assert!(!conn.wants_send());
+
+    // An exact encrypted replay and fresh CRYPTO with another packet
+    // number cannot revive TLS or retain ordinary flight timers.
+    conn.recv(&mut original.clone()).unwrap();
+    peer.send(&mut conn, Space::Initial, &body);
+    assert!(!conn.connected);
+    assert_eq!(conn.timeout(), Some(deadline));
+    assert!(
+        conn.spaces
+            .iter()
+            .all(|s| s.crypto_out.is_empty() && s.crypto_flight.is_empty())
+    );
+    conn.on_timeout(deadline);
+    assert!(conn.closed);
+    assert!(conn.timeout().is_none());
+    assert!(conn.recv(&mut original.clone()).is_err());
+    assert!(!conn.wants_send());
+    assert!(!conn.poll_transmit(&mut out).unwrap());
+    assert!(out.is_empty());
+}
+
+/// Rewrite one declaration without introducing a duplicate parameter ID.
+fn replace_scalar(params: &[u8], id: u64, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut reader = Reader::new(params);
+    while !reader.is_empty() {
+        let at = reader.position();
+        let current = reader.varint().unwrap();
+        reader.varint_slice().unwrap();
+        if current != id {
+            out.extend_from_slice(reader.slice_between(at).unwrap());
+        }
+    }
+    put_varint(&mut out, id);
+    put_varint(&mut out, body.len() as u64);
+    out.extend_from_slice(body);
+    out
+}
+
+#[test]
+fn encrypted_scalar_trailing_bytes_never_activate_application_keys() {
+    for id in 3..=11 {
+        for width in [1usize, 2, 4, 8] {
+            for reorder in [false, true] {
+                let mut body = 7u64.to_be_bytes()[8 - width..].to_vec();
+                body[0] |= (width.trailing_zeros() as u8) << 6;
+                body.push(0); // part of this declared scalar, not a new TLV
+                let params = replace_scalar(&tls_tickets::client_params(), id, &body);
+                assert_transport_parameters_rejected(params, reorder);
+            }
+        }
+    }
+}
+
+#[test]
+fn encrypted_nonminimal_scalars_preserve_peer_credit_and_complete_normally() {
+    for (id, value) in [
+        (3, 1200u64),
+        (4, 1 << 30),
+        (5, 1 << 24),
+        (6, 1 << 24),
+        (7, 1 << 24),
+        (8, 8),
+        (9, 8),
+        (10, 3),
+        (11, 25),
+    ] {
+        let mut body = value.to_be_bytes();
+        body[0] |= 0xc0;
+        let params = replace_scalar(&tls_tickets::client_params(), id, &body);
+        let (mut conn, mut peer) = Peer::pair_with_params(params);
+        assert!(conn.connected && !conn.is_closing_handshake());
+        assert_eq!(conn.peer.initial_max_data, 1 << 30);
+        assert_eq!(conn.peer.initial_max_stream_data_uni, 1 << 24);
+        assert_eq!(
+            conn.peer.max_udp_payload_size,
+            if id == 3 { 1200 } else { 65527 }
+        );
+        assert_eq!(conn.peer.ack_delay_exponent, 3);
+        assert_eq!(conn.peer.max_ack_delay, 25);
         peer.complete(&mut conn);
     }
 }
