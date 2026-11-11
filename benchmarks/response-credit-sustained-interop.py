@@ -37,7 +37,7 @@ class Server(base.Server):
         self.old_sent = False
         self.ack_gate_until = None
         q = self._quic
-        if scenario in ('stream-credit', 'no-credit'):
+        if window > 128 or scenario in ('stream-credit', 'no-credit'):
             q._local_max_streams_bidi.value = window
             q._local_max_streams_bidi.sent = window
         if scenario == 'data-credit':
@@ -182,7 +182,9 @@ async def check(peer, output, schedule='byte', mode='each', scenario='ordinary',
     name = f'{schedule}-{mode}-{scenario}-{fault or "valid"}-{count}' + ('-controlled' if controlled else '')
     if connection: name = 'connection-' + name
     hostile = fault or scenario in ('no-credit','no-request-ack')
-    budget = 3 if hostile else 10
+    # The new 4096-slot independent Python server scans all live streams for
+    # each aggregate grant. Keep its larger deadline explicit and bounded.
+    budget = 3 if hostile else (120 if window > 1024 else 60 if window > 512 else 10)
     process = await asyncio.create_subprocess_exec(str(peer), str(port), str(count), str(window), schedule, mode, str(budget), '--trace',
         *(['--controlled'] if controlled else []), *(['--connection-credit'] if connection else []), stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=16 << 20)
@@ -285,6 +287,7 @@ async def stream_cases(a, rows):
     rows.append(await check(a.peer,a.output,controlled=True))
     # 4-byte stream IDs and many generations, still inside the trace budget.
     rows.append(await check(a.peer,a.output,schedule='full',count=4112,window=32))
+    rows.append(await check(a.peer,a.output,schedule='full',count=4097,window=4096))
     for fault in ('wrong-byte','premature-fin','extra-byte','missing-fin','missing-response','missing-grant-ack','credit-overrun'):
         rows.append(await check(a.peer,a.output,fault=fault))
     for scenario in ('no-credit','no-request-ack'):
@@ -300,6 +303,9 @@ async def connection_cases(a, rows):
         rows.append(await check(a.peer, a.output, schedule='full', scenario=scenario, connection=True))
     rows.append(await check(a.peer, a.output, schedule='full', scenario='original-grant-ack', connection=True))
     rows.append(await check(a.peer, a.output, connection=True, controlled=True))
+    for window in (513, 1024, 4096):
+        rows.append(await check(a.peer, a.output, schedule='full', count=window+1,
+                                window=window, connection=True))
     for fault in ('wrong-byte', 'premature-fin', 'extra-byte', 'missing-fin', 'missing-response', 'missing-grant-ack', 'credit-overrun'):
         rows.append(await check(a.peer, a.output, fault=fault, connection=True))
     rows.append(await check(a.peer, a.output, mode='loss', fault='false-grant-ack', connection=True))

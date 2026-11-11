@@ -33,7 +33,7 @@ as if they were the same workload. Each later grant requires the preceding
 byte prefix and its grant ACK. At most 32 requests or grants share one packet;
 ACKs are batched after a receive drain, without changing any grant generation.
 
-The wave ledger retains at most 512 active stream records and up to 4,194,304
+The wave ledger retains at most 4096 active stream records and up to 4,194,304
 samples. Stream IDs always increase. Admission requires sufficient real
 MAX_DATA and MAX_STREAMS credit; stale credit cannot revoke a newer limit.
 Retirement requires every literal response byte, valid FIN, original first-send
@@ -47,7 +47,9 @@ Each outstanding packet batch retains every original/retry packet number until
 an authenticated ACK covers a copy. These identities and receive/ACK histories
 survive wave retirement. A response never acknowledges its request. There are
 at most 64 live batches, 128 copies per batch, and 16,384 disjoint ACK intervals;
-exhaustion fails explicitly. New grants wait if all batch slots are occupied.
+exhaustion fails explicitly. Request admission and new grants wait if all batch slots are occupied. A large
+wave resumes at its next unsent request after authenticated ACKs free slots;
+first-send timestamps and the all-request-ACK gate are preserved.
 The fixture uses a 50 ms retry timer, a fixed connection/key phase, localhost,
 and explicit deadlines. It is not a general-purpose QUIC implementation.
 
@@ -124,3 +126,33 @@ The independent aioquic suite verifies actual serialized transport parameters,
 MAX_DATA generations, delayed original request/grant ACKs, and rejects over-credit
 bytes, forged ACKs of an intentionally unsent grant, missing ACKs/FINs and corrupt
 bytes. These checks qualify a workload; they establish no throughput improvement.
+
+
+## Window boundaries and bounded traces
+
+The peer admits windows 1 through 4096. The native controller explicitly sets
+server stream capacity to `max(1024, WINDOW)`; record that configuration when
+comparing runs. CI retains 1/16/512 cases and adds 511/513/1024 windows with
+`2*WINDOW+1` responses for each aggregate increment, plus 4096-window controls
+with 4097 responses in both ordinary full-credit and aggregate 25-byte mode.
+The independent aioquic server also exercises 513/1024/4096 and final short waves.
+These are correctness qualifications, not native performance comparisons.
+
+Traced workloads are checked before opening a socket. Let N be request count,
+W the window, K=ceil(N/W), and G the sum of ceil(25*wave_size/step) over waves.
+A conservative transcript allowance includes 26 frames per response (one frame
+per byte plus a separate FIN). The per-table bound is `2*(53*N+2*G+2*K+8)+4096`
+in aggregate mode and `2*(26*N+8)+4096` in stream mode, with a minimum of 131072
+to preserve the prior allowance for small hostile/withheld-ACK cases. The factor two allows
+retries/duplicates, and 4096 extra events allow control/PING traffic. Every table
+remains capped at 1,048,576 entries. Larger traced workloads fail before transport;
+untraced runs retain the existing 4,194,304-sample limit. Arbitrary loss can still
+exhaust a transcript: that is an explicit failed run, never evidence silently
+omitted from a successful report. This is an event bound, not a byte/RSS bound.
+
+For example, aggregate byte grants at N=2049/W=1024 have a 426218-event bound;
+N=4097/W=4096 with 25-byte grants has a 454790-event bound. N=8193/W=4096 byte
+grants exceed the cap and are rejected. Reports include `trace_limit`; the
+independent validator derives the expected bound and checks each transcript.
+Tests cover upper-limit rejection, runtime exhaustion without overwriting prior
+evidence, duplicate credit, partial waves, and process exits/deadline cleanup.

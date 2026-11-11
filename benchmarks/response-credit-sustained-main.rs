@@ -36,10 +36,9 @@ use std::{
     net::UdpSocket,
     time::{Duration, Instant},
 };
-use waves::{Delivery, Grants, Ready, Waves};
+use waves::{Delivery, Grants, MAX_WINDOW, Ready, Waves, trace_limit};
 
 const REQUEST: &[u8] = b"\x01\x10\x00\x00\xd1\xd7\x50\x09localhost\xc1";
-const MAX_EVENTS: usize = 131072;
 const MAX_FLIGHTS: usize = 64;
 const BATCH: usize = 32;
 fn model<T>(result: std::result::Result<T, &'static str>) -> Result<T> {
@@ -108,6 +107,8 @@ struct Peer {
     schedule: String,
     mode: String,
     trace: bool,
+    trace_limit: usize,
+    queued_requests: usize,
     epoch: Instant,
     flights: Vec<Flight>,
     sent: Vec<Sent>,
@@ -166,13 +167,18 @@ impl Peer {
             _ => bail!("invalid schedule"),
         };
         ensure!(
-            (1..=512).contains(&window) && (window..=1 << 22).contains(&count),
+            (1..=MAX_WINDOW).contains(&window) && (window..=1 << 22).contains(&count),
             "invalid workload"
         );
         ensure!(
             ["each", "withheld", "sparse", "loss", "reorder"].contains(&mode.as_str()),
             "invalid mode"
         );
+        let trace_limit = if trace {
+            model(trace_limit(count, window, grants, connection))?
+        } else {
+            0
+        };
         let connection_credit = if connection {
             let step = match schedule.as_str() {
                 "byte" => 1,
@@ -267,6 +273,8 @@ impl Peer {
             schedule,
             mode,
             trace,
+            trace_limit,
+            queued_requests: 0,
             epoch: Instant::now(),
             flights: Vec::with_capacity(MAX_FLIGHTS),
             sent: Vec::new(),
@@ -348,7 +356,7 @@ impl Peer {
         let pn = self.send(&payload, drop)?;
         if self.trace {
             ensure!(
-                self.sent.len() + work.len() <= MAX_EVENTS,
+                self.sent.len() + work.len() <= self.trace_limit,
                 "work transcript exhausted"
             );
             for w in work {
@@ -429,7 +437,7 @@ impl Peer {
             for w in self.flights.swap_remove(i).work {
                 if self.trace {
                     ensure!(
-                        self.acked_work.len() < MAX_EVENTS,
+                        self.acked_work.len() < self.trace_limit,
                         "ACK transcript exhausted"
                     );
                     self.acked_work.push(w.fields());
@@ -518,7 +526,10 @@ impl Peer {
                     model(c.wire(*id, *offset, data.len()))?;
                 }
                 if self.trace {
-                    ensure!(self.frames.len() < MAX_EVENTS, "frame transcript exhausted");
+                    ensure!(
+                        self.frames.len() < self.trace_limit,
+                        "frame transcript exhausted"
+                    );
                     self.frames.push((
                         pn,
                         *id,
@@ -718,18 +729,24 @@ impl Peer {
                             model(c.begin(first, count))?;
                         }
                         self.released = false;
-                        for chunk in (0..count).collect::<Vec<_>>().chunks(BATCH) {
-                            self.queue(
-                                chunk
-                                    .iter()
-                                    .map(|i| Work::Request(first + *i as u64 * 4))
-                                    .collect(),
-                            )?;
-                        }
+                        self.queued_requests = 0;
                     }
                     Ready::StreamCredit => self.blocked_streams += 1,
                     Ready::DataCredit => self.blocked_data += 1,
                 }
+            }
+            // Large waves may need more batches than the bounded flight table.
+            // Resume at the first unsent request after authenticated ACKs free
+            // slots; queue() records timestamps only at the original send.
+            while self.queued_requests < self.waves.slots.len() && self.flights.len() < MAX_FLIGHTS
+            {
+                let end = (self.queued_requests + BATCH).min(self.waves.slots.len());
+                self.queue(
+                    (self.queued_requests..end)
+                        .map(|i| Work::Request((self.waves.retired + i as u64) * 4))
+                        .collect(),
+                )?;
+                self.queued_requests = end;
             }
             if self.flights.len() < MAX_FLIGHTS
                 && let Some(n) = self
@@ -792,6 +809,7 @@ impl Peer {
     }
     fn report(&self, error: Option<String>) -> Value {
         json!({"phase":if error.is_some(){"failed"}else{"done"},"error":error,"schedule":self.schedule,"mode":self.mode,"trace":self.trace,
+            "trace_limit":self.trace_limit,
             "credit_scope":if self.connection_credit.is_some(){"connection"}else{"stream"},
             "connection_credit":self.connection_credit.as_ref().filter(|_|self.bootstrap_acked && self.control==7).map(|c|json!({"initial":3,"step":c.step,"limit":c.limit,"acked":c.acked,"charged":c.charged,"wire_unique":c.wire_unique,"received":c.received,"completed_waves":c.completed_waves,"events":c.events})),
             "count":self.waves.sample_budget,"window":self.waves.window,"completed":self.completed,"retired":self.waves.retired,

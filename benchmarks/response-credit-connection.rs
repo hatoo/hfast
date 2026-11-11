@@ -3,6 +3,7 @@
 //! only delivered unique bytes permit the next grant. Packet-copy authentication
 //! belongs to the driver, which must call ack only for a retained sent flight.
 type Result<T> = std::result::Result<T, &'static str>;
+use crate::waves::{Grants, MAX_WINDOW, trace_limit};
 const ALL: u32 = (1 << 25) - 1;
 
 #[derive(Default)]
@@ -27,12 +28,12 @@ pub(crate) struct ConnectionCredit {
     retired: u64,
     end: u64,
     slots: Vec<Slot>,
-    trace: bool,
+    event_limit: usize,
 }
 impl ConnectionCredit {
     pub(crate) fn new(step: u64, window: usize, total: usize, trace: bool) -> Result<Self> {
         if ![1, 2, 25].contains(&step)
-            || !(1..=512).contains(&window)
+            || !(1..=MAX_WINDOW).contains(&window)
             || !(window..=1 << 22).contains(&total)
         {
             return Err("invalid connection-credit workload");
@@ -51,12 +52,25 @@ impl ConnectionCredit {
             retired: 0,
             end: 3,
             slots: Vec::with_capacity(window),
-            trace,
+            event_limit: if trace {
+                trace_limit(
+                    total,
+                    window,
+                    if step == 25 {
+                        Grants::Full
+                    } else {
+                        Grants::Bytes(step)
+                    },
+                    true,
+                )?
+            } else {
+                0
+            },
         })
     }
     fn event(&mut self, kind: u8, a: u64, b: u64, c: u64) -> Result<()> {
-        if self.trace {
-            if self.events.len() == 131072 {
+        if self.event_limit != 0 {
+            if self.events.len() >= self.event_limit {
                 return Err("connection transcript exhausted");
             }
             self.events.push((kind, a, b, c));
@@ -183,7 +197,7 @@ mod tests {
     #[test]
     fn bounded_waves_exact_unique_bytes_and_every_ack_gate() {
         for step in [1, 2, 25] {
-            for window in [1, 16, 512] {
+            for window in [1, 16, 511, 512, 513, 1024, 4096] {
                 let total = 2 * window + 1;
                 let mut c = ConnectionCredit::new(step, window, total, false).unwrap();
                 let capacity = c.slots.capacity();
@@ -279,7 +293,28 @@ mod tests {
             assert!(ConnectionCredit::new(step, 1, 1, false).is_err());
         }
         assert!(ConnectionCredit::new(1, 0, 1, false).is_err());
-        assert!(ConnectionCredit::new(1, 513, 513, false).is_err());
+        assert!(ConnectionCredit::new(1, MAX_WINDOW + 1, MAX_WINDOW + 1, false).is_err());
         assert!(ConnectionCredit::new(1, 2, 1, false).is_err());
+    }
+
+    #[test]
+    fn transcript_exhaustion_preserves_existing_evidence_and_credit() {
+        let mut c = ConnectionCredit::new(1, 513, 513, true).unwrap();
+        c.begin(0, 513).unwrap();
+        for sid in (0..513 * 4).step_by(4) {
+            c.request_ack(sid).unwrap();
+        }
+        // Exhaust with duplicate authenticated wire events, not lost samples.
+        c.grant(4).unwrap();
+        c.wire(0, 0, 1).unwrap();
+        while c.events.len() < c.event_limit {
+            c.wire(0, 0, 1).unwrap();
+        }
+        let before = (c.limit, c.charged, c.received, c.events.len());
+        assert_eq!(c.receive(0, 0, 1), Err("connection transcript exhausted"));
+        assert_eq!((c.limit, c.charged, c.received, c.events.len()), before);
+        assert_eq!(c.events[0], (0, 0, 513, 0));
+        assert!(ConnectionCredit::new(1, 4096, 8193, true).is_err());
+        assert!(ConnectionCredit::new(1, 4096, 8193, false).is_ok());
     }
 }
