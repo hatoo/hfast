@@ -1622,6 +1622,7 @@ pub(super) mod tests {
     use super::*;
 
     mod ack_ledger;
+    mod connection_wakeup;
     mod control_ack;
     mod credit_wakeup;
     mod crypto_handshake;
