@@ -15,11 +15,14 @@ struct Peer {
 
 impl Peer {
     fn unstarted(params: Vec<u8>) -> (Connection, Self) {
-        let (conn, tls) = tls_tickets::production_pair_with_params(
+        Self::from_pair(tls_tickets::production_pair_with_params(
             crate::quic::endpoint::tls_config(),
             false,
             params,
-        );
+        ))
+    }
+
+    fn from_pair((conn, tls): (Connection, rustls::quic::ClientConnection)) -> (Connection, Self) {
         let rustls::SupportedCipherSuite::Tls13(suite) =
             rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256;
         let initial = Keys::initial(
@@ -214,6 +217,68 @@ impl Peer {
         }
         assert_eq!(conn.finished, 1);
         assert!(conn.timeout().is_none());
+    }
+}
+
+#[test]
+fn encrypted_large_crypto_output_preserves_transcript_and_late_ack_recovery() {
+    for padding in [0, 2048, 60 * 1024] {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        // A noncritical opaque extension enlarges the authenticated certificate
+        // without changing its key, name, trust or signature validation.
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 55555, 1],
+                vec![0x42; padding],
+            ));
+        let cert = params.self_signed(&key_pair).unwrap();
+        let (mut conn, mut peer) = Peer::from_pair(tls_tickets::production_pair_with_certificate(
+            crate::quic::endpoint::tls_config(),
+            false,
+            tls_tickets::client_params(),
+            rcgen::CertifiedKey { cert, key_pair },
+        ));
+        let mut hello = Vec::new();
+        assert!(peer.tls.write_hs(&mut hello).is_none());
+        let mut body = Vec::new();
+        frame::put_crypto(&mut body, 0, &hello);
+        peer.send(&mut conn, Space::Initial, &body);
+        let receipts = peer.drain(&mut conn);
+        assert!(!peer.tls.is_handshaking());
+        assert!(conn.tls.is_handshaking());
+        let crypto: Vec<_> = receipts
+            .iter()
+            .filter(|(space, _, plain)| {
+                *space == Space::Handshake
+                    && frame::Frames::new(plain)
+                        .any(|f| matches!(f.unwrap(), frame::Frame::Crypto { .. }))
+            })
+            .collect();
+        assert!(!crypto.is_empty());
+        assert!(conn.spaces[1].crypto_offset > padding as u64);
+        if padding > 0 {
+            assert!(crypto.len() > 1);
+        }
+        assert!(conn.spaces[1].crypto_out.is_empty());
+        // Acknowledge only the last fragment, then retransmit all earlier gaps.
+        peer.ack(&mut conn, Space::Handshake, crypto.last().unwrap().1);
+        if crypto.len() > 1 {
+            assert_eq!(conn.spaces[1].crypto_flight.len(), crypto.len() - 1);
+            conn.on_timeout(conn.timeout().unwrap());
+            let retry = peer.drain(&mut conn);
+            assert!(retry.iter().any(|(_, _, plain)| {
+                frame::Frames::new(plain).any(|f| matches!(f.unwrap(), frame::Frame::Crypto { .. }))
+            }));
+            conn.on_timeout(conn.timeout().unwrap());
+            // Late original ACKs cancel both emitted retries and queued copies.
+            for (_, pn, _) in &crypto[..crypto.len() - 1] {
+                peer.ack(&mut conn, Space::Handshake, *pn);
+            }
+        }
+        assert!(conn.spaces[1].crypto_flight.is_empty());
+        peer.complete(&mut conn);
     }
 }
 
