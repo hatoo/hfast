@@ -1629,6 +1629,7 @@ pub(super) mod tests {
     mod flight_history;
     pub(in crate::quic) mod key_updates;
     mod receive_headers;
+    mod response_queue;
     mod response_recovery;
     mod send_credit;
     mod stream_credit;
