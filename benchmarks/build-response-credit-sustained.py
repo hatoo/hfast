@@ -22,6 +22,7 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     tar.extractall(source, filter='data')
 for src, dest in [('response-credit-sustained-main.rs', 'main.rs'),
                   ('response-credit-waves.rs', 'waves.rs'),
+                  ('response-credit-connection.rs', 'connection_credit.rs'),
                   ('response-credit-ledger.rs', 'response_ledger.rs'),
                   ('stream-credit-ledger.rs', 'credit_ledger.rs'),
                   ('stream-credit-control.rs', 'credit_control.rs'),

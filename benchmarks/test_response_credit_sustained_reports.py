@@ -25,7 +25,74 @@ def complete():
 def check(row): return validate(row,4,2,'two-fragment','each')
 
 
+def aggregate():
+    row = complete()
+    row.update(schedule='full', credit_scope='connection', server_ack_ranges=[[1,8]])
+    row['sent_work'] = [[1,0,3,3,True,False]]
+    row['acked_work'] = [[0,3,3]]
+    events, pn = [], 2
+    for first in (0, 8):
+        events.append([0,first,2,0])
+        for sid in (first,first+4):
+            row['sent_work'].append([pn,1,sid,0,True,False])
+            row['acked_work'].append([1,sid,0])
+            events.append([6,sid,0,0])
+        pn += 1
+        for sid in (first,first+4):
+            limit = 3 + (sid//4+1)*25
+            row['sent_work'].append([pn,5,0,limit,True,False])
+            row['acked_work'].append([5,0,limit])
+            events.extend([[1,limit,0,0],[2,limit,0,0],[3,sid,0,25],[4,sid,0,25]])
+            pn += 1
+        events.append([5,first,2,0])
+    row['sent_work'].append([pn,4,0,0,True,False])
+    row['acked_work'].append([4,0,0])
+    row['connection_credit'] = dict(initial=3,step=25,limit=103,acked=103,charged=103,
+        wire_unique=103,received=103,completed_waves=2,events=events)
+    return row
+
+
+def check_aggregate(row): return validate(row,4,2,'full','each',True)
+
+
 class Reports(unittest.TestCase):
+    def test_aggregate_waves_and_untraced_totals(self):
+        row = aggregate()
+        self.assertEqual(check_aggregate(row)['grants'], 4)
+        row.update(trace=False,sent_work=[],frames=[],acked_work=[])
+        row['connection_credit']['events'] = []
+        self.assertEqual(check_aggregate(row)['completed'], 4)
+        row['connection_credit']['received'] -= 1
+        with self.assertRaises(ValueError): check_aggregate(row)
+
+    def test_aggregate_report_and_timeline_mutations(self):
+        for fault in ('scope','initial','step','acked','charged','wire_unique','received','completed_waves',
+                      'missing-event','request-ack','early-grant','false-ack','gap','duplicate-byte',
+                      'wire-evidence','grant-flight','ack-flight','old-stream','extra-event'):
+            row = aggregate()
+            c, events = row['connection_credit'], row['connection_credit']['events']
+            if fault == 'scope': row['credit_scope'] = 'stream'
+            elif fault in c and fault != 'events': c[fault] += 1
+            elif fault == 'missing-event': events.pop()
+            elif fault == 'request-ack': events.pop(2)
+            elif fault == 'early-grant': events[3], events[7] = events[7], events[3]
+            elif fault == 'false-ack': events[4][1] = 29
+            elif fault == 'gap': events[5][2:] = [1,24]; events[6][2:] = [1,24]
+            elif fault == 'duplicate-byte': events[9][1] = events[10][1] = 0
+            elif fault == 'wire-evidence': events[5][3] = 24
+            elif fault == 'grant-flight': row['sent_work'][3][3] = 29
+            elif fault == 'ack-flight': row['acked_work'][3][2] = 29
+            elif fault == 'old-stream': events[12][1] = 0
+            elif fault == 'extra-event': events.append([7,0,0,0])
+            with self.subTest(fault=fault), self.assertRaises(ValueError): check_aggregate(row)
+
+    def test_aggregate_retransmitted_bytes_do_not_consume_new_credit(self):
+        row = aggregate()
+        events = row['connection_credit']['events']
+        events[7:7] = [[3,0,12,13],[4,0,12,13]]
+        row['frames'].append([11,0,12,list(RESPONSE[12:]),True,0])
+        self.assertEqual(check_aggregate(row)['response_bytes'],100)
+
     def test_exact_batched_generations(self):
         self.assertEqual(check(complete())['latency_samples'],4)
 
