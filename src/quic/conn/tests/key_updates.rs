@@ -119,6 +119,112 @@ fn preparations(conn: &Connection) -> u64 {
     conn.key_updates.as_ref().unwrap().preparations
 }
 
+// Scalar wire oracle: use the declared width, phase and payload, independently
+// of the output-vector assembly and production packet-number encoder.
+fn reference_short_packet(
+    conn: &Connection,
+    pn: u64,
+    width: usize,
+    phase: bool,
+    plain: &[u8],
+) -> Vec<u8> {
+    let mut packet = vec![0x40 + 4 * u8::from(phase) + (width as u8 - 1)];
+    for &byte in conn.peer_cid.as_slice() {
+        packet.push(byte);
+    }
+    let pn_at = packet.len();
+    for i in (0..width).rev() {
+        packet.push((pn >> (8 * i)) as u8);
+    }
+    let header_end = packet.len();
+    packet.extend_from_slice(plain);
+    let keys = conn.local_keys(Space::Data).unwrap();
+    let (header, payload) = packet.split_at_mut(header_end);
+    let tag = keys.packet.encrypt_in_place(pn, header, payload).unwrap();
+    packet.extend_from_slice(tag.as_ref());
+    protect_header(keys.header.as_ref(), &mut packet, pn_at, width).unwrap();
+    packet
+}
+
+#[test]
+fn short_headers_match_wire_oracle_across_cids_widths_phases_and_capacities() {
+    // 3 AEADs x 3 key generations x 21 CID lengths x 12 packet numbers x
+    // 2 payloads x 3 output layouts = 13,608 authenticated wire comparisons.
+    // Both sides of every width transition, plus truncated high packet numbers
+    // whose width is selected by the distance from a prior ACK.
+    let cases = [
+        (0, None, 1),
+        (126, None, 1),
+        (127, None, 2),
+        (32766, None, 2),
+        (32767, None, 3),
+        (8388606, None, 3),
+        (8388607, None, 4),
+        ((1 << 40) + 127, Some(1 << 40), 1),
+        ((1 << 40) + 128, Some(1 << 40), 2),
+        ((1 << 40) + 32768, Some(1 << 40), 3),
+        ((1 << 40) + 8388608, Some(1 << 40), 4),
+        ((1 << 62) - 1, Some((1 << 62) - 2), 1),
+    ];
+    let cid: Vec<_> = (0..ConnectionId::MAX).map(|i| (11 * i + 5) as u8).collect();
+    for provider in providers() {
+        let (mut conn, mut peer, _) = pair_with_provider(true, provider);
+        let (initial, _) = peer.receive(&mut conn);
+        acknowledge(&mut conn, Space::Data, &[(initial, initial)]);
+        for generation in 0..3 {
+            if generation != 0 {
+                peer.update();
+                // The synthetic ACK-only cases below acknowledge packet 7.
+                // Keep each authenticated update beyond that receive history.
+                conn.recv(&mut peer.packet(&conn, generation * 16, &[1]))
+                    .unwrap();
+            }
+            let phase = generation % 2 != 0;
+            assert_eq!(conn.key_updates.as_ref().unwrap().phase, phase);
+            for cid_len in 0..=ConnectionId::MAX {
+                conn.peer_cid = ConnectionId::new(&cid[..cid_len]).unwrap();
+                for (pn, largest_acked, width) in cases {
+                    for ack_only in [false, true] {
+                        // The tiny HANDSHAKE_DONE requires two padding bytes
+                        // for the header-protection sample. ACK-only does not.
+                        let plain: &[u8] = if ack_only {
+                            &[2, 7, 0, 0, 0]
+                        } else {
+                            &[0x1e, 0, 0]
+                        };
+                        let expected = reference_short_packet(&conn, pn, width, phase, plain);
+                        for (prefix, capacity) in [(0, 0), (31, 31), (31, 31 + MAX_DATAGRAM)] {
+                            let st = &mut conn.spaces[Space::Data as usize];
+                            st.next_pn = pn;
+                            st.largest_acked = largest_acked;
+                            st.ack.ranges = vec![(7, 7)];
+                            st.ack.owed = ack_only;
+                            conn.handshake_done.pending = !ack_only;
+                            let mut out = Vec::with_capacity(capacity);
+                            out.resize(prefix, 0xa5);
+                            conn.write_packet(&mut out, Space::Data, prefix).unwrap();
+                            assert_eq!(&out[..prefix], vec![0xa5; prefix]);
+                            assert_eq!(
+                                &out[prefix..],
+                                expected,
+                                "CID{cid_len} PN{pn} width{width} phase{phase} ack_only{ack_only} prefix{prefix} capacity{capacity}"
+                            );
+                            assert_eq!(peer.decrypt(&conn, &mut out[prefix..], pn), plain);
+                            assert_eq!(conn.spaces[Space::Data as usize].next_pn, pn + 1);
+                            assert_eq!(
+                                conn.spaces[Space::Data as usize].oldest_sent.is_some(),
+                                !ack_only
+                            );
+                            acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+                            assert!(conn.spaces[Space::Data as usize].oldest_sent.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn unchanged_phase_does_not_prepare_unused_keys_for_any_aead() {
     for provider in providers() {
