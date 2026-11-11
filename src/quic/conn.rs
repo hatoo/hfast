@@ -1623,6 +1623,7 @@ pub(super) mod tests {
 
     mod ack_ledger;
     mod control_ack;
+    mod credit_wakeup;
     mod crypto_handshake;
     mod crypto_output;
     mod datagram_budget;
