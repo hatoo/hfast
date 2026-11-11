@@ -13,7 +13,7 @@ import time
 import traceback
 
 from concurrent_uploads import collect, cpu_ticks
-from response_credit_sustained_reports import validate
+from response_credit_sustained_reports import trace_budget, validate
 from udp_accounting import (namespace_delta, namespace_snapshot, process_delta,
                             process_snapshot, require, require_clean_run)
 
@@ -42,6 +42,9 @@ def collect_terminal(worker, timeout, maximum=512 << 20):
 
 
 def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace, connection=False):
+    trace_budget(count, window, schedule, connection, trace)
+    require(1 <= timeout <= 120, 'invalid timeout')
+    require(mode in ('each', 'withheld', 'sparse', 'loss', 'reorder'), 'invalid mode')
     output.mkdir(parents=True, exist_ok=False)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(('127.0.0.1', 0))
@@ -50,8 +53,9 @@ def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace
     with ExitStack() as files:
         try:
             server_log = files.enter_context((output / 'server.log').open('xb'))
-            child = subprocess.Popen([str(server), '--threads', '1', '--tcp', '0', '--quic', str(port),
-                                      '--udp-receive-buffer', '4194304'],
+            server_command = [str(server), '--threads', '1', '--tcp', '0', '--quic', str(port),
+                              '--max-streams', str(max(1024, window)), '--udp-receive-buffer', '4194304']
+            child = subprocess.Popen(server_command,
                                      stdout=server_log, stderr=subprocess.STDOUT)
             time.sleep(.15)
             require(child.poll() is None, 'server failed to start')
@@ -105,6 +109,7 @@ def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace
             require(process.wait(timeout=3) == 0, 'peer exit failure')
             require(not process.stdout.read(), 'extra terminal report')
             result['command'] = command
+            result['server_command'] = server_command
             result['server_cpu_seconds'] = (sum(cpu_after) - sum(cpu_before)) / os.sysconf('SC_CLK_TCK')
             result['server_cpu_cores'] = result['server_cpu_seconds'] / result['elapsed_seconds']
             result['server_cpu_resolution_seconds'] = 1 / os.sysconf('SC_CLK_TCK')
@@ -122,7 +127,11 @@ def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace
                 worker['log'].write(process.stdout.read())
             if child is not None:
                 child.terminate()
-                child.wait(timeout=3)
+                try:
+                    child.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=3)
 
 
 def main():

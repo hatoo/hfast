@@ -1,7 +1,7 @@
 """Handwritten two-wave transcript and negative accounting controls."""
 import copy
 import unittest
-from response_credit_sustained_reports import validate, validate_failed_samples
+from response_credit_sustained_reports import trace_budget, validate, validate_failed_samples
 from response_credit_reports import RESPONSE
 
 
@@ -13,7 +13,7 @@ def complete():
         udp=dict(status='available', drops=0), workload_start_ns=5, workload_end_ns=95,
         interval=dict(start_monotonic_ns=100, end_monotonic_ns=200, elapsed_ns=100, cpu_elapsed_ns=80),
         active_streams=[], samples=[[0,10,20],[4,10,21],[8,30,40],[12,30,42]],
-        trace=True, sent_work=[[1,0,3,3,True,False],*[ [2+i//2,1,i*4,0,True,False] for i in range(4)],
+        trace=True, trace_limit=131072, sent_work=[[1,0,3,3,True,False],*[ [2+i//2,1,i*4,0,True,False] for i in range(4)],
                               *[[4+i//2,2,i*4,25,True,False] for i in range(4)], [6,4,0,0,True,False]],
         acked_work=[[0,3,3],*[[1,i*4,0] for i in range(4)],*[[2,i*4,25] for i in range(4)],[4,0,0]],
         frames=[[10,3,0,[0,4,0],False,0],*[[11+i,i*4,0,list(RESPONSE),True,0] for i in range(4)]],
@@ -27,7 +27,7 @@ def check(row): return validate(row,4,2,'two-fragment','each')
 
 def aggregate():
     row = complete()
-    row.update(schedule='full', credit_scope='connection', server_ack_ranges=[[1,8]])
+    row.update(schedule='full', credit_scope='connection', server_ack_ranges=[[1,8]], trace_limit=131072)
     row['sent_work'] = [[1,0,3,3,True,False]]
     row['acked_work'] = [[0,3,3]]
     events, pn = [], 2
@@ -56,10 +56,31 @@ def check_aggregate(row): return validate(row,4,2,'full','each',True)
 
 
 class Reports(unittest.TestCase):
+    def test_boundary_windows_partial_waves_and_trace_envelope(self):
+        for window in (511, 512, 513, 1024):
+            for schedule in ('byte', 'two-byte', 'full'):
+                self.assertLessEqual(trace_budget(2 * window + 1, window, schedule, True, True), 1048576)
+        self.assertEqual(trace_budget(4097, 4096, 'full', True, True), 454790)
+        self.assertEqual(trace_budget(4194304, 4096, 'byte', True, False), 0)
+        for count, window, schedule in ((8193,4096,'byte'), (4097,4097,'full'),
+                                         (512,513,'full'), (0,0,'byte'), (32,8,'two-fragment')):
+            with self.subTest(count=count, window=window), self.assertRaises(ValueError):
+                trace_budget(count, window, schedule, True, True)
+
+    def test_report_cannot_change_or_overrun_its_trace_budget(self):
+        for fault in ('limit', 'work', 'frames', 'connection'):
+            row = aggregate()
+            if fault == 'limit': row['trace_limit'] += 1
+            elif fault == 'work': row['sent_work'] *= row['trace_limit']
+            elif fault == 'frames': row['frames'] *= row['trace_limit']
+            else: row['connection_credit']['events'] *= row['trace_limit']
+            with self.subTest(fault=fault), self.assertRaisesRegex(ValueError, 'trace budget'):
+                check_aggregate(row)
+
     def test_aggregate_waves_and_untraced_totals(self):
         row = aggregate()
         self.assertEqual(check_aggregate(row)['grants'], 4)
-        row.update(trace=False,sent_work=[],frames=[],acked_work=[])
+        row.update(trace=False,trace_limit=0,sent_work=[],frames=[],acked_work=[])
         row['connection_credit']['events'] = []
         self.assertEqual(check_aggregate(row)['completed'], 4)
         row['connection_credit']['received'] -= 1
@@ -98,7 +119,7 @@ class Reports(unittest.TestCase):
 
     def test_all_samples_retained_without_frame_transcript(self):
         row=complete()
-        row.update(trace=False,sent_work=[],frames=[],acked_work=[])
+        row.update(trace=False,trace_limit=0,sent_work=[],frames=[],acked_work=[])
         self.assertEqual(check(row)['response_bytes'],100)
         row['samples'].pop()
         with self.assertRaises(ValueError): check(row)

@@ -10,7 +10,30 @@ def limits(schedule):
             'two-fragment': [1, 25], 'full': [25]}[schedule]
 
 
+def trace_budget(count, window, schedule, connection, trace):
+    require(type(count) is int and type(window) is int and 1 <= window <= 4096
+            and window <= count <= 4194304, 'invalid workload')
+    require(schedule in ('byte', 'two-byte', 'full') if connection else
+            schedule in ('byte', 'two-byte', 'two-fragment', 'full'), 'invalid credit schedule')
+    if not trace: return 0
+    # Independent resource bound, including one-byte frames and separate FINs.
+    frames = count * 26
+    if connection:
+        ordinary = count + 2 * grant_count(count, window, schedule) + 2 * frames + 2 * ((count + window - 1) // window) + 8
+    else:
+        ordinary = frames + 8
+    budget = max(131072, ordinary * 2 + 4096)
+    require(budget <= 1048576, 'trace workload exceeds event budget')
+    return budget
+
+
 def validate(row, count, window, schedule, mode, connection=False):
+    budget = trace_budget(count, window, schedule, connection, row['trace'])
+    require(row['trace_limit'] == budget, 'trace budget changed')
+    transcripts = [row[k] for k in ('sent_work', 'acked_work', 'frames')]
+    if connection and row.get('connection_credit'):
+        transcripts.append(row['connection_credit']['events'])
+    require(all(len(events) <= budget for events in transcripts), 'trace budget exceeded')
     require(row['phase'] == 'done' and row['error'] is None, f'native failure: {row.get("error")}')
     require((row['count'], row['window'], row['schedule'], row['mode']) == (count, window, schedule, mode), 'workload changed')
     require(row['completed'] == row['retired'] == row['request_acks'] == len(row['samples']) == count, 'missing completion/sample/request ACK')
@@ -86,6 +109,7 @@ def validate(row, count, window, schedule, mode, connection=False):
                 latency_samples=count, response_bytes=count*25, grants=grants, retries=row['retries'],
                 elapsed_seconds=interval['elapsed_ns']/1e9, peer_cpu_seconds=interval['cpu_elapsed_ns']/1e9,
                 peer_cpu_cores=interval['cpu_elapsed_ns']/interval['elapsed_ns'],
+                trace_limit=budget, transcript_lengths=[len(events) for events in transcripts], max_flights=row['max_flights'],
                 sent_packets=row['sent_packets'], ack_packets=row['ack_packets'], received_packets=row['received_packets'])
 
 

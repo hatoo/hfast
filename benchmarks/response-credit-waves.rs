@@ -11,7 +11,46 @@ const ALL_BYTES: u32 = (1 << RESPONSE.len()) - 1;
 const MAX_VARINT: u64 = (1 << 62) - 1;
 const MAX_STREAMS: u64 = 1 << 60;
 const MAX_SAMPLES: usize = 1 << 22;
+pub(crate) const MAX_WINDOW: usize = 4096;
+const MAX_TRACE_EVENTS: usize = 1 << 20;
 type Result<T> = std::result::Result<T, &'static str>;
+
+/// Bound each transcript before opening a socket. Allow a separate FIN and
+/// one-byte frames, twice the nominal events for retries/duplicates, and 4096
+/// control/PING events. This is a finite allowance, not a promise to absorb
+/// arbitrary loss. Exhaustion must still fail without discarding evidence.
+pub(crate) fn trace_limit(
+    count: usize,
+    window: usize,
+    grants: Grants,
+    connection: bool,
+) -> Result<usize> {
+    if !(1..=MAX_WINDOW).contains(&window) || !(window..=MAX_SAMPLES).contains(&count) {
+        return Err("invalid workload");
+    }
+    grants.initial()?;
+    let nominal = if connection {
+        let step = match grants {
+            Grants::Bytes(n) => n as usize,
+            Grants::Full => 25,
+            Grants::TwoFragments => return Err("unsupported connection increment"),
+        };
+        let generations =
+            count / window * (25 * window).div_ceil(step) + (25 * (count % window)).div_ceil(step);
+        // Request ACKs + grant/ACK pairs + wire/delivery pairs + begin/retire.
+        count + 2 * generations + 52 * count + 2 * count.div_ceil(window) + 8
+    } else {
+        // Frames dominate: 25 one-byte frames and a separate FIN per response.
+        26 * count + 8
+    };
+    // Preserve the original allowance for small hostile/withheld-ACK cases,
+    // where retransmission traffic can greatly exceed unique response bytes.
+    let limit = (2 * nominal + 4096).max(131072);
+    if limit > MAX_TRACE_EVENTS {
+        return Err("trace workload exceeds event budget");
+    }
+    Ok(limit)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Grants {
@@ -104,7 +143,7 @@ impl Waves {
         max_streams: u64,
     ) -> Result<Self> {
         grants.initial()?;
-        if !(1..=512).contains(&window)
+        if !(1..=MAX_WINDOW).contains(&window)
             || !(window..=MAX_SAMPLES).contains(&sample_budget)
             || request_bytes == 0
             || request_bytes > MAX_VARINT
@@ -316,6 +355,34 @@ impl Waves {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_windows_and_trace_budgets_are_bounded_before_admission() {
+        for window in [511, 512, 513, 1024, MAX_WINDOW] {
+            let total = 2 * window + 1;
+            let mut w = Waves::new(Grants::Full, window, total, 18, 5, 1 << 24, 1 << 20).unwrap();
+            assert_eq!(
+                w.begin(window),
+                Ok(Ready::Started {
+                    first: 0,
+                    count: window
+                })
+            );
+            assert_eq!(w.slots.len(), window);
+            assert_eq!(w.samples.capacity(), total);
+        }
+        for grants in [Grants::Bytes(1), Grants::Bytes(2), Grants::Full] {
+            assert!(trace_limit(2049, 1024, grants, true).unwrap() <= MAX_TRACE_EVENTS);
+        }
+        assert!(trace_limit(4097, 4096, Grants::Full, true).is_ok());
+        assert!(trace_limit(8193, 4096, Grants::Bytes(1), true).is_err());
+        assert!(trace_limit(MAX_SAMPLES, 512, Grants::Bytes(1), true).is_err());
+        for (count, window) in [(0, 0), (4097, 4097), (512, 513), (usize::MAX, 1)] {
+            assert!(trace_limit(count, window, Grants::Full, false).is_err());
+        }
+        assert!(trace_limit(32, 8, Grants::TwoFragments, true).is_err());
+        assert!(trace_limit(32, 8, Grants::TwoFragments, false).is_ok());
+    }
 
     pub(crate) fn waves(grants: Grants, window: usize, total: usize) -> Waves {
         Waves::new(grants, window, total, 18, 5, MAX_VARINT, MAX_STREAMS).unwrap()
@@ -543,7 +610,7 @@ mod tests {
         assert!(w.begin(1).is_err());
         assert_eq!(w.samples, sample);
         assert!(Waves::new(Grants::Bytes(0), 1, 1, 18, 5, 100, 1).is_err());
-        assert!(Waves::new(Grants::Full, 513, 1024, 18, 5, 100, 1).is_err());
+        assert!(Waves::new(Grants::Full, MAX_WINDOW + 1, 8192, 18, 5, 100, 1).is_err());
         assert!(Waves::new(Grants::Full, 1, MAX_SAMPLES + 1, 18, 5, 100, 1).is_err());
     }
     #[test]
