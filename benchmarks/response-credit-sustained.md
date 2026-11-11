@@ -90,3 +90,37 @@ CI runs both Rust profiles, strict lints, independent multi-wave/fault peers,
 report negative controls, and native 1,024-request/512-slot runs for each grant
 schedule. It retains reports and socket evidence as an artifact. CI runs are
 correctness gates; their durations are not a performance acceptance test.
+
+## Aggregate connection-credit mode
+
+Pass `--connection-credit` to the peer or native controller to exercise repeated
+MAX_DATA wakeups. In this mode `byte`, `two-byte`, and `full` mean connection
+increments of 1, 2, and 25 bytes respectively; `two-fragment` is unsupported.
+The existing stream mode, including its ordinary `full` control, is unchanged.
+Workloads with different credit scopes or increments are separate comparisons.
+
+Initial MAX_DATA is exactly 3 for the server control stream. Bidirectional stream
+credit is 25. Each wave's requests must all be acknowledged before its first
+connection grant. A grant advances only after every previously granted unique
+byte arrives and an authenticated ACK covers a retained copy of the preceding
+grant. Retries retain the same cumulative limit. Final short increments stop at
+the wave boundary; retirement also requires the final connection grant ACK.
+
+`response-credit-connection.rs` keeps bounded live stream masks and cumulative
+byte/credit/ACK totals. QUIC flow control charges each stream's highest offset,
+including gaps and frames the fault harness deliberately discards. Separately,
+delivered unique bytes gate further grants. Overlaps and retransmissions consume
+no new credit. The ordinary wave ledger still validates literal response bytes,
+FINs, request identity and every latency sample. The aggregate ledger starts
+from the reserved three-byte control prefix. The driver authenticates that prefix
+and its bootstrap ACK before starting a wave or reporting aggregate totals. A
+failed bootstrap reports the actual control count and no aggregate ledger.
+
+Traced reports include ordered connection events. An independent Python set
+oracle checks grant/ACK/unique-byte order, highest-offset credit, wave identity,
+and parity with the received-frame and retained-flight transcripts. Untraced
+reports retain all samples and cumulative ledgers without the event history.
+The independent aioquic suite verifies actual serialized transport parameters,
+MAX_DATA generations, delayed original request/grant ACKs, and rejects over-credit
+bytes, forged ACKs of an intentionally unsent grant, missing ACKs/FINs and corrupt
+bytes. These checks qualify a workload; they establish no throughput improvement.

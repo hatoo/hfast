@@ -41,7 +41,7 @@ def collect_terminal(worker, timeout, maximum=512 << 20):
                 return row
 
 
-def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace):
+def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace, connection=False):
     output.mkdir(parents=True, exist_ok=False)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(('127.0.0.1', 0))
@@ -57,7 +57,7 @@ def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace
             require(child.poll() is None, 'server failed to start')
             before = process_snapshot(child.pid, port, 1)
             net_before = namespace_snapshot()
-            command = ['taskset', '-c', str(cpu), str(peer), str(port), str(count), str(window), schedule, mode, str(timeout), '--controlled', *(['--trace'] if trace else [])]
+            command = ['taskset', '-c', str(cpu), str(peer), str(port), str(count), str(window), schedule, mode, str(timeout), '--controlled', *(['--trace'] if trace else []), *(['--connection-credit'] if connection else [])]
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=files.enter_context((output / 'peer.stderr').open('xb')), bufsize=0)
             worker = dict(process=process, log=files.enter_context((output / 'peer.jsonl').open('xb')), buffer=b'')
@@ -91,7 +91,7 @@ def run(server, peer, output, count, window, schedule, mode, cpu, timeout, trace
             (output / 'evidence.json').write_text(json.dumps(evidence, indent=2) + '\n')
             process.stdin.write(b'report\n')
             row = collect_terminal(worker, 30)
-            result = validate(row, count, window, schedule, mode)
+            result = validate(row, count, window, schedule, mode, connection)
             require_clean_run(row['udp'], evidence['server_delta'], evidence['namespace_delta'])
             require(evidence['namespace_delta']['counters']['InDatagrams'] == expected_datagrams, 'exact datagram ledger mismatch')
             delta = evidence['peer_delta']
@@ -135,8 +135,9 @@ def main():
     p.add_argument('--mode', choices=('each','withheld','sparse','loss','reorder'), default='each')
     p.add_argument('--timeout', type=int, default=60)
     p.add_argument('--trace', action='store_true')
+    p.add_argument('--connection-credit', action='store_true')
     a = p.parse_args()
-    result = run(a.server, a.peer, a.output, a.count, a.window, a.schedule, a.mode, a.cpu, a.timeout, a.trace)
+    result = run(a.server, a.peer, a.output, a.count, a.window, a.schedule, a.mode, a.cpu, a.timeout, a.trace, a.connection_credit)
     result['server_sha256'] = hashlib.sha256(a.server.read_bytes()).hexdigest()
     result['peer_sha256'] = hashlib.sha256(a.peer.read_bytes()).hexdigest()
     (a.output / 'summary.json').write_text(json.dumps(result, indent=2)+'\n')

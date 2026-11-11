@@ -11,10 +11,12 @@ import time
 from aioquic import tls
 from aioquic.asyncio import serve
 from aioquic.buffer import Buffer
+from aioquic.quic.rangeset import RangeSet
 from aioquic.quic.packet import push_ack_frame, pull_quic_transport_parameters
 
 from response_credit_sustained_reports import limits, validate, validate_failed_samples
 from response_credit_reports import RESPONSE
+from response_credit_connection_reports import generations
 from udp_accounting import require
 
 spec = importlib.util.spec_from_file_location('single_wave_interop', Path(__file__).with_name('response-credit-peer-interop.py'))
@@ -23,9 +25,10 @@ spec.loader.exec_module(base)
 
 
 class Server(base.Server):
-    def __init__(self, *args, window, scenario, **kwargs):
+    def __init__(self, *args, window, scenario, connection=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.window, self.scenario = window, scenario
+        self.connection_grants, self.false_ack_sent = [], False
         self.credit_open = scenario not in ('stream-credit', 'data-credit', 'no-credit')
         self.release_scheduled = False
         self.initial_server_limits = None
@@ -86,9 +89,51 @@ class Server(base.Server):
                 self.old_packets.append(builder.packet_number)
                 self.old_sent = True
         q._write_connection_limits = connection_limits
+        if connection and self.fault == 'one-byte-overrun':
+            original_stream = q._write_stream_frame
+            def overrun(builder, space, stream, max_offset):
+                if stream.stream_id % 4 == 0: max_offset = min(25, max_offset + 1)
+                return original_stream(builder, space, stream, max_offset)
+            q._write_stream_frame = overrun
+        if connection and self.fault == 'missing-control':
+            original_send = q.send_stream_data
+            def send_stream_data(stream_id, data, end_stream=False):
+                original_send(stream_id, b'' if stream_id == 3 else data, end_stream=end_stream)
+            q.send_stream_data = send_stream_data
+        if connection:
+            handlers = q._QuicConnection__frame_handlers
+            original_data, epochs = handlers[0x10]
+            def max_data(context, frame_type, buf):
+                pos = buf.tell()
+                self.connection_grants.append(buf.pull_uint_var())
+                buf.seek(pos)
+                if self.fault == 'missing-grant-ack': self.ack_disabled = True
+                return original_data(context, frame_type, buf)
+            handlers[0x10] = (max_data, epochs)
         original_ack = q._write_ack_frame
 
         def ack(builder, space, now):
+            if connection and self.fault == 'false-grant-ack' and self.connection_grants:
+                # Fill the actual gap left by the deliberately unsent first grant.
+                # This authenticated ACK falsely claims receipt of that packet.
+                buf = builder.start_frame(2, capacity=256)
+                push_ack_frame(buf, RangeSet([range(0, space.ack_queue[-1].stop)]), 0)
+                self.false_ack_sent = True
+                space.ack_at = None
+                return
+            if connection and scenario == 'original-grant-ack' and self.connection_grants and not self.old_sent:
+                if self.ack_gate_until is None:
+                    self.first_ack = copy.deepcopy(space.ack_queue)
+                    self.ack_gate_until = now + .12
+                if now < self.ack_gate_until:
+                    space.ack_at = self.ack_gate_until
+                    return
+                buf = builder.start_frame(2, capacity=256)
+                push_ack_frame(buf, self.first_ack, 0)
+                self.old_packets.append(builder.packet_number)
+                self.old_sent = True
+                space.ack_at = now + .02
+                return
             if self.headers and self.first_ack is None:
                 self.first_ack = copy.deepcopy(space.ack_queue)
             if self.headers and scenario == 'no-request-ack':
@@ -105,7 +150,7 @@ class Server(base.Server):
                 self.old_sent = True
                 space.ack_at = now + .02
                 return
-            if scenario == 'original-ack' and self.old_sent and len(self.headers) <= window:
+            if scenario == 'original-ack' and self.old_sent and len(self.headers) <= window and not (connection and self.connection_grants):
                 # Do not ACK the newer request copies until a new wave proves
                 # that the original copy was sufficient to retire the old one.
                 buf = builder.start_frame(2, capacity=256)
@@ -122,11 +167,11 @@ class Server(base.Server):
 
 
 async def check(peer, output, schedule='byte', mode='each', scenario='ordinary', fault=None,
-                count=32, window=8, controlled=False):
+                count=32, window=8, controlled=False, connection=False):
     protocols, failures = [], []
     def factory(*a, **kw):
-        p = Server(*a, step=limits(schedule)[0], count=count, fault=fault, failures=failures,
-                   window=window, scenario=scenario, **kw)
+        p = Server(*a, step=25 if connection else limits(schedule)[0], count=count, fault=fault, failures=failures,
+                   window=window, scenario=scenario, connection=connection, **kw)
         protocols.append(p)
         return p
     loop = asyncio.get_running_loop()
@@ -135,10 +180,11 @@ async def check(peer, output, schedule='byte', mode='each', scenario='ordinary',
     server = await serve('127.0.0.1', 0, configuration=base.configuration(), create_protocol=factory)
     port = server._transport.get_extra_info('sockname')[1]
     name = f'{schedule}-{mode}-{scenario}-{fault or "valid"}-{count}' + ('-controlled' if controlled else '')
+    if connection: name = 'connection-' + name
     hostile = fault or scenario in ('no-credit','no-request-ack')
     budget = 3 if hostile else 10
     process = await asyncio.create_subprocess_exec(str(peer), str(port), str(count), str(window), schedule, mode, str(budget), '--trace',
-        *(['--controlled'] if controlled else []), stdin=asyncio.subprocess.PIPE,
+        *(['--controlled'] if controlled else []), *(['--connection-credit'] if connection else []), stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=16 << 20)
     try:
         if controlled:
@@ -170,26 +216,37 @@ async def check(peer, output, schedule='byte', mode='each', scenario='ordinary',
         require(not failures, f'independent server failed: {failures}')
         require(len(protocols) == 1, 'wrong connection count')
         p = protocols[0]
-        require(p.parameters == dict(initial_max_data=25*count+3, initial_max_stream_data_bidi_local=limits(schedule)[0],
-                    initial_max_stream_data_uni=limits(schedule)[0], initial_max_streams_uni=0), 'wrong serialized TLS limits')
+        require(p.parameters == dict(initial_max_data=3 if connection else 25*count+3, initial_max_stream_data_bidi_local=25 if connection else limits(schedule)[0],
+                    initial_max_stream_data_uni=25 if connection else limits(schedule)[0], initial_max_streams_uni=0), 'wrong serialized TLS limits')
         row = json.loads(stdout)
         if hostile:
             require(process.returncode != 0 and row['phase'] == 'failed', f'fault accepted: {fault or scenario}')
             validate_failed_samples(row)
             expected = {'wrong-byte':'wire bytes differ', 'premature-fin':'wire premature/control FIN',
-                        'credit-overrun':'wire length/credit exceeded'}.get(fault, 'timeout')
+                        'credit-overrun':'wire connection credit exceeded' if connection else 'wire length/credit exceeded',
+                        'false-grant-ack':'ACK of intentionally unsent grant',
+                        'one-byte-overrun':'wire connection credit exceeded'}.get(fault, 'timeout')
             require(expected in row['error'], f'wrong failure: {row["error"]}')
             if scenario == 'no-credit':
                 require(len(p.headers) == window and row['blocked_streams'] > 0, 'request sent without stream credit')
             if scenario == 'no-request-ack':
                 require(row['request_acks'] == 0 and row['retired'] == 0 and row['retries'] > 0, 'response inferred request ACK')
-                require(row['completed'] == len(row['active_streams']) == window, 'completed unacknowledged samples absent')
+                if connection:
+                    require(row['completed'] == row['grants'] == 0, 'grant before all request ACKs')
+                else:
+                    require(row['completed'] == len(row['active_streams']) == window, 'completed unacknowledged samples absent')
+            if fault == 'missing-control':
+                require(row['control_bytes'] == row['completed'] == row['grants'] == 0 and row['connection_credit'] is None and not p.headers, 'bootstrap reservation counted as delivered data')
+            if fault == 'false-grant-ack': require(p.false_ack_sent and row['dropped_grants'] == 1, 'false wire ACK not exercised')
+            if connection and fault == 'missing-grant-ack': require(row['retries'] > 0 and row['grant_acks'] == 0 and row['grants'] == 1, 'missing grant ACK gate absent')
             result = dict(rejected=True, error=row['error'], scenario=scenario, fault=fault)
         else:
             require(process.returncode == 0, stderr.decode())
-            result = validate(row, count, window, schedule, mode)
+            result = validate(row, count, window, schedule, mode, connection)
             require(sorted(p.headers) == list(range(0,count*4,4)), 'wire requests differ')
-            require(set(p.grants) == {(3,3)} | {(sid,n) for sid in p.headers for n in limits(schedule)[1:]}, 'actual wire grant sequence differs')
+            require(set(p.grants) == {(3,3)} | (set() if connection else {(sid,n) for sid in p.headers for n in limits(schedule)[1:]}), 'actual wire grant sequence differs')
+            if connection:
+                require(set(p.connection_grants) == set(generations(count, window, schedule)), 'actual wire MAX_DATA generations differ')
             await asyncio.sleep(.01)
             floor = min(lo for lo, _ in row['received_ranges'])
             intended = {n for lo,hi in row['acked_packet_ranges'] for n in range(lo,hi+1)}
@@ -197,9 +254,9 @@ async def check(peer, output, schedule='byte', mode='each', scenario='ordinary',
             if scenario == 'stream-credit': require(row['blocked_streams'] > 0 and p.initial_server_limits['max_streams'] == window and p.credit_wire, 'stream-credit gate absent')
             if scenario == 'data-credit': require(row['blocked_data'] > 0 and p.initial_server_limits['max_data'] == 5+18*window and p.credit_wire, 'data-credit gate absent')
             if scenario == 'late-old': require(p.old_sent and row['late_duplicates'] > 0, 'old stream/ACK not exercised')
-            if scenario == 'original-ack': require(p.old_sent and row['retries'] > 0, 'old original ACK after retries absent')
+            if scenario in ('original-ack', 'original-grant-ack'): require(p.old_sent and row['retries'] > 0, 'old original ACK after retries absent')
         (output / f'{name}.wire.json').write_text(json.dumps(dict(parameters=p.parameters,
-            server_limits=p.initial_server_limits, credit_wire=p.credit_wire, grants=p.grants,
+            server_limits=p.initial_server_limits, credit_wire=p.credit_wire, grants=p.grants, connection_grants=p.connection_grants, false_ack_sent=p.false_ack_sent,
             request_ids=sorted(p.headers), acked=sorted(p.acks), old_packets=p.old_packets, result=result), indent=2)+'\n')
         print(json.dumps(dict(case=name, **result)), flush=True)
         return result
@@ -212,6 +269,13 @@ async def check(peer, output, schedule='byte', mode='each', scenario='ordinary',
 async def main(a):
     a.output.mkdir(parents=True, exist_ok=False)
     rows = []
+    if not a.connection_only:
+        await stream_cases(a, rows)
+    await connection_cases(a, rows)
+    (a.output/'summary.json').write_text(json.dumps(rows,indent=2)+'\n')
+
+
+async def stream_cases(a, rows):
     for schedule in ('byte','two-byte','two-fragment','full'):
         rows.append(await check(a.peer,a.output,schedule))
     for mode in ('withheld','sparse','loss','reorder'):
@@ -225,11 +289,29 @@ async def main(a):
         rows.append(await check(a.peer,a.output,fault=fault))
     for scenario in ('no-credit','no-request-ack'):
         rows.append(await check(a.peer,a.output,schedule='full',scenario=scenario))
-    (a.output/'summary.json').write_text(json.dumps(rows,indent=2)+'\n')
+
+
+async def connection_cases(a, rows):
+    for schedule in ('byte', 'two-byte', 'full'):
+        rows.append(await check(a.peer, a.output, schedule, connection=True))
+    for mode in ('withheld', 'sparse', 'loss', 'reorder'):
+        rows.append(await check(a.peer, a.output, mode=mode, connection=True))
+    for scenario in ('stream-credit', 'data-credit', 'late-old', 'original-ack'):
+        rows.append(await check(a.peer, a.output, schedule='full', scenario=scenario, connection=True))
+    rows.append(await check(a.peer, a.output, schedule='full', scenario='original-grant-ack', connection=True))
+    rows.append(await check(a.peer, a.output, connection=True, controlled=True))
+    for fault in ('wrong-byte', 'premature-fin', 'extra-byte', 'missing-fin', 'missing-response', 'missing-grant-ack', 'credit-overrun'):
+        rows.append(await check(a.peer, a.output, fault=fault, connection=True))
+    rows.append(await check(a.peer, a.output, mode='loss', fault='false-grant-ack', connection=True))
+    rows.append(await check(a.peer, a.output, fault='missing-control', connection=True))
+    rows.append(await check(a.peer, a.output, fault='one-byte-overrun', connection=True))
+    for scenario in ('no-credit', 'no-request-ack'):
+        rows.append(await check(a.peer, a.output, schedule='full', scenario=scenario, connection=True))
 
 
 if __name__ == '__main__':
     p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--connection-only', action='store_true')
     p.add_argument('peer',type=lambda s:Path(s).resolve())
     p.add_argument('output',type=lambda s:Path(s).resolve())
     asyncio.run(main(p.parse_args()))

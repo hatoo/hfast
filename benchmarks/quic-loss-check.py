@@ -39,15 +39,19 @@ async def guarded(work, process, timeout):
     try:
         done, _ = await asyncio.wait((task, exited), timeout=timeout,
                                      return_when=asyncio.FIRST_COMPLETED)
-        require(exited not in done, f"server exited unexpectedly: {process.returncode}")
-        if task not in done:
-            raise TimeoutError(f"QUIC case deadline exceeded ({timeout}s)")
-        return await task
     finally:
         for pending in (task, exited):
             if not pending.done():
                 pending.cancel()
         await asyncio.gather(task, exited, return_exceptions=True)
+    # TLS setup can occupy the event loop past the deadline. The subprocess
+    # watcher may publish its exit during cancellation cleanup, after wait's
+    # snapshot. Classify that known exit before diagnosing a silent live peer.
+    require(exited not in done and process.returncode is None,
+            f"server exited unexpectedly: {process.returncode}")
+    if task not in done:
+        raise TimeoutError(f"QUIC case deadline exceeded ({timeout}s)")
+    return task.result()
 
 
 async def ready(port, report):

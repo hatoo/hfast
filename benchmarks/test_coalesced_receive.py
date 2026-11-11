@@ -146,6 +146,30 @@ class AccountingTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exit_published_during_cancellation_is_not_a_timeout(self):
+        # Deterministically model a subprocess notification queued behind work
+        # which occupied the event loop past the deadline. Keep the real-process
+        # exit/silence/SIGKILL checks below as independent integration coverage.
+        class Process:
+            returncode = None
+
+            async def wait(self):
+                await asyncio.Future()
+
+        process = Process()
+        cleaned = asyncio.Event()
+
+        async def work():
+            try:
+                await asyncio.Future()
+            finally:
+                process.returncode = 17
+                cleaned.set()
+
+        with self.assertRaisesRegex(RuntimeError, "server exited unexpectedly: 17"):
+            await asyncio.wait_for(runner.runner.guarded(work(), process, .01), 1)
+        self.assertTrue(cleaned.is_set())
+
     async def test_server_exit_silence_and_sigterm_resistance_are_bounded(self):
         cases = (("raise SystemExit(17)", "server exited"),
                  ("import time; time.sleep(60)", "deadline"),

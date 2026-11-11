@@ -1,5 +1,6 @@
 """Independent set/byte audit of bounded sustained response-credit reports."""
 from collections import Counter
+from response_credit_connection_reports import generations as connection_generations, grant_count, validate_connection
 from response_credit_reports import RESPONSE, contains
 from udp_accounting import require, require_clean_peer
 
@@ -9,14 +10,15 @@ def limits(schedule):
             'two-fragment': [1, 25], 'full': [25]}[schedule]
 
 
-def validate(row, count, window, schedule, mode):
+def validate(row, count, window, schedule, mode, connection=False):
     require(row['phase'] == 'done' and row['error'] is None, f'native failure: {row.get("error")}')
     require((row['count'], row['window'], row['schedule'], row['mode']) == (count, window, schedule, mode), 'workload changed')
     require(row['completed'] == row['retired'] == row['request_acks'] == len(row['samples']) == count, 'missing completion/sample/request ACK')
     require(not row['active_streams'], 'unretired live streams')
     require(row['response_bytes'] == count * 25, 'missing bytes')
     require(row['request_bytes_reserved'] == 5 + 18 * count <= row['max_data'] and count <= row['max_streams'], 'request credit exceeded')
-    grants = count * (len(limits(schedule)) - 1)
+    require(row.get('credit_scope', 'stream') == ('connection' if connection else 'stream'), 'credit scope changed')
+    grants = grant_count(count, window, schedule) if connection else count * (len(limits(schedule)) - 1)
     require(row['grants'] == row['grant_acks'] == grants, 'missing grant generation/ACK')
     require(row['bootstrap_acked'] and row['fence_acked'] and row['control_bytes'] == 3 and row['unacked_work'] == 0, 'unsettled control/work')
     require(0 < row['max_flights'] <= 64, 'unbounded live flight state')
@@ -48,7 +50,8 @@ def validate(row, count, window, schedule, mode):
         expected = {(0, 3, 3), (4, 0, 0)}
         for sid in range(0, 4 * count, 4):
             expected.add((1, sid, 0))
-            expected.update((2, sid, n) for n in limits(schedule)[1:])
+            if not connection: expected.update((2, sid, n) for n in limits(schedule)[1:])
+        if connection: expected.update((5, 0, n) for n in connection_generations(count, window, schedule))
         require({k for k in generations if k[0] != 3} == expected, 'missing work generation')
         require(Counter(tuple(w) for w in row['acked_work'] if w[0] != 3) == Counter(expected), 'wrong work retirement')
         for copies in generations.values():
@@ -71,13 +74,15 @@ def validate(row, count, window, schedule, mode):
         require(control == set(range(3)) and all(s == set(range(25)) for s in seen) and fin == set(range(0, count*4, 4)), 'missing response/control bytes/FIN')
     else:
         require(not row['sent_work'] and not row['frames'] and not row['acked_work'], 'unexpected unbounded transcript')
+    if connection: validate_connection(row, count, window, schedule)
+    else: require(row.get('connection_credit') is None, 'unexpected aggregate ledger')
     if mode == 'loss':
-        require(row['dropped_response_packets'] == 2 and row['dropped_grants'] == int(schedule != 'full'), 'loss not exercised')
-        if schedule != 'full': require(row['retries'] > 0, 'retry not exercised')
+        require(row['dropped_response_packets'] == 2 and row['dropped_grants'] == int(connection or schedule != 'full'), 'loss not exercised')
+        if connection or schedule != 'full': require(row['retries'] > 0, 'retry not exercised')
     if mode == 'reorder': require(row['dropped_response_packets'] == 2 and row['replayed'] and row['duplicate_packets'] >= 2, 'reordering not exercised')
     if mode in ('withheld', 'sparse'): require(row['withheld_ranges'], 'ACK withholding not exercised')
     if mode == 'sparse': require(row['max_ack_ranges'] > 1, 'sparse ACK absent')
-    return dict(count=count, window=window, schedule=schedule, mode=mode, completed=count,
+    return dict(credit_scope='connection' if connection else 'stream', count=count, window=window, schedule=schedule, mode=mode, completed=count,
                 latency_samples=count, response_bytes=count*25, grants=grants, retries=row['retries'],
                 elapsed_seconds=interval['elapsed_ns']/1e9, peer_cpu_seconds=interval['cpu_elapsed_ns']/1e9,
                 peer_cpu_cores=interval['cpu_elapsed_ns']/interval['elapsed_ns'],

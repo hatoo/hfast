@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 #![recursion_limit = "256"]
 mod clock;
+mod connection_credit;
 mod credit_control;
 mod credit_ledger;
 mod quic;
@@ -22,6 +23,7 @@ pub fn is_informational(status: u16) -> bool {
 }
 
 use anyhow::{Context, Result, bail, ensure};
+use connection_credit::ConnectionCredit;
 use credit_ledger::{Ranges, ack_chunks, decode_ack};
 use quic::{
     conn::{Connection, LocalParamsInput},
@@ -49,6 +51,7 @@ enum Work {
     Bootstrap,
     Request(u64),
     Grant(u64, u64),
+    ConnectionGrant(u64),
     Ping,
     Fence,
 }
@@ -60,6 +63,7 @@ impl Work {
             Self::Grant(s, n) => (2, s, n),
             Self::Ping => (3, 0, 0),
             Self::Fence => (4, 0, 0),
+            Self::ConnectionGrant(n) => (5, 0, n),
         }
     }
     fn append(self, b: &mut Vec<u8>) {
@@ -80,6 +84,10 @@ impl Work {
                 put_varint(b, s);
                 put_varint(b, n);
             }
+            Self::ConnectionGrant(n) => {
+                b.push(0x10);
+                put_varint(b, n);
+            }
             Self::Ping | Self::Fence => b.push(1),
         }
     }
@@ -96,6 +104,7 @@ struct Peer {
     wire: Vec<u8>,
     udp_before: Value,
     waves: Waves,
+    connection_credit: Option<ConnectionCredit>,
     schedule: String,
     mode: String,
     trace: bool,
@@ -147,6 +156,7 @@ impl Peer {
         schedule: String,
         mode: String,
         trace: bool,
+        connection: bool,
     ) -> Result<Self> {
         let grants = match schedule.as_str() {
             "byte" => Grants::Bytes(1),
@@ -163,6 +173,18 @@ impl Peer {
             ["each", "withheld", "sparse", "loss", "reorder"].contains(&mode.as_str()),
             "invalid mode"
         );
+        let connection_credit = if connection {
+            let step = match schedule.as_str() {
+                "byte" => 1,
+                "two-byte" => 2,
+                "full" => 25,
+                _ => bail!("connection credit supports byte, two-byte or full (25-byte grants)"),
+            };
+            Some(model(ConnectionCredit::new(step, window, count, trace))?)
+        } else {
+            None
+        };
+        let grants = if connection { Grants::Full } else { grants };
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket2::SockRef::from(&socket).set_recv_buffer_size(4 << 20)?;
         socket.connect(("127.0.0.1", port))?;
@@ -172,8 +194,8 @@ impl Peer {
             tls::client_config(b"h3")?,
             "localhost",
             LocalParamsInput {
-                // Aggregate credit is explicit and sufficient for every byte, including SETTINGS.
-                initial_max_data: count as u64 * 25 + 3,
+                // Reserve exactly the three SETTINGS bytes in aggregate-credit mode.
+                initial_max_data: if connection { 3 } else { count as u64 * 25 + 3 },
                 initial_max_stream_data: model(grants.initial())?,
                 initial_max_streams_uni: 0,
                 max_idle_timeout_ms: 30000,
@@ -241,6 +263,7 @@ impl Peer {
             wire,
             udp_before,
             waves,
+            connection_credit,
             schedule,
             mode,
             trace,
@@ -318,7 +341,9 @@ impl Peer {
         }
         ensure!(payload.len() <= 1000, "work batch exceeds datagram budget");
         let drop = self.mode == "loss"
-            && work.iter().any(|w| matches!(w, Work::Grant(..)))
+            && work
+                .iter()
+                .any(|w| matches!(w, Work::Grant(..) | Work::ConnectionGrant(..)))
             && self.dropped_grants == 0;
         let pn = self.send(&payload, drop)?;
         if self.trace {
@@ -342,6 +367,15 @@ impl Peer {
                 Work::Request(s) => model(self.waves.start(s, now))?,
                 Work::Grant(s, n) => {
                     model(self.waves.grant(s, n))?;
+                    self.grants += 1;
+                }
+                Work::ConnectionGrant(n) => {
+                    model(
+                        self.connection_credit
+                            .as_mut()
+                            .context("missing connection ledger")?
+                            .grant(n),
+                    )?;
                     self.grants += 1;
                 }
                 _ => {}
@@ -404,10 +438,22 @@ impl Peer {
                     Work::Bootstrap => self.bootstrap_acked = true,
                     Work::Request(s) => {
                         model(self.waves.ack_request(s))?;
+                        if let Some(c) = &mut self.connection_credit {
+                            model(c.request_ack(s))?;
+                        }
                         self.request_acks += 1;
                     }
                     Work::Grant(s, n) => {
                         model(self.waves.ack_grant(s, n))?;
+                        self.grant_acks += 1;
+                    }
+                    Work::ConnectionGrant(n) => {
+                        model(
+                            self.connection_credit
+                                .as_mut()
+                                .context("missing connection ledger")?
+                                .ack(n),
+                        )?;
                         self.grant_acks += 1;
                     }
                     Work::Fence => self.fence_acked = true,
@@ -466,6 +512,11 @@ impl Peer {
                     !fin || (*id != 3 && end == 25),
                     "wire premature/control FIN"
                 );
+                if *id != 3
+                    && let Some(c) = &mut self.connection_credit
+                {
+                    model(c.wire(*id, *offset, data.len()))?;
+                }
                 if self.trace {
                     ensure!(self.frames.len() < MAX_EVENTS, "frame transcript exhausted");
                     self.frames.push((
@@ -538,6 +589,9 @@ impl Peer {
                     data,
                     fin,
                 } if id & 3 == 0 => {
+                    if let Some(c) = &mut self.connection_credit {
+                        model(c.receive(id, offset, data.len()))?;
+                    }
                     let now = self.now();
                     if model(self.waves.receive(id, offset, data, fin, now))? == Delivery::Complete
                     {
@@ -643,7 +697,14 @@ impl Peer {
                     .slots
                     .iter()
                     .all(|s| s.completed.is_some() && s.request_acked && s.grant_acked == 25)
+                && self
+                    .connection_credit
+                    .as_ref()
+                    .is_none_or(ConnectionCredit::settled)
             {
+                if let Some(c) = &mut self.connection_credit {
+                    model(c.retire())?;
+                }
                 model(self.waves.retire())?;
             }
             if self.waves.slots.is_empty() && self.waves.samples.len() < self.waves.sample_budget {
@@ -653,6 +714,9 @@ impl Peer {
                     .min(self.waves.sample_budget - self.waves.samples.len());
                 match model(self.waves.begin(count))? {
                     Ready::Started { first, count } => {
+                        if let Some(c) = &mut self.connection_credit {
+                            model(c.begin(first, count))?;
+                        }
                         self.released = false;
                         for chunk in (0..count).collect::<Vec<_>>().chunks(BATCH) {
                             self.queue(
@@ -666,6 +730,14 @@ impl Peer {
                     Ready::StreamCredit => self.blocked_streams += 1,
                     Ready::DataCredit => self.blocked_data += 1,
                 }
+            }
+            if self.flights.len() < MAX_FLIGHTS
+                && let Some(n) = self
+                    .connection_credit
+                    .as_ref()
+                    .and_then(ConnectionCredit::next)
+            {
+                self.queue(vec![Work::ConnectionGrant(n)])?;
             }
             let mut pending = Vec::with_capacity(BATCH);
             for i in 0..self.waves.slots.len() {
@@ -720,6 +792,8 @@ impl Peer {
     }
     fn report(&self, error: Option<String>) -> Value {
         json!({"phase":if error.is_some(){"failed"}else{"done"},"error":error,"schedule":self.schedule,"mode":self.mode,"trace":self.trace,
+            "credit_scope":if self.connection_credit.is_some(){"connection"}else{"stream"},
+            "connection_credit":self.connection_credit.as_ref().filter(|_|self.bootstrap_acked && self.control==7).map(|c|json!({"initial":3,"step":c.step,"limit":c.limit,"acked":c.acked,"charged":c.charged,"wire_unique":c.wire_unique,"received":c.received,"completed_waves":c.completed_waves,"events":c.events})),
             "count":self.waves.sample_budget,"window":self.waves.window,"completed":self.completed,"retired":self.waves.retired,
             "response_bytes":self.waves.received_bytes(),"late_duplicates":self.waves.late_duplicates,
             "request_acks":self.request_acks,"grants":self.grants,"grant_acks":self.grant_acks,
@@ -744,8 +818,8 @@ fn main() -> Result<()> {
         a.len() >= 7
             && a[7..]
                 .iter()
-                .all(|s| ["--controlled", "--trace"].contains(&s.as_str())),
-        "usage: peer PORT COUNT WINDOW byte|two-byte|two-fragment|full each|withheld|sparse|loss|reorder TIMEOUT_SECONDS [--controlled] [--trace]"
+                .all(|s| ["--controlled", "--trace", "--connection-credit"].contains(&s.as_str())),
+        "usage: peer PORT COUNT WINDOW byte|two-byte|two-fragment|full each|withheld|sparse|loss|reorder TIMEOUT_SECONDS [--controlled] [--trace] [--connection-credit]"
     );
     let secs: u64 = a[6].parse()?;
     ensure!((1..=120).contains(&secs), "invalid timeout");
@@ -759,6 +833,7 @@ fn main() -> Result<()> {
         a[4].clone(),
         a[5].clone(),
         trace,
+        a[7..].iter().any(|s| s == "--connection-credit"),
     )?;
     let result = (|| -> Result<()> {
         peer.bootstrap(timeout)?;
