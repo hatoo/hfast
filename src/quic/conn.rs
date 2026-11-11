@@ -1624,6 +1624,7 @@ pub(super) mod tests {
     mod ack_ledger;
     mod control_ack;
     mod crypto_handshake;
+    mod crypto_output;
     mod datagram_budget;
     pub(in crate::quic) mod endpoint_timers;
     mod flight_history;

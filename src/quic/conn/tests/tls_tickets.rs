@@ -50,11 +50,20 @@ pub(super) fn client_params() -> Vec<u8> {
 }
 
 pub(super) fn production_pair_with_params(
-    mut config: rustls::ServerConfig,
+    config: rustls::ServerConfig,
     ticket_request: bool,
     params: Vec<u8>,
 ) -> (Connection, rustls::quic::ClientConnection) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    production_pair_with_certificate(config, ticket_request, params, cert)
+}
+
+pub(super) fn production_pair_with_certificate(
+    mut config: rustls::ServerConfig,
+    ticket_request: bool,
+    params: Vec<u8>,
+    cert: rcgen::CertifiedKey,
+) -> (Connection, rustls::quic::ClientConnection) {
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
     let certified = rustls::sign::CertifiedKey::from_der(
         vec![cert.cert.der().clone()],
