@@ -667,12 +667,41 @@ def header_table_backpressure(port, fragmented):
     return backpressure(port, fragmented, table_change=True)
 
 
+def appended_blocked(port, fragmented):
+    """Ample connection credit must not revive previously blocked streams."""
+    peer = Peer(port, initial=0, fragmented=fragmented)
+    try:
+        peer.grant(100_000)
+        streams = []
+        for _ in range(16):
+            for _ in range(32):
+                streams.append(peer.request())
+                peer.grant(1)
+            peer.exchange()
+            for stream in streams:
+                peer.expect(stream, 0)
+        partial = streams[::7]
+        for stream in partial:
+            peer.grant(5, stream)
+        peer.exchange()
+        for stream in streams:
+            peer.expect(stream, 5 if stream in partial else 0)
+        peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 13})
+        peer.exchange()
+        for stream in streams:
+            peer.expect(stream, 13, True)
+        return {"case": "appended-blocked", "fragmented": fragmented,
+                "replies": len(streams), "partial": len(partial)}
+    finally:
+        peer.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--case", choices=["stream-zero", "connection", "settings",
                                           "header-table", "header-table-order", "header-table-pending", "header-table-backpressure",
-                                          "invalid", "pending-queue", "connection-trickle", "sparse-readiness", "backpressure",
+                                          "invalid", "pending-queue", "connection-trickle", "sparse-readiness", "appended-blocked", "backpressure",
                                           "all"], default="all")
     args = parser.parse_args()
     with socket.socket() as listener:
@@ -700,6 +729,7 @@ def main():
                       "pending-queue": pending_queue,
                       "connection-trickle": connection_trickle,
                       "sparse-readiness": sparse_readiness,
+                      "appended-blocked": appended_blocked,
                       "backpressure": backpressure}
             results = [check(port, fragmented) for name, check in checks.items()
                        if args.case in [name, "all"]
