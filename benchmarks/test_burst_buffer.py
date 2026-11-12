@@ -183,6 +183,19 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(row['status'], 'unavailable')
             self.assertIn('identity changed', row['error'])
 
+    def test_socket_disappearance_after_partial_startup_is_not_retried(self):
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        with patch.object(capacity.failure, 'process_snapshot',
+                          side_effect=[snapshot(), self.absent(), snapshot()]) as observe, \
+                patch.object(capacity.time, 'sleep'):
+            row = capacity.wait_ready(process, 9999, 0, workers=2)
+        self.assertEqual(row['status'], 'unavailable')
+        self.assertIsNone(row['effective_bytes'])
+        self.assertIn('socket changed', row['error'])
+        self.assertEqual(observe.call_count, 2)
+        self.assertEqual(len(row['startup_observations']), 1)
+
     def test_exit_and_timeout_stay_unavailable(self):
         process = Mock(pid=123)
         process.poll.return_value = 7
@@ -240,6 +253,74 @@ class StartupTests(unittest.TestCase):
                 child.stdin.write('stop\n')
                 child.stdin.flush()
                 child.wait(timeout=5)
+
+    def test_socket_creation_during_empty_ownership_snapshot(self):
+        # Reproduce CI43149019877: ownership is empty, then startup binds UDP
+        # sockets while a non-atomic table read repeats one of their rows.
+        code = ('import socket,sys\n'
+                'print("starting",flush=True)\nsys.stdin.readline()\n'
+                'sockets=[]\n'
+                'for _ in range(int(sys.argv[2])):\n'
+                ' s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n'
+                ' s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)\n'
+                ' s.bind(("127.0.0.1",int(sys.argv[1])))\n'
+                ' sockets.append(s)\n'
+                'print("bound",flush=True)\nsys.stdin.readline()\n')
+        for count in (1, 2):
+            with self.subTest(workers=count):
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                    reserve.bind(('127.0.0.1', 0))
+                    port = reserve.getsockname()[1]
+                with subprocess.Popen([sys.executable, '-c', code, str(port), str(count)],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      text=True) as child:
+                    try:
+                        self.assertEqual(child.stdout.readline(), 'starting\n')
+                        owned_inodes = capacity.failure.owned_inodes
+                        read_text = Path.read_text
+                        proc = Path(f'/proc/{child.pid}')
+                        first = True
+                        empty = False
+
+                        def bind_after_ownership(path):
+                            nonlocal first, empty
+                            owned = owned_inodes(path)
+                            if path == proc:
+                                empty = not owned
+                                if first:
+                                    first = False
+                                    self.assertEqual(owned, {})
+                                    child.stdin.write('start\n')
+                                    child.stdin.flush()
+                                    self.assertEqual(child.stdout.readline(), 'bound\n')
+                            return owned
+
+                        def repeat_startup_row(path, *args, **kwargs):
+                            text = read_text(path, *args, **kwargs)
+                            if path == proc / 'net/udp' and empty:
+                                rows = [line for line in text.splitlines()[1:]
+                                        if int(line.split()[1].split(':')[1], 16) == port]
+                                self.assertEqual(len(rows), count)
+                                text += rows[0] + '\n'
+                            return text
+
+                        with patch.object(capacity.failure, 'owned_inodes', bind_after_ownership), \
+                                patch.object(Path, 'read_text', repeat_startup_row):
+                            before = capacity.wait_ready(child, port, 0, workers=count)
+                        self.assertEqual(before['status'], 'available', before)
+                        self.assertEqual(len(before['snapshot']['sockets']), count)
+                        history = before['startup_observations']
+                        self.assertEqual(len(history), 1)
+                        self.assertEqual(history[0]['snapshot']['owned_inodes'], {})
+                        self.assertEqual(history[0]['error'], 'ValueError: no owned UDP sockets remain')
+                        after = capacity.observe(child.pid, port, 0, workers=count)
+                        interval = capacity.interval(before, after)
+                        self.assertEqual(interval['status'], 'available', interval)
+                        self.assertEqual(interval['socket_delta']['drops'], 0)
+                    finally:
+                        child.stdin.write('stop\n')
+                        child.stdin.flush()
+                        child.wait(timeout=5)
 
 
 class CommandTests(unittest.TestCase):

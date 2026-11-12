@@ -56,6 +56,10 @@ def _process_snapshot(pid, deadline):
         require(identity['netns'] == os.readlink('/proc/self/ns/net'), 'different network namespace')
         owned = owned_inodes(proc)
         result['owned_inodes'] = owned
+        # Startup may bind its first sockets during the following table read.
+        # An empty ownership scan cannot identify any of them; leave it absent
+        # so wait_ready can take a new snapshot within its startup deadline.
+        require(owned, 'no owned UDP sockets remain')
         tables = result['tables'] = {}
         for filename, family in [('udp', socket.AF_INET), ('udp6', socket.AF_INET6)]:
             path = proc / 'net' / filename

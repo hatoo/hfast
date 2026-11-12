@@ -156,6 +156,12 @@ inodes; the successful replacement read must still pass all cookie, capacity,
 queue and drop checks. This handles an observed non-atomic table read during
 producer startup without declaring incomplete evidence lossless.
 
+An empty owned-socket scan returns unavailable before reading UDP tables: no row
+could belong to that scan, even if the server binds its first sockets meanwhile.
+The bounded startup wait records this absence and takes a fresh snapshot. Once
+it has observed a worker socket, disappearance or replacement remains an error.
+Outside startup, an empty scan stays unavailable and cannot produce a loss delta.
+
 `run-failure.json` retains the server snapshot before its teardown. If a native
 worker exits first, its stderr contains a `burst_failure` JSON record with the
 original error, phase, partial peer ledgers and its still-owned socket counters

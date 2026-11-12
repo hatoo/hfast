@@ -514,8 +514,10 @@ class FailureEvidenceTests(unittest.TestCase):
 
     def test_duplicate_retry_uses_the_original_diagnostic_deadline(self):
         injection, reads, _ = self.repeated_table(100)
-        with injection, patch.object(b.failure.time, 'monotonic', side_effect=[10, 10, 13]):
-            row = b.failure.process_snapshot(os.getpid())
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            with injection, patch.object(b.failure.time, 'monotonic', side_effect=[10, 10, 13]):
+                row = b.failure.process_snapshot(os.getpid())
         self.assertEqual(len(reads), 1)
         self.assertEqual(row['status'], 'unavailable')
         self.assertIn('deadline expired', row['error'])
