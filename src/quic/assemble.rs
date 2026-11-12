@@ -22,7 +22,11 @@ impl Assembler {
         if offset > self.end {
             // Out of order. Keeping it whole is enough; it is looked at again
             // only when the gap in front of it is filled.
-            self.early.push((offset, data.to_vec()));
+            // An empty range cannot fill a gap. Retaining it would grow the
+            // queue and make every later gap closure scan a useless entry.
+            if !data.is_empty() {
+                self.early.push((offset, data.to_vec()));
+            }
             return;
         }
         self.append(offset, data);
@@ -69,6 +73,79 @@ impl Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_future_fragments_do_not_retain_storage() {
+        let mut a = Assembler::default();
+        for _ in 0..4096 {
+            for offset in [0, 1, 4096, (1 << 62) - 1] {
+                a.push(offset, &[]);
+            }
+        }
+        assert!(a.read().is_empty());
+        assert_eq!(a.end, 0);
+        assert_eq!(a.early.capacity(), 0);
+        assert_eq!(a.buf.capacity(), 0);
+
+        // Empty ranges must not grow a queue which already holds real bytes,
+        // including after a read has consumed part of the contiguous prefix.
+        a.push(8, b"ijkl");
+        a.push(0, b"abcd");
+        a.consume(3);
+        let capacity = a.early.capacity();
+        for _ in 0..4096 {
+            for offset in [0, 3, 4, 6, 8, 12, (1 << 62) - 1] {
+                a.push(offset, &[]);
+            }
+        }
+        assert_eq!(a.early.len(), 1);
+        assert_eq!(a.early.capacity(), capacity);
+        assert_eq!(a.read(), b"d");
+        assert_eq!(a.end, 4);
+        a.push(4, b"efgh");
+        assert_eq!(a.read(), b"defghijkl");
+        assert!(a.early.is_empty());
+    }
+
+    #[test]
+    fn empty_fragments_preserve_byte_coverage_and_consumption() {
+        let bytes: Vec<_> = (0..128).map(|i| (i * 37 + 11) as u8).collect();
+        for reverse in [false, true] {
+            let mut a = Assembler::default();
+            let mut covered = [false; 128];
+            let mut consumed = 0;
+            let mut order: Vec<_> = (0..16).collect();
+            if reverse {
+                order.reverse();
+            }
+            for chunk in order {
+                let start = chunk * 8;
+                for (offset, data) in [
+                    (127, &[][..]),
+                    (start, &[][..]),
+                    (start, &bytes[start..start + 8]),
+                    (start + 4, &[][..]),
+                    (0, &[][..]),
+                    (start, &bytes[start..start + 8]),
+                ] {
+                    a.push(offset as u64, data);
+                    covered[offset..offset + data.len()].fill(true);
+                    let end = covered.iter().take_while(|&&v| v).count();
+                    assert_eq!(a.read(), &bytes[consumed..end]);
+                    let n = a.read().len() / 2;
+                    a.consume(n);
+                    consumed += n;
+                }
+            }
+            assert_eq!(a.read(), &bytes[consumed..]);
+            a.consume(usize::MAX);
+            a.push(0, &bytes);
+            a.push(128, &[]);
+            assert!(a.read().is_empty());
+            a.push(128, b"next");
+            assert_eq!(a.read(), b"next");
+        }
+    }
 
     #[test]
     fn data_in_order_is_just_appended() {

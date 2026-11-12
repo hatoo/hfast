@@ -221,6 +221,70 @@ impl Peer {
 }
 
 #[test]
+fn encrypted_empty_crypto_preserves_ack_and_handshake_progress() {
+    for reverse in [false, true] {
+        let (mut conn, mut peer) = Peer::unstarted(tls_tickets::client_params());
+        // New authenticated packet numbers ensure replay filtering does not
+        // hide the empty CRYPTO frames from reassembly. They remain ack-eliciting.
+        for offset in [0, 1, 4096, (1 << 62) - 1] {
+            let mut body = Vec::new();
+            for _ in 0..32 {
+                frame::put_crypto(&mut body, offset, &[]);
+            }
+            let pn = u64::from(peer.next_pn);
+            peer.send(&mut conn, Space::Initial, &body);
+            assert!(!conn.connected && conn.tls.is_handshaking());
+            assert!(conn.spaces[0].crypto_in.read().is_empty());
+            let receipts = peer.drain(&mut conn);
+            assert!(receipts.iter().any(|(space, _, plain)| {
+                *space == Space::Initial
+                    && frame::Frames::new(plain).any(|frame| match frame.unwrap() {
+                        frame::Frame::Ack {
+                            largest,
+                            first_range,
+                            rest,
+                            ..
+                        } => frame::AckRanges::new(largest, first_range, rest)
+                            .any(|(low, high)| (low..=high).contains(&pn)),
+                        _ => false,
+                    })
+            }));
+        }
+        let mut hello = Vec::new();
+        assert!(peer.tls.write_hs(&mut hello).is_none());
+        send_crypto_fragments(&mut peer, &mut conn, Space::Initial, &hello, 7, reverse);
+        peer.drain(&mut conn);
+        assert!(!peer.tls.is_handshaking());
+        assert!(conn.tls.is_handshaking());
+
+        let mut body = Vec::new();
+        for offset in [0, 1, 4096, (1 << 62) - 1] {
+            frame::put_crypto(&mut body, offset, &[]);
+        }
+        let pn = u64::from(peer.next_pn);
+        peer.send(&mut conn, Space::Handshake, &body);
+        assert!(conn.tls.is_handshaking());
+        assert!(conn.spaces[1].crypto_in.read().is_empty());
+        assert!(peer.drain(&mut conn).iter().any(|(space, _, plain)| {
+            *space == Space::Handshake
+                && frame::Frames::new(plain).any(|frame| match frame.unwrap() {
+                    frame::Frame::Ack {
+                        largest,
+                        first_range,
+                        rest,
+                        ..
+                    } => frame::AckRanges::new(largest, first_range, rest)
+                        .any(|(low, high)| (low..=high).contains(&pn)),
+                    _ => false,
+                })
+        }));
+        // Delayed and duplicated real Finished bytes still authenticate one
+        // exact response and settle every outstanding recovery obligation.
+        peer.complete(&mut conn);
+    }
+}
+
+#[test]
 fn encrypted_crypto_input_fragments_preserve_tls_transcript_and_retirement() {
     for chunk in [1, 7, 64, usize::MAX] {
         for reverse in [false, true] {
