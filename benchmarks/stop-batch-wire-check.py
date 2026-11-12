@@ -68,18 +68,81 @@ def negative_oracles(records, report):
     return cases
 
 
+def encode(values):
+    """Independent aioquic frame writer used only to damage known-good traces."""
+    buf = Buffer(capacity=65536)
+    for ty, v in values:
+        if 8 <= ty <= 15:
+            sid, offset, fin, data = v
+            buf.push_uint_var(0x0e | int(fin))
+            for n in (sid, offset, len(data)):
+                buf.push_uint_var(n)
+            buf.push_bytes(data)
+        elif ty == 2:
+            buf.push_uint_var(2)
+            for n in (v[0][1], 0, len(v)-1, v[0][1]-v[0][0]):
+                buf.push_uint_var(n)
+            for (prev, _), (lo, hi) in zip(v, v[1:]):
+                buf.push_uint_var(prev-hi-2)
+                buf.push_uint_var(hi-lo)
+        else:
+            buf.push_uint_var(ty)
+            for n in v:
+                buf.push_uint_var(n)
+    return buf.data.hex()
+
+
+def unsent_negative_oracles(records, report):
+    cases = negative_oracles(records, report)
+    decoded = [list(frames(bytes.fromhex(r["hex"]))) for r in records]
+    first_stop = next(i for i, fs in enumerate(decoded) if records[i]["direction"] == "tx" and any(t == 5 for t, _ in fs))
+    first_target = next(i for i, fs in enumerate(decoded) if records[i]["direction"] == "tx" and
+                        any(8 <= t <= 15 and v[0] % 4 == 0 and not v[2] for t, v in fs))
+    first_reset = next(i for i, fs in enumerate(decoded) if records[i]["direction"] == "rx" and any(t == 4 for t, _ in fs))
+    final_reset_ack = next(i for i in range(first_reset+1, len(records)) if records[i]["direction"] == "tx" and any(t == 2 for t, _ in decoded[i]))
+    last_rx = max(i for i, r in enumerate(records) if r["direction"] == "rx")
+    creation_ack = max(i for i in range(first_stop) if records[i]["direction"] == "rx")
+    sid = next(v[0] for t, v in decoded[first_stop] if t == 5)
+    last_before_stop = records[creation_ack]["pn"]
+    mutations = {
+        "request-fin": (first_target, [(t, (v[0], v[1], True, v[3])) if 8 <= t <= 15 else (t, v) for t, v in decoded[first_target]]),
+        "missing-receive-reset": (first_stop, [(t, v) for t, v in decoded[first_stop] if t != 4 or v[0] != sid]),
+        "wrong-receive-final-size": (first_stop, [(t, (v[0], v[1], v[2]+1)) if t == 4 and v[0] == sid else (t, v) for t, v in decoded[first_stop]]),
+        "missing-stop": (first_stop, [(t, v) for t, v in decoded[first_stop] if t != 5 or v[0] != sid]),
+        "early-retirement": (first_stop, [(2, [(0, last_before_stop)])] + decoded[first_stop]),
+        "missing-request-fence": (creation_ack, [(t, v) for t, v in decoded[creation_ack] if t != 2]),
+        "missing-final-fence": (last_rx, [(t, v) for t, v in decoded[last_rx] if t != 2]),
+        "late-reset-ack": (final_reset_ack, [(t, [(0, v[0][1]-1)]) if t == 2 else (t, v) for t, v in decoded[final_reset_ack]]),
+        "target-response": (first_reset, decoded[first_reset]+[(0x0f, (sid, 0, True, b"unexpected"))]),
+    }
+    for name, (index, values) in mutations.items():
+        damaged = copy.deepcopy(records)
+        damaged[index]["hex"] = encode(values)
+        try:
+            verify(damaged, report)
+        except (ValueError, KeyError, AssertionError):
+            cases.append(name)
+        else:
+            raise ValueError(f"unsent transcript fault passed: {name}")
+    return cases
+
+
 def main(args):
     args.output.mkdir(parents=True)
     rows = []
-    for mode in ("plain", "repeat", "stop-ack", "ack-stop"):
-        out = args.output/mode
-        report = s.run(args.server, args.peer, out, 1024, 64, 32, 64, 1, mode,
-                       args.client_cpu, trace=True)
+    cases = [(mode, 1024, 64) for mode in ("plain", "repeat", "stop-ack", "ack-stop")]
+    cases += [("unsent", 512, 128), ("unsent", 4096, 1024)]
+    for mode, window, cancellations in cases:
+        name = f"unsent-w{window}" if mode == "unsent" else mode
+        out = args.output/name
+        report = s.run(args.server, args.peer, out, window, cancellations, 32, 64, 1, mode,
+                       args.client_cpu, trace=True, warmup_cycles=2 if mode == "unsent" else 1)
         records = [json.loads(line) for line in (out/"wire.jsonl").read_text().splitlines()]
         row = verify(records, report)
         if report["resets"]:
-            row["negative_oracles"] = negative_oracles(records, report)
+            row["negative_oracles"] = (unsent_negative_oracles if mode == "unsent" else negative_oracles)(records, report)
         row["mode"] = mode
+        row["window"] = window
         rows.append(row)
         print(json.dumps(row), flush=True)
     (args.output/"summary.json").write_text(json.dumps(rows, indent=2)+"\n")

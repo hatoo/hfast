@@ -28,7 +28,7 @@ def main(args):
         for variant in order:
             row = s.run(getattr(args, variant), args.peer, args.output/f"{pair}-{variant}",
                         args.window, args.cancellations, args.batch, args.stop_batch,
-                        args.cycles, args.mode, args.client_cpu)
+                        args.cycles, args.mode, args.client_cpu, warmup_cycles=args.warmup_cycles)
             row.update(variant=variant, pair=pair)
             rows.append(row)
             results[variant] = row
@@ -43,6 +43,11 @@ def main(args):
             cancellation_percent=100*(c["cancellation_seconds"]/b["cancellation_seconds"]-1),
             cpu_percent=(100*(c["server_cpu_ns_per_response"]/b["server_cpu_ns_per_response"]-1)
                          if b["server_cpu_ns_per_response"] else None)))
+        if args.mode == "unsent":
+            for key in ("cancelled_requests", "retired_streams", "request_bytes", "response_samples", "cancellation_samples"):
+                s.require(b[key] == c[key], f"mismatched {key}")
+            for key in ("response_p99_ns", "cancellation_p99_ns", "server_peak_rss_kib"):
+                pairs[-1][key+"_percent"] = 100*(c[key]/b[key]-1)
     s.require(inputs == {k: s.sha(getattr(args, k)) for k in inputs}, "input binary changed")
     summary = dict(inputs=inputs, pairs=pairs, reverse=args.reverse,
                    total_responses=sum(r["responses"] for r in rows),
@@ -64,8 +69,9 @@ if __name__ == "__main__":
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--stop-batch", type=int, default=64)
     p.add_argument("--cycles", type=int, default=64)
+    p.add_argument("--warmup-cycles", type=int, default=1)
     p.add_argument("--pairs", type=int, default=3)
     p.add_argument("--client-cpu", type=int, default=8)
-    p.add_argument("--mode", choices=["plain", "repeat", "stop-ack", "ack-stop"], default="plain")
+    p.add_argument("--mode", choices=["plain", "repeat", "stop-ack", "ack-stop", "unsent"], default="plain")
     p.add_argument("--reverse", action="store_true")
     main(p.parse_args())

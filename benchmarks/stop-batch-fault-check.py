@@ -19,7 +19,7 @@ from stop_batch_wire import frames
 
 
 def run(args, mode):
-    out = args.output / mode
+    out = args.output / f"{args.workload}-{mode}"
     out.mkdir()
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -39,7 +39,7 @@ def run(args, mode):
                 env = dict(os.environ, STOP_BATCH_TRACE=str(out/"wire.jsonl"))
                 peer = subprocess.Popen(["taskset", "-c", str(args.client_cpu), str(args.peer),
                                          str(relay.getsockname()[1]), str(server.pid),
-                                         "1024", "64", "32", "64", "1", "plain"],
+                                         "1024", "64", "32", "64", "1", args.workload],
                                         env=env, stdout=stdout, stderr=stderr)
                 client, cancel, injected = None, False, 0
                 deadline = time.monotonic() + 12
@@ -92,6 +92,7 @@ if __name__ == "__main__":
     for key in ("server", "peer", "output"):
         p.add_argument(key, type=lambda x: Path(x).resolve())
     p.add_argument("--client-cpu", type=int, default=8)
+    p.add_argument("--workload", choices=["plain", "unsent"], default="plain")
     args = p.parse_args()
     args.output.mkdir(parents=True)
     rows = [run(args, mode) for mode in ("drop", "duplicate")]

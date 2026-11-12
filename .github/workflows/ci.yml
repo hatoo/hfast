@@ -219,6 +219,10 @@ jobs:
             "$(command -v python)" benchmarks/stop-batch-fault-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/stop-peer/stop-batch-peer" \
             "$RUNNER_TEMP/stop-faults" --client-cpu 1
+          sudo unshare --net sh -c 'ip link set lo up && exec "$@"' unsent-stop-faults \
+            "$(command -v python)" benchmarks/stop-batch-fault-check.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/stop-peer/stop-batch-peer" \
+            "$RUNNER_TEMP/unsent-stop-faults" --client-cpu 1 --workload unsent
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
