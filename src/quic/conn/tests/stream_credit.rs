@@ -299,3 +299,42 @@ fn stream_credit_small_requests_do_not_allocate_delivery_state() {
         size_of::<StreamSlot>()
     );
 }
+
+#[test]
+fn stream_credit_encrypted_terminal_cohort_cancels_only_its_queued_limits() {
+    let mut conn = small_window();
+    conn.initial_max_data = 4096;
+    conn.data_credit.told = 4096;
+    let mut body = Vec::new();
+    for id in [0, 4, 8, 12] {
+        frame::put_stream(&mut body, id, 0, false, &[0; 32]);
+    }
+    conn.recv(&mut peer_data_packet(&conn, 10, &body)).unwrap();
+    body.clear();
+    frame::put_stream(&mut body, 0, 32, true, b"");
+    frame::put_stream(&mut body, 12, 32, true, b"");
+    for value in [frame::RESET_STREAM, 8, 0x10c, 32] {
+        put_varint(&mut body, value);
+    }
+    let terminal = peer_data_packet(&conn, 11, &body);
+    conn.recv(&mut terminal.clone()).unwrap();
+    conn.recv(&mut terminal.clone()).unwrap();
+    let (pn, plain) = send_data(&mut conn);
+    assert_eq!(limits(&plain), [(4, 96)]);
+    acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+    assert_eq!(conn.finished, 3);
+    assert_eq!(conn.data_seen, 128);
+    body.clear();
+    frame::put_stream(&mut body, 4, 32, false, &[0; 32]);
+    conn.recv(&mut peer_data_packet(&conn, 12, &body)).unwrap();
+    let (pn, plain) = send_data(&mut conn);
+    assert_eq!(limits(&plain), [(4, 128)]);
+    acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+    conn.on_stream(4, 64, b"", true).unwrap();
+    let (pn, plain) = send_data(&mut conn);
+    assert!(limits(&plain).is_empty());
+    acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
+    assert_eq!((conn.finished, conn.data_seen), (4, 160));
+    assert!(conn.receive_credit.is_none());
+    assert!(conn.timeout().is_none());
+}
