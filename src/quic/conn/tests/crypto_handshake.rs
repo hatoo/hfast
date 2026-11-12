@@ -636,3 +636,40 @@ fn encrypted_nonminimal_scalars_preserve_peer_credit_and_complete_normally() {
         peer.complete(&mut conn);
     }
 }
+
+#[test]
+fn encrypted_crypto_multiple_gaps_preserve_tls_transcript() {
+    fn send_gaps(peer: &mut Peer, conn: &mut Connection, space: Space, input: &[u8], chunk: usize) {
+        let chunks = input.len().div_ceil(chunk);
+        // Queue islands first, then close the gaps one at a time. Each range
+        // overlaps its successor and is repeated in a fresh encrypted packet.
+        let order = (0..chunks)
+            .filter(|i| i % 2 == 1)
+            .rev()
+            .chain((0..chunks).filter(|i| i % 2 == 0));
+        for i in order {
+            let start = i * chunk;
+            let end = (start + chunk + 1).min(input.len());
+            let mut body = Vec::new();
+            frame::put_crypto(&mut body, start as u64, &input[start..end]);
+            for _ in 0..2 {
+                peer.send(conn, space, &body);
+                assert!(conn.spaces[space as usize].crypto_in.read().is_empty());
+            }
+        }
+    }
+
+    for chunk in [1, 7, 96] {
+        let (mut conn, mut peer) = Peer::unstarted(tls_tickets::client_params());
+        let mut hello = Vec::new();
+        assert!(peer.tls.write_hs(&mut hello).is_none());
+        send_gaps(&mut peer, &mut conn, Space::Initial, &hello, chunk);
+        assert!(conn.connected);
+        peer.drain(&mut conn);
+        assert!(!peer.tls.is_handshaking());
+        let finished = peer.finished.clone();
+        send_gaps(&mut peer, &mut conn, Space::Handshake, &finished, chunk);
+        assert!(!conn.tls.is_handshaking());
+        peer.complete(&mut conn);
+    }
+}
