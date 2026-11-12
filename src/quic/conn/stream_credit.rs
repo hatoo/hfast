@@ -165,6 +165,140 @@ impl StreamCredits {
 mod tests {
     use super::*;
 
+    fn decoded_limits(body: &[u8]) -> Vec<(u64, u64)> {
+        frame::Frames::new(body)
+            .map(|frame| match frame.unwrap() {
+                frame::Frame::MaxStreamData { id, limit } => (id, limit),
+                other => panic!("unexpected credit frame: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cancelled_entries_and_reused_ids_keep_fifo_and_exact_room() {
+        let mut credits = StreamCredits::new(64);
+        let ids = (0..128).map(|n| n * 4).collect::<Vec<_>>();
+        for &id in &ids {
+            credits.update(id, 32);
+        }
+        // Cancel head, tail and interior entries. Reusing an ID here is also a
+        // stronger queue contract than QUIC's terminal stream lifecycle needs.
+        for &id in ids.iter().step_by(2).chain(ids.last()) {
+            credits.remove(id);
+            credits.remove(id);
+        }
+        let mut expected = ids
+            .iter()
+            .copied()
+            .filter(|id| id % 8 == 4 && *id != 508)
+            .map(|id| (id, 96))
+            .collect::<Vec<_>>();
+        for &id in ids.iter().step_by(2).rev() {
+            credits.update(id, 64);
+            credits.update(id, 48); // A duplicate cannot lower or reorder it.
+            expected.push((id, 128));
+        }
+        credits.update(MAX_STREAM_OFFSET, 32);
+        expected.push((MAX_STREAM_OFFSET, 96));
+        let mut body = vec![0; 7];
+        credits.write(&mut body, 10, 1);
+        assert_eq!(body, [0; 7], "no room for the first update");
+        assert_eq!(credits.limit(expected[0].0), 64);
+        assert!(!credits.in_flight());
+        let mut actual = Vec::new();
+        let mut pn = 2;
+        while credits.owed() {
+            body.clear();
+            credits.write(&mut body, 23, pn);
+            assert!(!body.is_empty());
+            assert!(body.len() <= 23);
+            actual.extend(decoded_limits(&body));
+            assert!(credits.on_ack(pn, 0, &[]));
+            assert!(!credits.in_flight());
+            pn += 1;
+        }
+        assert_eq!(actual, expected);
+        for (id, limit) in expected {
+            assert_eq!(credits.limit(id), limit);
+            credits.remove(id);
+        }
+        assert!(credits.is_empty());
+        assert!(!credits.owed());
+    }
+
+    #[test]
+    fn sparse_ack_cancellation_keeps_new_increase_and_reused_queue_slots() {
+        let mut credits = StreamCredits::new(64);
+        let mut body = Vec::new();
+        for (id, pn) in [(0, 10), (4, 11), (8, 12)] {
+            credits.update(id, 32);
+            body.clear();
+            credits.write(&mut body, 4, pn);
+            assert_eq!(decoded_limits(&body), [(id, 96)]);
+        }
+        credits.on_timeout();
+        credits.on_timeout(); // Exactly one pending retry per stream.
+        credits.update(4, 64);
+        // ACK 12 and 10, with a hole at 11. Cancel two retries in one pass.
+        assert!(credits.on_ack(12, 0, &[0, 0]));
+        assert_eq!(credits.flights, 1);
+        assert!(credits.owed());
+        credits.update(0, 64);
+        credits.remove(8);
+        assert!(credits.on_ack(11, 0, &[]));
+        assert!(!credits.in_flight());
+        body.clear();
+        credits.write(&mut body, 8, 20);
+        assert_eq!(decoded_limits(&body), [(4, 128), (0, 128)]);
+        assert!(!credits.owed());
+        assert_eq!(credits.flights, 2);
+        credits.on_timeout();
+        assert!(
+            !credits.on_ack(12, 2, &[]),
+            "old ACK cannot deliver a new limit"
+        );
+        assert!(credits.owed());
+        assert!(credits.on_ack(20, 0, &[]));
+        assert!(!credits.owed());
+        assert!(!credits.in_flight());
+        credits.on_timeout();
+        assert!(!credits.owed());
+        for id in [0, 4] {
+            credits.remove(id);
+        }
+        assert!(credits.is_empty());
+    }
+
+    #[test]
+    fn cancelled_cohorts_leave_no_output_or_flight_after_reuse() {
+        let mut credits = StreamCredits::new(64);
+        let mut body = Vec::new();
+        for round in 0..6 {
+            for n in 0..2048 {
+                credits.update(n * 4, 32);
+            }
+            if round % 2 == 0 {
+                for n in 0..2048 {
+                    credits.remove(n * 4);
+                }
+            } else {
+                for n in (0..2048).rev() {
+                    credits.remove(n * 4);
+                }
+            }
+            assert!(credits.is_empty());
+            assert!(!credits.owed());
+            assert!(!credits.in_flight());
+            credits.write(&mut body, 1200, round);
+            assert!(body.is_empty());
+        }
+        credits.update(0, 32);
+        credits.write(&mut body, 4, 10);
+        assert_eq!(decoded_limits(&body), [(0, 96)]);
+        assert!(credits.on_ack(10, 0, &[]));
+        assert!(!credits.in_flight());
+    }
+
     #[test]
     fn repeated_loss_has_bounded_history_and_retains_recent_late_acks() {
         let mut credits = StreamCredits::new(64);
