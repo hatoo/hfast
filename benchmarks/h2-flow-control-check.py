@@ -696,13 +696,49 @@ def appended_blocked(port, fragmented):
         peer.close()
 
 
+def unchanged_settings(port, fragmented):
+    peer = Peer(port, initial=5, fragmented=fragmented)
+    try:
+        streams = [peer.request() for _ in range(64)]
+        peer.exchange()
+        for stream in streams:
+            peer.expect(stream, 5)
+        peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0})
+        peer.exchange()
+        for stream in streams[::7]:
+            peer.client.reset_stream(stream)
+        active = [stream for stream in streams if stream not in streams[::7]]
+        for _ in range(8):
+            peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0})
+        peer.exchange()
+        assert peer.settings_acks == 11
+        for stream in active:
+            peer.expect(stream, 5)
+        # One frame mixes unchanged and changed entries. Register its final
+        # value with hyper-h2, which independently validates returned credit.
+        peer.client.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 13})
+        queued = peer.client.data_to_send()
+        assert len(queued) == 15 and queued[3] == 4
+        values = [0, 0, 7, 7, 13, 13]
+        payload = b"".join(b"\x00\x04" + n.to_bytes(4, "big") for n in values)
+        peer.exchange(extra=frame(4, 0, payload))
+        assert peer.settings_acks == 12
+        for stream in active:
+            peer.expect(stream, 13, True)
+        return {"case": "unchanged-settings", "fragmented": fragmented,
+                "replies": len(active), "cancelled": len(streams) - len(active),
+                "settings_acks": peer.settings_acks}
+    finally:
+        peer.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--case", choices=["stream-zero", "connection", "settings",
                                           "header-table", "header-table-order", "header-table-pending", "header-table-backpressure",
                                           "invalid", "pending-queue", "connection-trickle", "sparse-readiness", "appended-blocked", "backpressure",
-                                          "all"], default="all")
+                                          "unchanged-settings", "all"], default="all")
     args = parser.parse_args()
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -730,6 +766,7 @@ def main():
                       "connection-trickle": connection_trickle,
                       "sparse-readiness": sparse_readiness,
                       "appended-blocked": appended_blocked,
+                      "unchanged-settings": unchanged_settings,
                       "backpressure": backpressure}
             results = [check(port, fragmented) for name, check in checks.items()
                        if args.case in [name, "all"]

@@ -227,6 +227,12 @@ impl Conn {
                                     if value > MAX_WINDOW {
                                         return self.fail(out, buf.len(), FLOW_CONTROL_ERROR);
                                     }
+                                    // An unchanged limit cannot affect any stream's
+                                    // credit. Still process later settings and ACK
+                                    // this frame, without walking the pending queue.
+                                    if value == self.initial_window {
+                                        continue;
+                                    }
                                     let delta = value as i32 - self.initial_window as i32;
                                     for response in &mut self.pending {
                                         if response.sent as usize == BODY.len() {
