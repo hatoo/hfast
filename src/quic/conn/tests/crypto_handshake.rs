@@ -221,6 +221,108 @@ impl Peer {
 }
 
 #[test]
+fn encrypted_crypto_input_fragments_preserve_tls_transcript_and_retirement() {
+    for chunk in [1, 7, 64, usize::MAX] {
+        for reverse in [false, true] {
+            let (mut conn, mut peer) = Peer::unstarted(tls_tickets::client_params());
+            let mut hello = Vec::new();
+            assert!(peer.tls.write_hs(&mut hello).is_none());
+            send_crypto_fragments(&mut peer, &mut conn, Space::Initial, &hello, chunk, reverse);
+            assert!(conn.connected);
+            assert!(conn.tls.is_handshaking());
+            peer.drain(&mut conn);
+            assert!(!peer.tls.is_handshaking());
+            let finished = peer.finished.clone();
+            assert!(!finished.is_empty());
+            send_crypto_fragments(
+                &mut peer,
+                &mut conn,
+                Space::Handshake,
+                &finished,
+                chunk,
+                reverse,
+            );
+            assert!(!conn.tls.is_handshaking());
+            assert!(conn.initial.is_none() && conn.handshake.is_none());
+            // Includes a late duplicate Finished, a complete authenticated
+            // response and ACK retirement, with no outstanding recovery timer.
+            peer.complete(&mut conn);
+        }
+    }
+}
+
+fn send_crypto_fragments(
+    peer: &mut Peer,
+    conn: &mut Connection,
+    space: Space,
+    input: &[u8],
+    chunk: usize,
+    reverse: bool,
+) {
+    let mut offsets: Vec<_> = (0..input.len()).step_by(chunk).collect();
+    if reverse {
+        offsets.reverse();
+    }
+    for offset in offsets {
+        let end = offset.saturating_add(chunk).min(input.len());
+        let mut body = Vec::new();
+        frame::put_crypto(&mut body, offset as u64, &input[offset..end]);
+        // A new authenticated packet repeats the same CRYPTO range, rather
+        // than relying on packet-number duplicate filtering to hide it.
+        for _ in 0..2 {
+            peer.send(conn, space, &body);
+            assert!(conn.spaces[space as usize].crypto_in.read().is_empty());
+        }
+        body.clear();
+        let overlap = offset.saturating_sub(1);
+        frame::put_crypto(
+            &mut body,
+            overlap as u64,
+            &input[overlap..end.saturating_add(1).min(input.len())],
+        );
+        peer.send(conn, space, &body);
+        assert!(conn.spaces[space as usize].crypto_in.read().is_empty());
+    }
+    // Already-consumed overlaps and empty frames must not feed TLS again.
+    let mut body = Vec::new();
+    frame::put_crypto(&mut body, 0, &[]);
+    frame::put_crypto(
+        &mut body,
+        (input.len() / 2) as u64,
+        &input[input.len() / 2..],
+    );
+    peer.send(conn, space, &body);
+    assert!(conn.spaces[space as usize].crypto_in.read().is_empty());
+}
+
+#[test]
+fn encrypted_crypto_tls_errors_consume_assembled_input_once() {
+    for reverse in [false, true] {
+        let (mut conn, mut peer) = Peer::unstarted(tls_tickets::client_params());
+        // Unknown TLS handshake message, split across the message header.
+        let invalid = [0xff, 0, 0, 0];
+        let offsets = if reverse { [2, 0] } else { [0, 2] };
+        for (step, offset) in offsets.into_iter().enumerate() {
+            let mut body = Vec::new();
+            frame::put_crypto(&mut body, offset as u64, &invalid[offset..offset + 2]);
+            let mut packet = peer.packet(&conn, Space::Initial, &body);
+            let result = conn.recv(&mut packet);
+            assert_eq!(result.is_err(), step == 1);
+            assert!(conn.spaces[0].crypto_in.read().is_empty());
+            assert!(!conn.connected);
+            assert!(conn.handshake.is_none() && conn.one_rtt_local.is_none());
+        }
+        // Reassembly remembers the consumed offset even when TLS rejected it.
+        // A new packet repeating those bytes cannot resubmit the invalid input.
+        let mut body = Vec::new();
+        frame::put_crypto(&mut body, 0, &invalid);
+        peer.send(&mut conn, Space::Initial, &body);
+        assert!(conn.spaces[0].crypto_in.read().is_empty());
+        assert!(!conn.connected);
+    }
+}
+
+#[test]
 fn encrypted_large_crypto_output_preserves_transcript_and_late_ack_recovery() {
     for padding in [0, 2048, 60 * 1024] {
         let key_pair = rcgen::KeyPair::generate().unwrap();
