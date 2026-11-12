@@ -419,8 +419,10 @@ impl Conn {
             return;
         }
         // A grant covering every remaining body can retire them in one pass.
+        // Only start at the front: a later cursor already proves the prefix
+        // blocked, and rescanning it on each appended request is quadratic.
         // Every survivor then has exhausted its stream credit.
-        if (self.send_window as usize) / BODY.len() >= self.pending.len() {
+        if self.resume_at == 0 && (self.send_window as usize) / BODY.len() >= self.pending.len() {
             if self.retired == 0 {
                 self.pending
                     .retain_mut(|response| !send_body(out, &mut self.send_window, response));

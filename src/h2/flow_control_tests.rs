@@ -223,6 +223,155 @@ fn ordinary_responses_never_allocate_pending_state() {
 }
 
 #[test]
+fn ample_connection_credit_preserves_appended_blocked_and_partial_responses() {
+    let mut conn = fresh(0);
+    for stream in (1..=255).step_by(2) {
+        assert_eq!(
+            deliver(&mut conn, &request(stream)),
+            response_headers(stream)
+        );
+    }
+    // Move the deque's head, leave interior holes, then refill past its end.
+    for stream in (1..=127).step_by(2) {
+        assert!(deliver(&mut conn, &frame(3, 0, stream, &[0; 4])).is_empty());
+    }
+    for stream in [137, 171, 203] {
+        assert!(deliver(&mut conn, &frame(3, 0, stream, &[0; 4])).is_empty());
+    }
+    assert!(deliver(&mut conn, &credit(0, 100_000)).is_empty());
+    let mut partial = Vec::new();
+    for stream in (257..=511).step_by(2) {
+        assert_eq!(
+            deliver(&mut conn, &request(stream)),
+            response_headers(stream)
+        );
+        assert!(deliver(&mut conn, &credit(0, 1)).is_empty());
+        assert_eq!(conn.resume_at, conn.pending.len());
+        if stream % 8 == 1 {
+            assert_eq!(
+                deliver(&mut conn, &credit(stream, 5)),
+                frame(0, 0, stream, b"Hello")
+            );
+            partial.push(stream);
+        }
+    }
+    assert!(!conn.pending.as_slices().1.is_empty());
+    let mut expected = frame(4, 1, 0, b"");
+    for stream in (129..=511)
+        .step_by(2)
+        .filter(|s| ![137, 171, 203].contains(s))
+    {
+        expected.extend(frame(
+            0,
+            1,
+            stream,
+            if partial.contains(&stream) {
+                b", World!"
+            } else {
+                BODY
+            },
+        ));
+    }
+    assert_eq!(deliver(&mut conn, &setting(13)), expected);
+    assert!(conn.pending.is_empty());
+    assert_eq!(
+        conn.send_window,
+        INITIAL_WINDOW + 100_000 + 128 - (192 - 3) * 13
+    );
+}
+
+#[test]
+fn ample_grant_finishes_ready_suffix_and_later_reactivates_negative_prefix() {
+    let mut conn = fresh(5);
+    for stream in [1, 3, 5] {
+        assert_eq!(
+            deliver(&mut conn, &request(stream)),
+            [response_headers(stream), frame(0, 0, stream, b"Hello")].concat()
+        );
+    }
+    deliver(&mut conn, &setting(0));
+    assert!(deliver(&mut conn, &credit(0, 1)).is_empty());
+    assert_eq!(conn.resume_at, 3);
+    // A new ready suffix is appended while connection credit is exhausted.
+    conn.send_window = 0;
+    for stream in [7, 9, 11] {
+        assert_eq!(
+            deliver(&mut conn, &request(stream)),
+            response_headers(stream)
+        );
+        assert!(deliver(&mut conn, &credit(stream, 13)).is_empty());
+    }
+    assert_eq!(
+        deliver(&mut conn, &credit(0, 1000)),
+        [
+            frame(0, 1, 7, BODY),
+            frame(0, 1, 9, BODY),
+            frame(0, 1, 11, BODY)
+        ]
+        .concat()
+    );
+    assert_eq!(conn.send_window, 961);
+    assert_eq!(conn.pending.len(), 3);
+    assert_eq!(conn.resume_at, 3);
+    assert!(deliver(&mut conn, &credit(3, 5)).is_empty());
+    assert_eq!(
+        deliver(&mut conn, &credit(3, 8)),
+        frame(0, 1, 3, b", World!")
+    );
+    assert!(deliver(&mut conn, &frame(3, 0, 1, &[0; 4])).is_empty());
+    assert_eq!(
+        deliver(&mut conn, &setting(13)),
+        [frame(4, 1, 0, b""), frame(0, 1, 5, b", World!")].concat()
+    );
+    assert_eq!(conn.send_window, 945);
+    assert!(conn.pending.is_empty());
+}
+
+#[test]
+fn ample_grant_matches_wire_model_for_each_cursor_and_retired_slot() {
+    for prefix in 0..12 {
+        for cancelled in 0..12 {
+            let mut conn = fresh(0);
+            for stream in (1..24).step_by(2) {
+                deliver(&mut conn, &request(stream));
+            }
+            // Mark an arbitrary retired slot, including either end.
+            deliver(&mut conn, &frame(3, 0, cancelled * 2 + 1, &[0; 4]));
+            deliver(&mut conn, &credit(0, 1));
+            conn.send_window = 0;
+            for index in prefix..12 {
+                deliver(&mut conn, &credit(index * 2 + 1, 7));
+            }
+            let mut expected = Vec::new();
+            for index in prefix..12 {
+                if index != cancelled {
+                    expected.extend(frame(0, 0, index * 2 + 1, b"Hello, "));
+                }
+            }
+            assert_eq!(
+                deliver(&mut conn, &credit(0, 1000)),
+                expected,
+                "prefix {prefix}, cancelled {cancelled}"
+            );
+            let mut expected = frame(4, 1, 0, b"");
+            for index in 0..12 {
+                if index != cancelled {
+                    expected.extend(frame(
+                        0,
+                        1,
+                        index * 2 + 1,
+                        if index < prefix { BODY } else { b"World!" },
+                    ));
+                }
+            }
+            assert_eq!(deliver(&mut conn, &setting(13)), expected);
+            assert_eq!(conn.send_window, 1000 - 11 * 13);
+            assert!(conn.pending.is_empty());
+        }
+    }
+}
+
+#[test]
 fn zero_and_overflowing_stream_updates_reset_only_the_affected_stream() {
     for (initial, first, increment, error) in [(0, 0, 0, 1_u32), (65535, MAX_WINDOW - 65535, 1, 3)]
     {
