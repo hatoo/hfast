@@ -1,4 +1,4 @@
-//! Exact fully sent response cancellation workload. No production code changes.
+//! Exact fully sent and unsent cancellation workloads. No production code changes.
 #![allow(dead_code)]
 mod clock;
 mod quic;
@@ -85,13 +85,17 @@ impl Batch {
 const CANCEL_ERROR: u64 = 0x10c;
 
 // Reject missing, duplicate, unsolicited and corrupt resets independently of
-// response accounting. Every timing reset must refer to a fully sent response.
+// response accounting. The workload selects the exact expected final send size.
 struct ResetBatch {
     expected: BTreeSet<u64>,
     seen: BTreeSet<u64>,
+    final_size: u64,
 }
 impl ResetBatch {
     fn new(ids: &[u64]) -> Result<Self> {
+        Self::with_size(ids, RESPONSE.len() as u64)
+    }
+    fn with_size(ids: &[u64], final_size: u64) -> Result<Self> {
         let expected: BTreeSet<_> = ids.iter().copied().collect();
         ensure!(
             !ids.is_empty() && expected.len() == ids.len(),
@@ -100,13 +104,14 @@ impl ResetBatch {
         Ok(Self {
             expected,
             seen: BTreeSet::new(),
+            final_size,
         })
     }
     fn reset(&mut self, id: u64, error: u64, final_size: u64) -> Result<()> {
         ensure!(self.expected.contains(&id), "unsolicited reset {id}");
         ensure!(error == CANCEL_ERROR, "wrong reset error {error}");
         ensure!(
-            final_size == RESPONSE.len() as u64,
+            final_size == self.final_size,
             "wrong reset final size {final_size}"
         );
         ensure!(self.seen.insert(id), "duplicate reset {id}");
@@ -128,6 +133,15 @@ fn put_stops(payload: &mut Vec<u8>, ids: &[u64], error: u64) {
         put_varint(payload, 5);
         put_varint(payload, id);
         put_varint(payload, error);
+    }
+}
+
+fn put_receive_resets(payload: &mut Vec<u8>, ids: &[u64], final_size: u64) {
+    for &id in ids {
+        put_varint(payload, 4);
+        put_varint(payload, id);
+        put_varint(payload, CANCEL_ERROR);
+        put_varint(payload, final_size);
     }
 }
 
@@ -203,6 +217,7 @@ struct Peer {
     max_data: u64,
     sent_data: u64,
     completed: usize,
+    cancelled: usize,
     reset_count: usize,
     resets: Option<ResetBatch>,
     packet_count: usize,
@@ -274,6 +289,7 @@ impl Peer {
             max_data,
             sent_data: 0,
             completed: 0,
+            cancelled: 0,
             reset_count: 0,
             resets: None,
             packet_count: 0,
@@ -459,6 +475,168 @@ impl Peer {
         )
     }
 
+    fn timed_request(
+        &mut self,
+        count: usize,
+        ranges: &[(u64, u64)],
+        samples: &mut Vec<u64>,
+    ) -> Result<u64> {
+        let start = Instant::now();
+        let pn = self.request(count, ranges)?;
+        // Each batch must complete in one authenticated packet. All members
+        // share the instant when that packet's entire response set is checked.
+        samples.extend(std::iter::repeat_n(
+            start.elapsed().as_nanos() as u64,
+            count,
+        ));
+        Ok(pn)
+    }
+
+    fn incomplete_requests(&mut self, count: usize) -> Result<()> {
+        ensure!(self.next_stream / 4 + count as u64 <= self.stream_limit);
+        self.sent_data += (count * self.request.len()) as u64;
+        ensure!(
+            self.sent_data <= self.max_data,
+            "connection credit exceeded"
+        );
+        let mut payload = Vec::with_capacity(1200);
+        for i in 0..count {
+            frame::put_stream(
+                &mut payload,
+                self.next_stream + 4 * i as u64,
+                0,
+                false,
+                &self.request,
+            );
+        }
+        let sent = self.send(&payload)?;
+        self.next_stream += 4 * count as u64;
+        // An authenticated ACK proves these requests were processed. Any
+        // response byte is an error, including a response to a cancelled ID.
+        while self.acked_through.is_none_or(|pn| pn < sent) {
+            let (_, ack_only) = self.receive(None)?;
+            ensure!(ack_only, "incomplete request produced output");
+        }
+        Ok(())
+    }
+
+    fn unsent_cycle(
+        &mut self,
+        window: usize,
+        cancellations: usize,
+        batch_size: usize,
+        stop_batch: usize,
+        pid: u32,
+    ) -> Result<Value> {
+        let mut response_samples = Vec::with_capacity(window * 2 + 1);
+        let mut cancellation_samples = Vec::with_capacity(cancellations);
+        let before = cpu(pid)?;
+        let start = Instant::now();
+        let completed_before = self.completed;
+        let cancelled_before = self.cancelled;
+        let resets_before = self.reset_count;
+        let packets_before = self.packet_count;
+        let sent_before = self.sent_packets.len();
+        let bytes_before = self.sent_data;
+        let mut outstanding = VecDeque::<(u64, usize)>::new();
+        let mut count = 0;
+        let mut batches = 0;
+        while count < window {
+            let progress = if batches > 0 && batches % 64 == 0 {
+                let (pn, n) = outstanding.pop_front().context("missing oldest packet")?;
+                count -= n;
+                Some(pn)
+            } else {
+                None
+            };
+            let n = batch_size.min(window - count);
+            let ack = progress.map(|pn| vec![(0, pn)]).unwrap_or_default();
+            let pn = self.timed_request(n, &ack, &mut response_samples)?;
+            outstanding.push_back((pn, n));
+            count += n;
+            batches += 1;
+            self.check_credit(self.completed + cancelled_before - count)?;
+        }
+        ensure!(count == window);
+        let retired_before_ack = self.completed + cancelled_before - window;
+        self.check_credit(retired_before_ack)?;
+        // Do not acknowledge any live response. This authenticated processing
+        // fence and the later request ACKs prove priming preceded cancellation.
+        let (_, ack_only) = self.ping(None)?;
+        ensure!(ack_only, "priming fence produced unexpected output");
+        let first = self.next_stream;
+        let ids: Vec<_> = (0..cancellations).map(|i| first + 4 * i as u64).collect();
+        for chunk in ids.chunks(batch_size) {
+            self.incomplete_requests(chunk.len())?;
+        }
+        self.check_credit(retired_before_ack)?;
+        let cancel_start = Instant::now();
+        for chunk in ids.chunks(stop_batch) {
+            let mut payload = Vec::with_capacity(1200);
+            put_stops(&mut payload, chunk, CANCEL_ERROR);
+            // Finish the independent receive side at its exact received size.
+            // No response or reset is ACKed until all cancellations are done.
+            put_receive_resets(&mut payload, chunk, self.request.len() as u64);
+            self.resets = Some(ResetBatch::with_size(chunk, 0)?);
+            let reset_start = Instant::now();
+            let sent = self.send(&payload)?;
+            loop {
+                self.receive(None)?;
+                if self.acked_through.is_some_and(|pn| pn >= sent)
+                    && self.resets.as_ref().unwrap().complete().is_ok()
+                {
+                    break;
+                }
+            }
+            self.resets.take().unwrap().complete()?;
+            cancellation_samples.extend(std::iter::repeat_n(
+                reset_start.elapsed().as_nanos() as u64,
+                chunk.len(),
+            ));
+        }
+        ensure!(self.reset_count - resets_before == cancellations);
+        self.check_credit(retired_before_ack)?;
+        let advertised_before_reset_ack = self.stream_limit;
+        self.cancelled += cancellations;
+        // ACK all ordinary responses and zero-size resets. A fresh HTTP
+        // response fences retirement; its own ACK is included in cycle time.
+        self.timed_request(1, &[(0, self.last_received)], &mut response_samples)?;
+        self.check_credit(self.completed + self.cancelled - 1)?;
+        let cancellation_seconds = cancel_start.elapsed().as_secs_f64();
+        self.ping(Some(self.last_received))?;
+        self.check_credit(self.completed + self.cancelled)?;
+        let (_, ack_only) = self.ping(Some(self.last_received))?;
+        ensure!(ack_only, "final credit ACK did not drain control state");
+        self.check_credit(self.completed + self.cancelled)?;
+        ensure!(
+            self.acked_through
+                .is_some_and(|pn| *self.sent_packets.last().unwrap() <= pn)
+        );
+        empty_socket(&self.socket)?;
+        let seconds = start.elapsed().as_secs_f64();
+        let after = cpu(pid)?;
+        let responses = self.completed - completed_before;
+        ensure!(response_samples.len() == responses && cancellation_samples.len() == cancellations);
+        Ok(json!({
+            "responses":responses, "cancelled_requests":cancellations,
+            "resets":cancellations, "receive_resets":cancellations,
+            "reset_acks":cancellations, "retired_streams":responses+cancellations,
+            "seconds":seconds, "cancellation_seconds":cancellation_seconds,
+            "server_cpu_seconds":after-before, "window":window, "survivors":window,
+            "prime_responses":responses-1, "followup_responses":1,
+            "credit_before_reset_ack":advertised_before_reset_ack,
+            "completed_before_reset_ack":retired_before_ack,
+            "advertised_stream_limit":self.stream_limit,
+            "unadvertised_credit":self.initial_limit+(self.completed+self.cancelled) as u64-self.stream_limit,
+            "sent_request_bytes":self.sent_data-bytes_before,
+            "receive_reset_final_bytes":cancellations*self.request.len(),
+            "response_latency_ns":response_samples, "cancellation_latency_ns":cancellation_samples,
+            "received_packets":self.packet_count-packets_before,
+            "sent_packets":self.sent_packets.len()-sent_before,
+            "leftover_datagrams":0, "outstanding_responses":0, "outstanding_resets":0
+        }))
+    }
+
     fn cycle(
         &mut self,
         window: usize,
@@ -468,6 +646,9 @@ impl Peer {
         pid: u32,
         mode: &str,
     ) -> Result<Value> {
+        if mode == "unsent" {
+            return self.unsent_cycle(window, cancellations, batch_size, stop_batch, pid);
+        }
         let before = cpu(pid)?;
         let start = Instant::now();
         let completed_before = self.completed;
@@ -597,8 +778,8 @@ impl Peer {
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     ensure!(
-        args.len() == 9,
-        "usage: peer PORT PID WINDOW CANCELS REQUEST_BATCH STOP_BATCH CYCLES MODE"
+        (9..=10).contains(&args.len()),
+        "usage: peer PORT PID WINDOW CANCELS REQUEST_BATCH STOP_BATCH CYCLES MODE [WARMUP_CYCLES]"
     );
     let port = args[1].parse()?;
     let pid = args[2].parse()?;
@@ -608,6 +789,12 @@ fn main() -> Result<()> {
     let stop_batch: usize = args[6].parse()?;
     let cycles: usize = args[7].parse()?;
     let mode = args[8].as_str();
+    let warmup_cycles: usize = args.get(9).map(|s| s.parse()).transpose()?.unwrap_or(1);
+    ensure!((1..=4096).contains(&warmup_cycles));
+    ensure!(
+        warmup_cycles == 1 || mode == "unsent",
+        "extra warmup requires unsent mode"
+    );
     ensure!(
         (64..=65536).contains(&window)
             && (1..=32).contains(&batch)
@@ -616,7 +803,10 @@ fn main() -> Result<()> {
             && cycles > 0
     );
     ensure!(
-        matches!(mode, "plain" | "repeat" | "stop-ack" | "ack-stop"),
+        matches!(
+            mode,
+            "plain" | "repeat" | "stop-ack" | "ack-stop" | "unsent"
+        ),
         "invalid mode"
     );
     ensure!(
@@ -626,6 +816,10 @@ fn main() -> Result<()> {
     cancellation_ids(0, window, cancellations)?;
     let mut peer = Peer::connect(port, window)?;
     let warmup = peer.cycle(window, cancellations, batch, stop_batch, pid, mode)?;
+    let mut extra_warmup = Vec::new();
+    for _ in 1..warmup_cycles {
+        extra_warmup.push(peer.cycle(window, cancellations, batch, stop_batch, pid, mode)?);
+    }
     let mut rows = Vec::new();
     for _ in 0..cycles {
         rows.push(peer.cycle(window, cancellations, batch, stop_batch, pid, mode)?);
@@ -634,7 +828,10 @@ fn main() -> Result<()> {
         "{}",
         json!({"window":window,"cancellations":cancellations,"batch":batch,
         "stop_batch":stop_batch,"mode":mode,"warmup":warmup,"cycles":rows,
+        "warmup_cycles":warmup_cycles,"extra_warmup":extra_warmup,
         "responses":peer.completed,"resets":peer.reset_count,"errors":0,
+        "cancelled_requests":peer.cancelled,"retired_streams":peer.completed+peer.cancelled,
+        "request_bytes":peer.sent_data-5,"request_size":peer.request.len(),
         "unexpected_packets":0,"duplicate_responses":0,"duplicate_resets":0,
         "initial_stream_limit":peer.initial_limit,"advertised_stream_limit":peer.stream_limit})
     );
@@ -684,6 +881,41 @@ mod peer_tests {
             let mut b = ResetBatch::new(&[0]).unwrap();
             assert!(b.reset(0, error, size).is_err());
             assert!(b.complete().is_err());
+        }
+    }
+    #[test]
+    fn unsent_resets_require_exact_zero_final_size_and_complete_set() {
+        let mut batch = ResetBatch::with_size(&[16, 24], 0).unwrap();
+        assert!(
+            batch
+                .reset(16, CANCEL_ERROR, RESPONSE.len() as u64)
+                .is_err()
+        );
+        assert!(batch.reset(16, CANCEL_ERROR + 1, 0).is_err());
+        batch.reset(16, CANCEL_ERROR, 0).unwrap();
+        assert!(batch.complete().is_err());
+        assert!(batch.reset(16, CANCEL_ERROR, 0).is_err());
+        assert!(batch.reset(20, CANCEL_ERROR, 0).is_err());
+        batch.reset(24, CANCEL_ERROR, 0).unwrap();
+        batch.complete().unwrap();
+    }
+    #[test]
+    fn both_cancellation_directions_fit_one_packet_at_sustained_ids() {
+        for first in [0, 1 << 16, (1 << 30) - 256] {
+            let ids: Vec<_> = (0..64).map(|i| first + i * 4).collect();
+            let mut payload = Vec::new();
+            put_stops(&mut payload, &ids, CANCEL_ERROR);
+            put_receive_resets(&mut payload, &ids, 18);
+            assert!(payload.len() + 32 <= 1200);
+            let parsed: Vec<_> = frame::Iter::new(&payload)
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(parsed.len(), 128);
+            for (f, id) in parsed[64..].iter().zip(&ids) {
+                assert!(
+                    matches!(f, Frame::ResetStream {id: got, error: CANCEL_ERROR, final_size: 18} if got == id)
+                );
+            }
         }
     }
     #[test]

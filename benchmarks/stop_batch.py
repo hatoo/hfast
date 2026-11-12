@@ -27,7 +27,10 @@ def prime_batches(window, batch):
     return count
 
 
-def validate(report, window, cancellations, batch, stop_batch, cycles, mode):
+def validate(report, window, cancellations, batch, stop_batch, cycles, mode, warmup_cycles=1):
+    if mode == "unsent":
+        return validate_unsent(report, window, cancellations, batch, stop_batch, cycles, warmup_cycles)
+    require(warmup_cycles == 1, "extra warmup requires unsent mode")
     require(mode in ("plain", "repeat", "stop-ack", "ack-stop"), "invalid mode")
     require(0 < cancellations <= window and window % cancellations == 0, "invalid cancellations")
     require(1 <= stop_batch <= 64 and cycles > 0, "invalid stop batch/cycles")
@@ -80,6 +83,72 @@ def validate(report, window, cancellations, batch, stop_batch, cycles, mode):
     return report
 
 
+def validate_unsent(report, window, cancellations, batch, stop_batch, cycles, warmup_cycles):
+    """Count HTTP completions separately from both halves of cancelled streams."""
+    nb = prime_batches(window, batch)
+    require(0 < cancellations <= window and window % cancellations == 0,
+            "invalid cancellations")
+    require(1 <= stop_batch <= 64 and cycles > 0, "invalid stop batch/cycles")
+    for key, value in dict(window=window, cancellations=cancellations, batch=batch,
+                           stop_batch=stop_batch, mode="unsent", request_size=18,
+                           warmup_cycles=warmup_cycles).items():
+        require(report[key] == value, f"wrong {key}")
+    for key in ("errors", "unexpected_packets", "duplicate_responses", "duplicate_resets"):
+        require(report[key] == 0, key)
+    require(len(report["cycles"]) == cycles, "missing or extra cycles")
+    require(1 <= warmup_cycles <= 4096 and len(report["extra_warmup"]) == warmup_cycles-1,
+            "missing or extra warmup")
+    responses = nb * batch + 1
+    packets = nb + 1 + (cancellations+batch-1)//batch + (cancellations+stop_batch-1)//stop_batch + 3
+    initial = 2 * window
+    require(report["initial_stream_limit"] == initial, "initial credit")
+    advertised, retired, total_responses, total_cancelled = initial, 0, 0, 0
+
+    def update_credit(completed):
+        nonlocal advertised
+        if initial + completed - advertised >= window:
+            advertised = initial + completed
+        return advertised
+
+    for row in [report["warmup"], *report["extra_warmup"], *report["cycles"]]:
+        for i in range(nb):
+            if i and i % 64 == 0:
+                retired += batch
+                update_credit(retired)
+        for key, value in dict(responses=responses, cancelled_requests=cancellations,
+                               resets=cancellations, receive_resets=cancellations,
+                               reset_acks=cancellations, retired_streams=responses+cancellations,
+                               window=window, survivors=window, prime_responses=responses-1,
+                               followup_responses=1, sent_packets=packets, received_packets=packets,
+                               leftover_datagrams=0, outstanding_responses=0, outstanding_resets=0,
+                               sent_request_bytes=18*(responses+cancellations),
+                               receive_reset_final_bytes=18*cancellations,
+                               completed_before_reset_ack=retired,
+                               credit_before_reset_ack=advertised).items():
+            require(row[key] == value, f"cycle {key}: {row[key]} != {value}")
+        retired += window + cancellations
+        update_credit(retired)
+        retired += 1
+        update_credit(retired)
+        require(row["advertised_stream_limit"] == advertised, "cycle exact stream credit")
+        require(row["unadvertised_credit"] == initial+retired-advertised, "wrong unadvertised credit")
+        total_responses += responses
+        total_cancelled += cancellations
+        for key in ("seconds", "cancellation_seconds", "server_cpu_seconds"):
+            require(math.isfinite(row[key]) and row[key] >= 0, f"invalid {key}")
+        require(0 < row["cancellation_seconds"] < row["seconds"], "invalid cycle duration")
+        for key, count in (("response_latency_ns", responses), ("cancellation_latency_ns", cancellations)):
+            samples = row[key]
+            require(len(samples) == count, f"missing/extra {key}")
+            require(all(type(v) is int and 0 < v < row["seconds"]*1e9 for v in samples),
+                    f"invalid {key}")
+    for key, value in dict(responses=total_responses, cancelled_requests=total_cancelled,
+                           resets=total_cancelled, retired_streams=retired,
+                           request_bytes=18*retired, advertised_stream_limit=advertised).items():
+        require(report[key] == value, f"wrong total {key}")
+    return report
+
+
 def udp():
     lines = Path("/proc/net/snmp").read_text().splitlines()
     for keys, values in zip(lines, lines[1:]):
@@ -97,7 +166,7 @@ def validate_udp(before, after):
 
 
 def run(server_binary, peer, output, window, cancellations, batch, stop_batch, cycles,
-        mode, client_cpu, trace=False):
+        mode, client_cpu, trace=False, warmup_cycles=1):
     output.mkdir(parents=True)  # Never overwrite an earlier run.
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -113,7 +182,7 @@ def run(server_binary, peer, output, window, cancellations, batch, stop_batch, c
             command = ["/usr/bin/time", "-o", str(output / "peer-cpu.txt"), "-f", "%U %S %e %M",
                        "taskset", "-c", str(client_cpu), str(peer), str(port), str(server.pid),
                        str(window), str(cancellations), str(batch), str(stop_batch),
-                       str(cycles), mode]
+                       str(cycles), mode, str(warmup_cycles)]
             (output / "commands.json").write_text(json.dumps(
                 dict(server=server_command, peer=command), indent=2) + "\n")
             env = dict(os.environ)
@@ -125,8 +194,11 @@ def run(server_binary, peer, output, window, cancellations, batch, stop_batch, c
             (output / "stderr").write_text(result.stderr)
             require(result.returncode == 0, f"peer failed: {result.stderr}")
             report = validate(json.loads(result.stdout), window, cancellations, batch,
-                              stop_batch, cycles, mode)
+                              stop_batch, cycles, mode, warmup_cycles)
             require(server.poll() is None, "server exited during run")
+            memory = {line.split()[0].rstrip(":"): int(line.split()[1])
+                      for line in Path(f"/proc/{server.pid}/status").read_text().splitlines()
+                      if line.startswith(("VmRSS:", "VmHWM:"))}
             delta = validate_udp(before, udp())
         finally:
             server.terminate()
@@ -141,6 +213,13 @@ def run(server_binary, peer, output, window, cancellations, batch, stop_batch, c
                   server_cpu_ns_per_response=sum(row["server_cpu_seconds"] for row in measured)
                   * 1e9 / responses,
                   cancellation_seconds=sum(row["cancellation_seconds"] for row in measured)/cycles,
+                  server_rss_kib=memory["VmRSS"], server_peak_rss_kib=memory["VmHWM"],
                   command=command, server_command=server_command)
+    if mode == "unsent":
+        for kind in ("response", "cancellation"):
+            samples = sorted(v for row in measured for v in row[f"{kind}_latency_ns"])
+            report[f"{kind}_samples"] = len(samples)
+            for name, quantile in (("p50", .5), ("p95", .95), ("p99", .99), ("p999", .999)):
+                report[f"{kind}_{name}_ns"] = samples[math.ceil(len(samples)*quantile)-1]
     (output / "report.json").write_text(json.dumps(report, indent=2)+"\n")
     return report

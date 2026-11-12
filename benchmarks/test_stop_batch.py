@@ -25,6 +25,96 @@ def validate(report):
     return s.validate(report, 1024, 64, 32, 64, 1, "plain")
 
 
+def unsent_fixture():
+    # Hand-counted: two full-response batches, one non-ACKing PING, one
+    # incomplete-request batch, one STOP/reset batch, one response, two PINGs.
+    row = dict(responses=65, cancelled_requests=16, resets=16, receive_resets=16,
+               reset_acks=16, retired_streams=81, window=64, survivors=64,
+               prime_responses=64, followup_responses=1, sent_packets=8,
+               received_packets=8, leftover_datagrams=0, outstanding_responses=0,
+               outstanding_resets=0, sent_request_bytes=1458, receive_reset_final_bytes=288,
+               completed_before_reset_ack=0, credit_before_reset_ack=128,
+               advertised_stream_limit=208, unadvertised_credit=1,
+               seconds=.1, cancellation_seconds=.01, server_cpu_seconds=.02,
+               response_latency_ns=[1000]*65, cancellation_latency_ns=[2000]*16)
+    second = {**copy.deepcopy(row), "completed_before_reset_ack": 81,
+              "credit_before_reset_ack": 208, "advertised_stream_limit": 289}
+    return dict(window=64, cancellations=16, batch=32, stop_batch=64, mode="unsent",
+                request_size=18, errors=0, unexpected_packets=0, duplicate_responses=0,
+                duplicate_resets=0, initial_stream_limit=128, responses=130,
+                cancelled_requests=32, resets=32, retired_streams=162, request_bytes=2916,
+                advertised_stream_limit=289, warmup=row, cycles=[second], warmup_cycles=1, extra_warmup=[])
+
+
+def validate_unsent(report):
+    return s.validate(report, 64, 16, 32, 64, 1, "unsent")
+
+
+class UnsentAccountingTests(unittest.TestCase):
+    def test_exact_separate_ledgers(self):
+        validate_unsent(unsent_fixture())
+
+    def test_every_count_and_credit_field_is_checked(self):
+        for scope in ("warmup", "cycle", "final"):
+            original = unsent_fixture()
+            selected = original if scope == "final" else original["warmup"] if scope == "warmup" else original["cycles"][0]
+            for key, value in selected.items():
+                if type(value) is not int:
+                    continue
+                for delta in (-1, 1):
+                    with self.subTest(scope=scope, key=key, delta=delta):
+                        report = copy.deepcopy(original)
+                        target = report if scope == "final" else report["warmup"] if scope == "warmup" else report["cycles"][0]
+                        target[key] += delta
+                        with self.assertRaises(ValueError):
+                            validate_unsent(report)
+
+    def test_samples_cannot_be_lost_duplicated_or_nonfinite(self):
+        for key in ("response_latency_ns", "cancellation_latency_ns"):
+            for change in ("drop", "duplicate", "zero", "negative", "nan", "late"):
+                report = unsent_fixture()
+                samples = report["cycles"][0][key]
+                if change == "drop":
+                    samples.pop()
+                elif change == "duplicate":
+                    samples.append(samples[0])
+                else:
+                    samples[0] = dict(zero=0, negative=-1, nan=float("nan"), late=100_000_000)[change]
+                with self.assertRaises(ValueError):
+                    validate_unsent(report)
+
+    def test_cancelled_streams_are_not_http_successes(self):
+        report = unsent_fixture()
+        report["responses"] += report["cancelled_requests"]
+        with self.assertRaises(ValueError):
+            validate_unsent(report)
+
+    def test_extra_warmup_is_accounted_separately(self):
+        report = unsent_fixture()
+        report["extra_warmup"] = report["cycles"]
+        row = {**copy.deepcopy(report["cycles"][0]), "completed_before_reset_ack": 162,
+               "credit_before_reset_ack": 289, "advertised_stream_limit": 370}
+        report.update(warmup_cycles=2, cycles=[row], responses=195, cancelled_requests=48,
+                      resets=48, retired_streams=243, request_bytes=4374, advertised_stream_limit=370)
+        s.validate(report, 64, 16, 32, 64, 1, "unsent", 2)
+        report["extra_warmup"] = []
+        with self.assertRaises(ValueError):
+            s.validate(report, 64, 16, 32, 64, 1, "unsent", 2)
+
+    def test_missing_cycles_fields_or_invalid_times_fail(self):
+        for key in unsent_fixture():
+            report = unsent_fixture()
+            del report[key]
+            with self.assertRaises((ValueError, KeyError)):
+                validate_unsent(report)
+        for key in ("seconds", "cancellation_seconds", "server_cpu_seconds"):
+            for value in (-1, float("nan"), float("inf")):
+                report = unsent_fixture()
+                report["warmup"][key] = value
+                with self.assertRaises(ValueError):
+                    validate_unsent(report)
+
+
 class AccountingTests(unittest.TestCase):
     def test_exact_fixture_passes(self):
         validate(fixture())

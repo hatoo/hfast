@@ -3,7 +3,8 @@
 This fixture measures complete cycles with a fixed, fully sent response window.
 It exercises `Connection::stop_sending` with sparse cancellation sets while the
 server still retains response delivery state. It does not estimate ordinary HTTP
-throughput or model a large queue of unsent responses.
+throughput. The separate `unsent` mode cancels other, incomplete requests while
+retaining that response window.
 
 `build-stop-batch-peer.py` extracts shb commit
 `48b2d7e2ca138ea9f69190cd3ae4112058fb56d7` into a new output directory and adds
@@ -91,3 +92,50 @@ CPU from `/proc/PID/stat`. Short runs can have quantized CPU measurements.
 Transcripts and other instrumentation are prohibited during timing. Ordinary
 fixed-client CPU and all reported latency metrics remain a separate publication
 gate for any optimization evaluated with this fixture.
+
+## Incomplete-request cancellations
+
+`--mode unsent` retains 512/4096 fully sent responses and creates 128/1024
+different requests with valid headers and no FIN. A PING without response ACKs
+fences priming; each incomplete-request packet must receive an authenticated
+ACK with no application output. The peer then sends STOP_SENDING and a receive
+RESET_STREAM at the exact request size. Every target must return exactly one
+reset with final send size zero. No target may produce response bytes.
+
+All original responses remain live until every cancellation has completed.
+The final response/ACK/PING fences retire both directions of every stream and
+check exact returned stream credit. Completed HTTP responses, cancelled requests,
+receive resets, server resets, reset ACKs and retired streams have separate
+counters. Cancelled requests never count as HTTP successes. Whole-cycle timing
+includes request creation, processing fences, cancellation and retirement.
+
+The mode retains one latency sample per response and per cancellation, including
+warmup separately. Requests in a single response packet share that packet's
+validation timestamp; cancellations in one STOP batch share the timestamp when
+the full reset set and its processing ACK have arrived. These are explicitly
+batch-completion latencies, not shb's individual-request latency measurements.
+`--warmup-cycles N` can extend the same connection's warmup in this mode; every
+warmup response, cancellation and sample remains validated and exported under
+`warmup`/`extra_warmup`, separate from the measured `cycles`.
+The report validates exact sample counts and exports p50/p95/p99/p99.9 values,
+server CPU and end-of-run RSS/high-water RSS. Timing excludes JSON serialization
+after each cycle, as in the original fixture; sample collection is timed.
+
+The independent decoder checks the unchanged newest-first response order,
+authenticated request/stop fences, a constant live response window, exact request
+final sizes, zero-size response resets and complete ACK retirement. In addition
+to missing/duplicate/corrupt resets, its faults include early retirement, missing
+receive resets, request FIN, missing request/final ACK fences, late reset ACKs,
+and unexpected response bytes on cancelled streams. CI runs the new mode against
+actual UDP drop/duplicate faults as well as existing positive recovery tests.
+
+```sh
+python3 benchmarks/compare-stop-batches.py BASELINE CANDIDATE \
+  /tmp/stop-peer/stop-batch-peer /tmp/unsent-primary \
+  --mode unsent --window 4096 --cancellations 1024 --cycles 64 --pairs 3
+```
+
+Use identical-binary controls and independent reversed confirmation before making
+a performance claim. All original fully sent and frame-order modes remain in the
+correctness matrix. A passing fixture establishes workload integrity; it does
+not itself establish a production performance improvement.

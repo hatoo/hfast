@@ -14,6 +14,7 @@ def main(args):
         (1024, 1, "plain"), (1024, 64, "plain"), (1024, 1024, "plain"),
         (65536, 1, "plain"), (65536, 64, "plain"), (65536, 1024, "plain"),
         (1024, 64, "repeat"), (1024, 64, "stop-ack"), (1024, 64, "ack-stop"),
+        (64, 1, "unsent"), (512, 128, "unsent"), (4096, 1024, "unsent"),
     ]
     rows = []
     for window, cancellations, mode in cases:
@@ -22,6 +23,10 @@ def main(args):
                     32, 64, 2, mode, args.client_cpu)
         rows.append(row)
         print(name, row["responses"], row["resets"], "PASS", flush=True)
+    row = s.run(args.server, args.peer, args.output/"unsent-extra-warmup", 512, 128,
+                8, 7, 3, "unsent", args.client_cpu, warmup_cycles=3)
+    rows.append(row)
+    print("unsent-extra-warmup", row["responses"], row["resets"], "PASS", flush=True)
     s.require(inputs == {k: s.sha(getattr(args, k)) for k in inputs}, "binary changed")
     summary = dict(inputs=inputs, cases=len(rows), errors=0,
                    total_responses=sum(r["responses"] for r in rows),
