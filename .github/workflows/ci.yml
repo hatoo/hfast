@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -223,6 +223,24 @@ jobs:
             "$(command -v python)" benchmarks/stop-batch-fault-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/stop-peer/stop-batch-peer" \
             "$RUNNER_TEMP/unsent-stop-faults" --client-cpu 1 --workload unsent
+      - name: Sustained native receive-credit cancellation contracts
+        env:
+          NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
+        run: |
+          rustfmt --edition 2024 --config skip_children=true --check benchmarks/receive-credit-cancel.rs
+          python -m unittest discover -s benchmarks -p test_receive_credit_cancel.py -v
+          python benchmarks/build-receive-credit-cancel.py .native-peer-shb "$RUNNER_TEMP/receive-credit-cancel-peer"
+          sudo env CANCELLATION_PARENT_NETNS="$(readlink /proc/self/ns/net)" unshare --net sh -c 'ip link set lo up && exec "$@"' receive-credit-cancel \
+            "$(command -v python)" benchmarks/check-receive-credit-cancel.py \
+            "$PWD/target/release/hfast" "$RUNNER_TEMP/receive-credit-cancel-peer/receive-credit-cancel-peer" \
+            "$RUNNER_TEMP/receive-credit-cancel" --warmup 2 --cycles 18 --server-cpu 0 --peer-cpu 1
+      - name: Preserve sustained receive-credit cancellation evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receive-credit-cancel-failure
+          path: ${{ runner.temp }}/receive-credit-cancel
+          retention-days: 7
       - name: QUIC uni credit with gaps and retransmission
         run: python benchmarks/uni-accounting-check.py target/release/hfast
       - name: QUIC cancellation credit and reset recovery
