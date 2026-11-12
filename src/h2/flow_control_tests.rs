@@ -175,6 +175,99 @@ fn settings_never_replenish_the_connection_window() {
 }
 
 #[test]
+fn unchanged_settings_preserve_negative_windows_and_retired_slots() {
+    let mut conn = fresh(5);
+    for stream in (1..32).step_by(2) {
+        deliver(&mut conn, &request(stream));
+    }
+    deliver(&mut conn, &setting(0));
+    for stream in [7, 19] {
+        deliver(&mut conn, &frame(RST_STREAM, 0, stream, &[0; 4]));
+    }
+    assert_eq!(conn.retired, 2);
+    let state = |conn: &Conn| {
+        conn.pending
+            .iter()
+            .map(|p| (p.stream, p.window, p.sent))
+            .collect::<Vec<_>>()
+    };
+    let before = state(&conn);
+    let cursor = conn.resume_at;
+    let connection_credit = conn.send_window;
+    let duplicates = frame(SETTINGS, 0, 0, &[0, 4, 0, 0, 0, 0].repeat(64));
+    for _ in 0..4 {
+        assert_eq!(deliver(&mut conn, &duplicates), frame(SETTINGS, 1, 0, b""));
+        assert_eq!(state(&conn), before);
+        assert_eq!(conn.resume_at, cursor);
+        assert_eq!(conn.send_window, connection_credit);
+    }
+    let expected = std::iter::once(frame(SETTINGS, 1, 0, b""))
+        .chain(
+            (1..32)
+                .step_by(2)
+                .filter(|s| ![7, 19].contains(s))
+                .map(|s| frame(DATA, 1, s, b", World!")),
+        )
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(deliver(&mut conn, &setting(13)), expected);
+    assert_eq!(conn.send_window, connection_credit - 14 * 8);
+    assert!(conn.pending.is_empty());
+}
+
+#[test]
+fn unchanged_settings_still_apply_later_entries_and_ack_once() {
+    let mut conn = fresh(0);
+    deliver(&mut conn, &request(1));
+    deliver(&mut conn, &request(3));
+    let mut payload = Vec::new();
+    for value in [0_u32, 0, 7, 7, 13, 13] {
+        payload.extend_from_slice(&[0, 4]);
+        payload.extend_from_slice(&value.to_be_bytes());
+    }
+    // A different setting after an unchanged window must also take effect.
+    payload.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+    assert_eq!(
+        deliver(&mut conn, &frame(SETTINGS, 0, 0, &payload)),
+        [
+            frame(SETTINGS, 1, 0, b""),
+            frame(DATA, 1, 1, BODY),
+            frame(DATA, 1, 3, BODY),
+        ]
+        .concat()
+    );
+    assert!(matches!(conn.header_table, HeaderTable::ZeroPending));
+    assert_eq!(conn.initial_window, 13);
+    assert_eq!(conn.send_window, INITIAL_WINDOW - 26);
+    assert!(conn.pending.is_empty());
+}
+
+#[test]
+fn unchanged_settings_do_not_hide_later_errors_or_intermediate_overflow() {
+    for (id, value, error) in [
+        (4_u16, MAX_WINDOW + 1, FLOW_CONTROL_ERROR),
+        (2, 2, PROTOCOL_ERROR),
+        (5, 16_383, PROTOCOL_ERROR),
+        (4, 1, FLOW_CONTROL_ERROR),
+    ] {
+        let mut conn = fresh(0);
+        conn.send_window = 0;
+        deliver(&mut conn, &request(1));
+        deliver(&mut conn, &credit(1, MAX_WINDOW));
+        let mut payload = vec![0, 4, 0, 0, 0, 0];
+        payload.extend_from_slice(&id.to_be_bytes());
+        payload.extend_from_slice(&value.to_be_bytes());
+        // Returning to zero cannot hide an earlier invalid value or overflow.
+        payload.extend_from_slice(&[0, 4, 0, 0, 0, 0]);
+        assert_eq!(
+            deliver(&mut conn, &frame(SETTINGS, 0, 0, &payload)),
+            goaway(1, error)
+        );
+        assert!(conn.is_closing());
+    }
+}
+
+#[test]
 fn reset_removes_only_its_unsent_suffix_and_never_refunds_sent_data() {
     let mut conn = fresh(5);
     deliver(&mut conn, &request(1));
