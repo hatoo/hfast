@@ -1002,6 +1002,70 @@ mod tests {
     }
 
     #[test]
+    fn receive_mode_changes_preserve_every_payload_and_sender() {
+        let senders = [socket(), socket()];
+        let receiver = socket();
+        receiver.set_nonblocking(true).unwrap();
+        let to = receiver.local_addr().unwrap();
+        let mut rx = ReceiveBatch::new();
+        for (round, single) in [true, false, true, false, false, true]
+            .into_iter()
+            .enumerate()
+        {
+            let count = if single { 1 } else { BATCH + 3 };
+            let expected: Vec<_> = (0..count)
+                .map(|i| {
+                    let size = [0, 1, 127, 2048][(round + i) % 4];
+                    let payload = vec![(round * 37 + i) as u8; size];
+                    let sender = &senders[i % senders.len()];
+                    sender.send_to(&payload, to).unwrap();
+                    (payload, sender.local_addr().unwrap())
+                })
+                .collect();
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                let messages = rx.receive(&receiver, single).unwrap();
+                assert!(messages > 0, "queued datagrams must make progress");
+                for i in 0..messages {
+                    let (datagrams, from) = rx.datagrams(i);
+                    received.extend(datagrams.map(|data| (data.to_vec(), from)));
+                }
+            }
+            assert_eq!(received, expected, "round {round}");
+            assert_eq!(
+                rx.receive(&receiver, single).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "no duplicate or stale datagrams after round {round}",
+            );
+        }
+    }
+
+    #[test]
+    fn receive_mode_changes_recover_after_empty_socket_errors() {
+        let sender = socket();
+        let receiver = socket();
+        receiver.set_nonblocking(true).unwrap();
+        let mut rx = ReceiveBatch::new();
+        for (round, single) in [true, false, true, false].into_iter().enumerate() {
+            // An empty-socket error in either mode must leave the receiver
+            // ready to return the next datagram with its full payload.
+            assert_eq!(
+                rx.receive(&receiver, single).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+            );
+            let payload = vec![round as u8; 65_000];
+            sender
+                .send_to(&payload, receiver.local_addr().unwrap())
+                .unwrap();
+            assert_eq!(rx.receive(&receiver, single).unwrap(), 1);
+            let (mut datagrams, from) = rx.datagrams(0);
+            assert_eq!(datagrams.next().unwrap(), payload);
+            assert!(datagrams.next().is_none());
+            assert_eq!(from, sender.local_addr().unwrap());
+        }
+    }
+
+    #[test]
     fn receive_returns_partial_batch_and_idle_timeout() {
         let sender = socket();
         let receiver = socket();
