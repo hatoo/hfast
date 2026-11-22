@@ -12,14 +12,18 @@ def main(args):
     available = sorted(os.sched_getaffinity(0) - {0}) or sorted(os.sched_getaffinity(0))
     cpus = [available[i % len(available)] for i in range(4)]
     rows = []
+    cases = [(mode, 0) for mode in ('normal', 'reverse', 'overlap-duplicates')]
+    if args.empty_prefixes:
+        cases.extend((mode, n) for mode in ('normal', 'reverse') for n in (1, 32, 512))
     for producers in (1, 4):
-        for mode in ('normal', 'reverse', 'overlap-duplicates'):
+        for mode, empty_prefix in cases:
             for gro in (True, False):
                 result = c.run(args.server, args.peer,
-                               args.output / f'p{producers}-{mode}-gro{int(gro)}',
+                               args.output / f'p{producers}-{mode}-empty{empty_prefix}-gro{int(gro)}',
                                cpus[:producers], mode=mode, count=8, warmup=2,
-                               gro=gro, timeout=30, smoke=True)
-                rows.append(dict(mode=mode, producers=producers, gro=gro,
+                               gro=gro, timeout=30, smoke=True, empty_prefix=empty_prefix,
+                               shared_namespace=args.shared_namespace)
+                rows.append(dict(mode=mode, empty_prefix=empty_prefix, producers=producers, gro=gro,
                                  completed=result['completed'], errors=0))
     summary = dict(cases=rows, completed=sum(r['completed'] for r in rows),
                    errors=0, smoke=True)
@@ -31,4 +35,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('server', 'peer', 'output'):
         parser.add_argument(name, type=lambda s: Path(s).resolve())
+    parser.add_argument('--empty-prefixes', action='store_true',
+                        help='exercise bounded 0/1/32/512 empty prefixes in both TLS epochs')
+    parser.add_argument('--shared-namespace', action='store_true',
+                        help='untimed only: use owned socket checks; global counters are diagnostic')
     main(parser.parse_args())

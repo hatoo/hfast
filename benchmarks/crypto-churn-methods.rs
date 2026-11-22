@@ -4,6 +4,23 @@ impl Connection {
         self.churn = Some(crate::crypto_schedule::Audit::new(mode));
     }
 
+    pub fn churn_empty_prefix(&mut self, count: usize) -> Result<()> {
+        anyhow::ensure!(matches!(count, 0 | 1 | 32 | 512), "invalid empty prefix");
+        self.churn.as_mut().unwrap().empty_prefix = count;
+        Ok(())
+    }
+
+    fn churn_ack(&mut self, space: Space, largest: u64, first_range: u64, ranges: &[u8]) {
+        if space != Space::Data
+            && let Some(audit) = self.churn.as_mut()
+            && let Some(plan) = audit.plans[space as usize].as_mut()
+        {
+            for (first, last) in frame::AckRanges::new(largest, first_range, ranges) {
+                plan.acknowledge(first, last);
+            }
+        }
+    }
+
     pub fn churn_verify(&self) -> Result<[crate::crypto_schedule::Plan; 2]> {
         anyhow::ensure!(self.churn_tls_completed(), "incomplete TLS");
         anyhow::ensure!(self.closed.is_none(), "failed TLS connection");
@@ -31,12 +48,20 @@ impl Connection {
         }
         let audit = self.churn.as_mut().unwrap();
         let plan = audit.plans[space as usize].get_or_insert_with(|| {
-            crate::crypto_schedule::Plan::new(audit.mode, &state.crypto_out)
+            crate::crypto_schedule::Plan::with_empty_prefix(
+                audit.mode,
+                &state.crypto_out,
+                audit.empty_prefix,
+            )
+            .unwrap()
         });
         anyhow::ensure!(
             plan.bytes == state.crypto_out.len(),
             "unexpected extra TLS flight"
         );
+        if !plan.can_emit() {
+            return Ok(false);
+        }
         let Some((start, stop)) = plan.next() else {
             // Timing rejects a retransmission instead of silently changing the
             // offered schedule. The ordinary transport's recovery remains intact

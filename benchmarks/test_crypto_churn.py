@@ -6,20 +6,54 @@ import unittest
 import crypto_churn as c
 
 
-def report():
+def report(empty_prefix=0):
     epochs = []
     for size in (257, 36):
-        ranges = c.schedule('overlap-duplicates', size)
+        ranges = c.schedule('overlap-duplicates', size, empty_prefix)
         epochs.append(dict(bytes=size, schedule=ranges, original_hex='00' * size,
+                           empty_prefix=empty_prefix, empty_acked=[i * 2 for i in range(empty_prefix)],
                            sent=[dict(packet=i * 2, start=a, stop=b)
                                  for i, (a, b) in enumerate(ranges)]))
-    packets, size = c.validate_epochs(epochs, 'overlap-duplicates')
+    packets, size = c.validate_epochs(epochs, 'overlap-duplicates', empty_prefix)
     return dict(phase='done', failed=0, offered=2, completed=2, requests=2,
                 responses=2, tls_completed=2, close_sent=2, latencies_ns=[123, 456],
-                seconds=.1, epochs=epochs, crypto_packets=packets * 2, crypto_bytes=size * 2)
+                seconds=.1, empty_prefix=empty_prefix, empty_crypto_packets=4 * empty_prefix,
+                empty_crypto_acked=4 * empty_prefix, epochs=epochs, crypto_packets=packets * 2, crypto_bytes=size * 2)
 
 
 class Oracles(unittest.TestCase):
+    def test_empty_prefixes_keep_real_bytes_and_all_acks(self):
+        for n in (0, 1, 32, 512):
+            row = report(n)
+            c.validate_done(row, 'overlap-duplicates', 2, n)
+            self.assertEqual(row['crypto_bytes'], report()['crypto_bytes'])
+            for plan in row['epochs']:
+                self.assertEqual(plan['schedule'][:n], [[plan['bytes'], plan['bytes']]] * n)
+
+    def test_rejects_missing_empty_ack_wrong_offsets_and_fake_tls_bytes(self):
+        for n in (1, 32, 512):
+            for fault in ('ack', 'offset', 'bytes', 'count', 'prefix'):
+                row = report(n)
+                if fault == 'ack':
+                    row['epochs'][1]['empty_acked'].pop()
+                elif fault == 'offset':
+                    row['epochs'][0]['sent'][0]['start'] -= 1
+                elif fault == 'bytes':
+                    row['crypto_bytes'] += 1
+                elif fault == 'count':
+                    row['empty_crypto_packets'] -= 1
+                else:
+                    row['empty_prefix'] = 0
+                with self.subTest(n=n, fault=fault), self.assertRaises(RuntimeError):
+                    c.validate_done(row, 'overlap-duplicates', 2, n)
+
+    def test_empty_prefix_bounds_and_shared_namespace_timing_refusal(self):
+        for n in (-1, 2, 513, True):
+            with self.subTest(n=n), self.assertRaises(RuntimeError):
+                c.schedule('normal', 36, n)
+        with self.assertRaisesRegex(RuntimeError, 'correctness-only'):
+            c.run(None, None, None, [], mode='normal', shared_namespace=True)
+
     def test_valid_report(self):
         c.validate_done(report(), 'overlap-duplicates', 2)
 
