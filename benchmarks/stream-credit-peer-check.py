@@ -266,13 +266,17 @@ async def concurrent_wire_failure(peer, output, target):
         server.close()
 
 
-async def hfast_check(peer, binary, output, mode, count, size, threads):
+async def hfast_check(peer, binary, output, mode, count, size, threads, receive_buffer=0):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
     name = f'hfast-{mode}-s{count}-t{threads}'
     with (output / f'{name}.server').open('x') as log:
-        server = subprocess.Popen([str(binary), '--threads', str(threads), '--tcp', '0', '--quic', str(port)],
+        command = [str(binary), '--threads', str(threads), '--tcp', '0', '--quic', str(port)]
+        if receive_buffer:
+            command += ['--udp-receive-buffer', str(receive_buffer)]
+        (output / f'{name}.command.json').write_text(json.dumps(command) + '\n')
+        server = subprocess.Popen(command,
                                   stdout=log, stderr=subprocess.STDOUT)
         process = None
         before = net_before = evidence = None
@@ -303,7 +307,7 @@ async def hfast_check(peer, binary, output, mode, count, size, threads):
             validate(row, count, size)
             require_clean_run(row['udp'], evidence['server_delta'], evidence['namespace_delta'])
             require(all(row['credit_frames_per_stream']), 'large upload did not exercise credit')
-            return dict(case=name, peer=row, udp=evidence)
+            return dict(case=name, peer=row, udp=evidence, requested_receive_buffer=receive_buffer)
         finally:
             if process and process.returncode is None:
                 process.kill()
@@ -356,7 +360,8 @@ async def main(args):
     if args.server:
         for mode in (args.mode.split(',') if args.mode else ['ordinary', 'loss', 'reorder', 'sparse', 'pto']):
             for count in args.streams:
-                cases.append(await hfast_check(args.peer, args.server, args.output, mode, count, args.bytes, args.threads))
+                cases.append(await hfast_check(args.peer, args.server, args.output, mode, count,
+                                              args.bytes, args.threads, args.udp_receive_buffer))
     (args.output / 'summary.json').write_text(json.dumps(dict(cases=cases, timing=False), indent=2) + '\n')
     print(json.dumps(dict(cases=len(cases), expected_failures=sum(c.get('expected_failure', False) for c in cases))))
 
@@ -371,4 +376,9 @@ if __name__ == '__main__':
     parser.add_argument('--streams', type=int, nargs='+', default=[1, 8, 32])
     parser.add_argument('--bytes', type=int, default=(1 << 24) + 65543)
     parser.add_argument('--threads', type=int, default=1)
-    asyncio.run(main(parser.parse_args()))
+    parser.add_argument('--udp-receive-buffer', type=int, default=0,
+                        help='request up to 4194304 bytes per hfast worker (0 keeps the host default)')
+    args = parser.parse_args()
+    if not 0 <= args.udp_receive_buffer <= 4194304:
+        parser.error('--udp-receive-buffer must be in 0..4194304')
+    asyncio.run(main(args))

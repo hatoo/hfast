@@ -177,10 +177,10 @@ jobs:
           python benchmarks/build-stream-credit-peer.py .stream-credit-shb "$RUNNER_TEMP/stream-credit-peer"
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' credit-peer \
             "$(command -v python)" benchmarks/stream-credit-peer-check.py \
-            "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-check" --server target/release/hfast
+            "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-check" --server target/release/hfast --udp-receive-buffer 4194304
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' credit-peer-t2 \
             "$(command -v python)" benchmarks/stream-credit-peer-check.py \
-            "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-t2" --server target/release/hfast --only-server --threads 2 --streams 8 --mode sparse,pto
+            "$RUNNER_TEMP/stream-credit-peer/stream-credit-peer" "$RUNNER_TEMP/stream-credit-t2" --server target/release/hfast --only-server --threads 2 --streams 8 --mode sparse,pto --udp-receive-buffer 4194304
           STREAM_CREDIT_VALID_ROW="$RUNNER_TEMP/stream-credit-check/ordinary.stdout" python -m unittest discover -s benchmarks -p test_udp_accounting.py -v
       - name: Concurrent upload clocks, aggregate accounting and failed producers
         run: |

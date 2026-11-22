@@ -23,6 +23,16 @@ peer JSON, stderr and server logs, including failures. It uses ephemeral UDP
 ports and bounded child cleanup. `--streams 1 8 32` and `--threads 2` select
 server correctness cases; `--only-server` skips already-run independent oracles.
 
+For the large native upload matrix, CI passes `--udp-receive-buffer 4194304`
+to request a bounded receive queue for each hfast worker. The default 212992-byte
+queue on a hosted runner overflowed during an otherwise complete 16 MiB upload;
+the preserved socket and namespace counters both reported four lost datagrams.
+The option leaves the body sizes, flight window, recovery schedules, and zero-drop
+requirements unchanged. The default remains `0` (host default) for local callers.
+Each case saves its exact server command and effective socket capacity, including
+host caps; an increased request does not guarantee an increased or lossless queue.
+The separate forced-overflow tests must still reject actual drops.
+
 Each upload has one static QPACK POST header block and one DATA frame. A 1 KiB
 scratch buffer generates every body byte as `x`; complete bodies are never
 allocated. There are at most 64 outstanding data/control/PING work items and
