@@ -28,6 +28,11 @@ def main(repo, output, *, persistent=False):
     conn = source / 'src/quic/conn.rs'
     text = conn.read_text()
     replacements = [
+        ('            } => self.on_ack(space, largest, delay, first_range, ranges, now)?,',
+         '            } => {\n'
+         '                self.churn_ack(space, largest, first_range, ranges);\n'
+         '                self.on_ack(space, largest, delay, first_range, ranges, now)?;\n'
+         '            }'),
         ('pub struct Connection {', 'pub struct Connection {\n    churn: Option<crate::crypto_schedule::Audit>,'),
         ('        Ok(Self {\n            tls,', '        Ok(Self {\n            churn: None,\n            tls,'),
         ('        // Handshake bytes that have not been sent yet,',

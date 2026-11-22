@@ -120,6 +120,7 @@ fn connection(
     socket: &mut Socket,
     config: Arc<rustls::ClientConfig>,
     mode: Mode,
+    empty_prefix: usize,
     attempt: &mut Attempt,
 ) -> Result<[Plan; 2]> {
     let mut conn = Connection::connect(
@@ -134,6 +135,7 @@ fn connection(
         },
     )?;
     conn.churn_schedule(mode);
+    conn.churn_empty_prefix(empty_prefix)?;
     let mut wire = Vec::with_capacity(1200);
     let mut buf = [0; 65536];
     let deadline = Instant::now() + DEADLINE;
@@ -244,13 +246,14 @@ fn run_connection(
     socket: &mut Socket,
     config: Arc<rustls::ClientConfig>,
     mode: Mode,
+    empty_prefix: usize,
     phase: &str,
     completed: usize,
     latencies: &[u64],
 ) -> Result<([Plan; 2], u64)> {
     let start = Instant::now();
     let mut attempt = Attempt::default();
-    let result = connection(socket, config, mode, &mut attempt);
+    let result = connection(socket, config, mode, empty_prefix, &mut attempt);
     let elapsed = start.elapsed().as_nanos() as u64;
     match result {
         Ok(plans) => Ok((plans, elapsed)),
@@ -281,7 +284,15 @@ fn command(expected: &str) -> Result<()> {
 
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
-    ensure!(args.len() == 5, "usage: peer PORT MODE CONNECTIONS WARMUP");
+    ensure!(
+        matches!(args.len(), 5 | 6),
+        "usage: peer PORT MODE CONNECTIONS WARMUP [EMPTY_PREFIX]"
+    );
+    let empty_prefix: usize = args.get(5).map(|s| s.parse()).transpose()?.unwrap_or(0);
+    ensure!(
+        matches!(empty_prefix, 0 | 1 | 32 | 512),
+        "invalid empty prefix"
+    );
     let port: u16 = args[1].parse()?;
     let mode = Mode::parse(&args[2])?;
     let count: usize = args[3].parse()?;
@@ -300,8 +311,16 @@ fn run() -> Result<()> {
     };
     let config = tls::client_config(b"h3")?;
     for i in 0..warmup {
-        run_connection(&mut socket, config.clone(), mode, "warmup", i, &[])
-            .with_context(|| format!("warmup {i}"))?;
+        run_connection(
+            &mut socket,
+            config.clone(),
+            mode,
+            empty_prefix,
+            "warmup",
+            i,
+            &[],
+        )
+        .with_context(|| format!("warmup {i}"))?;
     }
     emit(
         json!({"phase": "ready", "port": socket.udp.local_addr()?.port(),
@@ -313,13 +332,29 @@ fn run() -> Result<()> {
     let mut sample = None;
     let mut crypto_packets = 0;
     let mut crypto_bytes = 0;
+    let mut empty_crypto_packets = 0;
+    let mut empty_crypto_acked = 0;
     for i in 0..count {
-        let (plans, elapsed) =
-            run_connection(&mut socket, config.clone(), mode, "measured", i, &latencies)
-                .with_context(|| format!("measured connection {i}/{count}"))?;
+        let (plans, elapsed) = run_connection(
+            &mut socket,
+            config.clone(),
+            mode,
+            empty_prefix,
+            "measured",
+            i,
+            &latencies,
+        )
+        .with_context(|| format!("measured connection {i}/{count}"))?;
         latencies.push(elapsed);
         for plan in &plans {
             crypto_packets += plan.sent.len();
+            empty_crypto_packets += plan.sent.iter().filter(|s| s.start == s.stop).count();
+            empty_crypto_acked += plan
+                .sent
+                .iter()
+                .take(plan.empty_prefix)
+                .filter(|s| s.acknowledged)
+                .count();
             crypto_bytes += plan.sent.iter().map(|s| s.stop - s.start).sum::<usize>();
         }
         if sample.is_none() {
@@ -333,13 +368,23 @@ fn run() -> Result<()> {
         "close_sent": count, "failed": 0, "latencies_ns": latencies,
         "ledger": socket.ledger(),
         "seconds": elapsed, "crypto_packets": crypto_packets, "crypto_bytes": crypto_bytes,
+        "empty_prefix": empty_prefix, "empty_crypto_packets": empty_crypto_packets,
+        "empty_crypto_acked": empty_crypto_acked,
         "epochs": sample.unwrap().iter().map(Plan::json).collect::<Vec<_>>() }),
     )?;
     command("validate")?;
     // Reusing the same address with fresh keys and no retry proves the last
     // measured close was consumed. hfast routes connections by this address.
-    run_connection(&mut socket, config, mode, "retirement", 0, &[])
-        .context("final retirement handshake")?;
+    run_connection(
+        &mut socket,
+        config,
+        mode,
+        empty_prefix,
+        "retirement",
+        0,
+        &[],
+    )
+    .context("final retirement handshake")?;
     emit(json!({"phase": "validated", "retirement_probes": 1,
         "replacements_verified": warmup + count, "maximum_server_addresses": 1,
         "port": socket.udp.local_addr()?.port(), "failed": 0, "ledger": socket.ledger()}))?;

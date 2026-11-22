@@ -13,9 +13,11 @@ import time
 import traceback
 
 from burst_workers import cpu, cpu_delta, empty_sockets, require, udp, ERROR_COUNTERS
+import burst_sockets
 
 
-def schedule(mode, size):
+def schedule(mode, size, empty_prefix=0):
+    require(type(empty_prefix) is int and empty_prefix in (0, 1, 32, 512), 'invalid empty prefix')
     require(size >= 24, 'short TLS flight')
     chunk = min(96, size // 3)
     ranges = [[start, min(start + chunk, size)] for start in range(0, size, chunk)]
@@ -24,24 +26,27 @@ def schedule(mode, size):
     if mode == 'overlap-duplicates':
         ranges = [ranges[0]] * 8 + ranges[:-1] + [[chunk // 2, min(2 * chunk, size)]] + ranges[-1:]
     require(mode in ('normal', 'reverse', 'overlap-duplicates'), 'invalid schedule')
-    return ranges
+    return [[size, size] for _ in range(empty_prefix)] + ranges
 
 
-def validate_epochs(epochs, mode):
+def validate_epochs(epochs, mode, empty_prefix=0):
     require(len(epochs) == 2, 'missing/extra TLS epoch')
     for plan in epochs:
-        expected = schedule(mode, plan['bytes'])
+        expected = schedule(mode, plan['bytes'], empty_prefix)
+        require(plan['empty_prefix'] == empty_prefix, 'wrong empty prefix')
         require(plan['schedule'] == expected, 'wrong schedule')
         require(len(bytes.fromhex(plan['original_hex'])) == plan['bytes'], 'wrong TLS bytes')
         sent = plan['sent']
         require([[r['start'], r['stop']] for r in sent] == expected, 'wrong emitted ranges')
         pns = [r['packet'] for r in sent]
-        require(pns == sorted(set(pns)), 'replayed/reordered encrypted packets')
+        require(all(type(pn) is int and 0 <= pn < 2**62 for pn in pns)
+                and pns == sorted(set(pns)), 'replayed/reordered encrypted packets')
+        require(plan['empty_acked'] == pns[:empty_prefix], 'missing empty CRYPTO ACK')
     return (sum(len(p['sent']) for p in epochs),
             sum(r['stop'] - r['start'] for p in epochs for r in p['sent']))
 
 
-def validate_done(row, mode, count):
+def validate_done(row, mode, count, empty_prefix=0):
     require(row['phase'] == 'done' and row['failed'] == 0, 'failed/incomplete producer')
     for key in ('offered', 'completed', 'requests', 'responses', 'tls_completed', 'close_sent'):
         require(row[key] == count, f'wrong {key}')
@@ -49,7 +54,10 @@ def validate_done(row, mode, count):
             and all(isinstance(n, int) and n > 0 for n in row['latencies_ns']),
             'missing/invalid latency samples')
     require(math.isfinite(row['seconds']) and row['seconds'] > 0, 'invalid elapsed time')
-    packets, size = validate_epochs(row['epochs'], mode)
+    require(row['empty_prefix'] == empty_prefix, 'wrong producer empty prefix')
+    require(row['empty_crypto_packets'] == row['empty_crypto_acked'] == 2 * count * empty_prefix,
+            'wrong empty CRYPTO packet/ACK count')
+    packets, size = validate_epochs(row['epochs'], mode, empty_prefix)
     require(row['crypto_packets'] == packets * count and row['crypto_bytes'] == size * count,
             'inhomogeneous TLS workload')
 
@@ -81,14 +89,17 @@ def collect(workers, phase, timeout, maximum):
     return rows
 
 
-def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout):
+def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout,
+               empty_prefix=0, shared_namespace=False):
     workers = []
     with ExitStack() as files:
         before_udp = udp()
+        before_server = burst_sockets.observe(pid, [port])
+        require(before_server['status'] == 'available', 'server socket audit unavailable')
         try:
             for i, core in enumerate(cpus):
                 command = ['taskset', '-c', str(core), str(peer), str(port), mode,
-                           str(count), str(warmup)]
+                           str(count), str(warmup), str(empty_prefix)]
                 stderr = files.enter_context((output / f'peer-{i}.stderr').open('xb'))
                 log = files.enter_context((output / f'peer-{i}.jsonl').open('xb'))
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -97,18 +108,22 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout):
             ready = collect(workers, 'ready', timeout, 8192)
             require(all(r['warmup'] == warmup for r in ready), 'wrong warmup')
             require(len({r['port'] for r in ready}) == len(workers), 'shared source address')
+            before_peers = [burst_sockets.observe(w['process'].pid, [r['port']])
+                            for w, r in zip(workers, ready)]
+            require(all(r['status'] == 'available' for r in before_peers),
+                    'producer socket audit unavailable')
             server_before = cpu(pid)
             peers_before = [cpu(w['process'].pid) for w in workers]
             start = time.perf_counter()
             for w in workers:
                 w['process'].stdin.write(b'start\n')
-            done = collect(workers, 'done', timeout, count * 32 + 65536)
+            done = collect(workers, 'done', timeout, count * 32 + 262144)
             seconds = time.perf_counter() - start
             server_cpu = cpu_delta(server_before, cpu(pid), seconds)
             peers_cpu = [cpu_delta(old, cpu(w['process'].pid), seconds)
                          for old, w in zip(peers_before, workers)]
             for row in done:
-                validate_done(row, mode, count)
+                validate_done(row, mode, count, empty_prefix)
             for w in workers:
                 w['process'].stdin.write(b'validate\n')
             final = collect(workers, 'validated', timeout, 8192)
@@ -130,10 +145,31 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout):
             # Clients emit individual datagrams, so GRO cannot aggregate their
             # input; clients themselves have GRO disabled. This counts receive
             # operations across both ends, including every final close.
-            require(after_udp['InDatagrams'] == expected, 'UDP delivery ledger mismatch')
-            for key in ERROR_COUNTERS:
-                require(after_udp[key] == before_udp[key], f'UDP error {key}')
-            empty_sockets([port] + [r['port'] for r in ready])
+            if not shared_namespace:
+                require(after_udp['InDatagrams'] == expected, 'UDP delivery ledger mismatch')
+                for key in ERROR_COUNTERS:
+                    require(after_udp[key] == before_udp[key], f'UDP error {key}')
+            # Shared namespace counters are diagnostic only. Socket identities,
+            # drop counters and empty queues still have to pass independently.
+            ports = [port] + [r['port'] for r in ready]
+            identities = {s['port']: {s['inode']}
+                          for r in [before_server, *before_peers] for s in r['snapshot']['sockets']}
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    empty_sockets(ports, identities)
+                    break
+                except RuntimeError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.001)
+            socket_audit = dict(
+                before=[before_server, *before_peers],
+                after=[burst_sockets.observe(pid, [port], before_server['snapshot'])]
+                      + [burst_sockets.observe(w['process'].pid, [r['port']], old['snapshot'])
+                         for w, r, old in zip(workers, ready, before_peers)])
+            require(all(r['status'] == 'available' for r in socket_audit['after']),
+                    'final socket audit unavailable or socket loss')
             for w in workers:
                 w['process'].stdin.write(b'exit\n')
             for w in workers:
@@ -142,13 +178,15 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout):
                 w['log'].write(trailing)
                 require(not trailing, 'unexpected final output')
             total = count * len(workers)
-            return dict(mode=mode, producers=len(workers), client_cpus=cpus,
+            return dict(mode=mode, empty_prefix=empty_prefix, producers=len(workers), client_cpus=cpus,
                         per_producer=count, warmup=warmup, completed=total, errors=0,
                         seconds=seconds, connections_per_second=total / seconds,
                         server_cpu=server_cpu, peer_cpu=peers_cpu,
                         server_cpu_ns_per_connection=sum(server_cpu[k] for k in ('user', 'system')) * 1e9 / total,
                         ready=ready, workers=done, final=final,
                         udp_before=before_udp, udp_after=after_udp,
+                        network_namespace=os.readlink('/proc/self/ns/net'),
+                        shared_namespace=shared_namespace, socket_audit=socket_audit,
                         commands=[w['command'] for w in workers])
         except BaseException:
             (output / 'failure.txt').open('x').write(traceback.format_exc())
@@ -164,7 +202,9 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout):
 
 
 def run(server, peer, output, cpus, *, mode, count=10000, warmup=32,
-        gro=True, timeout=120, smoke=False):
+        gro=True, timeout=120, smoke=False, empty_prefix=0, shared_namespace=False):
+    require(not shared_namespace or smoke, 'shared namespace is correctness-only')
+    schedule(mode, 24, empty_prefix)
     require(len(cpus) in (1, 4), 'one or four producers required')
     require(all(c in os.sched_getaffinity(0) for c in cpus), 'unavailable CPU')
     require(smoke or (0 in os.sched_getaffinity(0) and 0 not in cpus
@@ -186,7 +226,7 @@ def run(server, peer, output, cpus, *, mode, count=10000, warmup=32,
             time.sleep(.2)
             require(server_process.poll() is None, 'server startup failure')
             result = coordinate(peer, server_process.pid, port, output, cpus,
-                                mode, count, warmup, timeout)
+                                mode, count, warmup, timeout, empty_prefix, shared_namespace)
             require(server_process.poll() is None, 'server exited during workload')
         finally:
             server_process.terminate()

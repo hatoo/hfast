@@ -24,6 +24,18 @@ independent aioquic server decrypts them and checks actual ranges, overlapping
 bytes, packet numbers, full TLS completion, exact request headers, and closes.
 Neither encrypted packet replay nor TLS resumption is used.
 
+Pass `--empty-prefixes` to both the interoperability and smoke commands to add
+1, 32, and 512 zero-length CRYPTO frames before each Initial and Handshake flight,
+with both normal and reversed real fragments. The original three no-empty cases
+remain. Empty frames use the real flight length as their future offset, fresh
+authenticated packet numbers, and normal Initial padding. At most 16 empty
+packets are outstanding; every one must be acknowledged before any real TLS byte
+is sent. Empty packet and ACK counts are separate from TLS bytes and HTTP counts.
+The independent receiver checks that empty frames never advance TLS, that the
+wire ACK fence precedes real bytes, and that all original bytes arrive. In each
+epoch it also injects missing-prefix, corrupt-byte, and missing-empty-ACK faults
+after a completed connection to verify failure and partial latency accounting.
+
 One or four producer processes each retain one UDP socket. Every connection
 must finish TLS, receive exactly one status-200 response with the expected
 headers/body and FIN, complete an ACK fence, and send an authenticated close.
@@ -34,9 +46,15 @@ concurrent connections within a producer. Loss, unexpected response frames,
 packet reordering or duplication, and incomplete work fail the run. This is a
 controlled loopback fixture, not a general QUIC recovery test.
 
-The controller owns global UDP counters, checks exact aggregate receive delivery
-including closes, checks error counters and empty socket queues, and rejects any
-failed producer. Every connection latency is retained. Server and producer CPU
+By default the controller requires an isolated network namespace: it checks
+exact aggregate UDP receive delivery including closes and UDP error counters.
+It also records owned socket inode/cookie identities, receive buffers, drop
+counters, and empty queues before/after work, and rejects any failed producer.
+When namespace creation is unavailable, `crypto-churn-check.py --shared-namespace`
+allows unprivileged correctness smoke with those same socket checks. Global UDP
+counters then remain diagnostic only; the report explicitly records the shared
+namespace. This option is refused for timing runs. It is not evidence of isolated
+network performance. Every connection latency is retained. Server and producer CPU
 are accompanied by partial connection/request/TLS counts and all completed
 latency samples when a connection fails; the failed attempt has its own elapsed
 time. Warmup and retirement failures are labeled separately. CPU measurements

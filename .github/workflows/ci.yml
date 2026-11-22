@@ -331,13 +331,13 @@ jobs:
         run: |
           python benchmarks/build-crypto-churn-peer.py .crypto-churn-shb "$RUNNER_TEMP/crypto-churn-peer"
           python -m unittest discover -s benchmarks -p test_crypto_churn.py -v
-          python benchmarks/crypto-churn-interop.py "$RUNNER_TEMP/crypto-churn-peer/crypto-churn-peer" "$RUNNER_TEMP/crypto-churn-interop"
+          python benchmarks/crypto-churn-interop.py "$RUNNER_TEMP/crypto-churn-peer/crypto-churn-peer" "$RUNNER_TEMP/crypto-churn-interop" --empty-prefixes
       - name: Native CRYPTO churn with GRO and fallback delivery
         run: |
           sudo unshare --net sh -c 'ip link set lo up && exec "$@"' crypto-churn \
             "$(command -v python)" benchmarks/crypto-churn-check.py \
             "$PWD/target/release/hfast" "$RUNNER_TEMP/crypto-churn-peer/crypto-churn-peer" \
-            "$RUNNER_TEMP/crypto-churn-smoke"
+            "$RUNNER_TEMP/crypto-churn-smoke" --empty-prefixes
       - name: Persistent native peer accounting and independent failure oracles
         env:
           NATIVE_PEER_TARGET_DIR: ${{ runner.temp }}/sparse-ack-peer/target
