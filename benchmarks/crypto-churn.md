@@ -81,3 +81,25 @@ An improvement still needs uncertainty assessment and ordinary fixed-client
 serial/concurrent CPU and latency guards; this fixture cannot establish that a
 microbenchmark saving improves steady-state HTTP throughput. The fixed small TLS
 messages also do not model arbitrarily large certificates or sparse attack input.
+
+`crypto_campaign.py BASELINE CANDIDATE PEER OUTPUT` runs the empty-future-frame
+qualification as root on a dedicated host. It creates a new network namespace
+for every trial, without modifying a shared runner. The fixed matrix is one/four
+producers, normal/reversed TLS fragments, and zero/512 empty frames per epoch.
+Each trial includes 16 warmup connections per producer, then 4,096 ordinary or
+512 affected measured connections per producer. Three pairs use AB/BA/AB order.
+Only when an affected cell has three positive pairs and a median gain of at
+least 3% does it run the full matrix again in BA/AB/BA order. This is a screening
+rule, not statistical significance or acceptance of a runtime improvement.
+
+All server threads run on CPU 0. Client cores exclude that physical core and its
+SMT siblings. On small runners, four producers explicitly share the remaining
+client cores; topology, actual thread affinities before/after each trial and the
+sharing flag are retained. These cases do not represent four dedicated client
+cores. CPU counters are sampled at the host's `/proc` clock-tick resolution;
+server and peer CPU, wall time, p50/p99 and every underlying latency sample are
+saved. Peer CPU includes its protocol validation and JSON reporting. The driver
+replays completion, ACK, byte, final-drain, UDP, socket-drop and affinity checks
+before including a trial. Namespace commands, failures, input hashes and all
+per-producer logs remain in unique output directories. Ordinary fixed-client
+H1/H2/H3 and tail qualification are still required before a production PR.

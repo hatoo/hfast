@@ -90,7 +90,7 @@ def collect(workers, phase, timeout, maximum):
 
 
 def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout,
-               empty_prefix=0, shared_namespace=False):
+               empty_prefix=0, shared_namespace=False, timing=False):
     workers = []
     with ExitStack() as files:
         before_udp = udp()
@@ -112,6 +112,7 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout,
                             for w, r in zip(workers, ready)]
             require(all(r['status'] == 'available' for r in before_peers),
                     'producer socket audit unavailable')
+            affinity_before = affinities(pid, workers, cpus, timing)
             server_before = cpu(pid)
             peers_before = [cpu(w['process'].pid) for w in workers]
             start = time.perf_counter()
@@ -122,6 +123,7 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout,
             server_cpu = cpu_delta(server_before, cpu(pid), seconds)
             peers_cpu = [cpu_delta(old, cpu(w['process'].pid), seconds)
                          for old, w in zip(peers_before, workers)]
+            affinity_after = affinities(pid, workers, cpus, timing)
             for row in done:
                 validate_done(row, mode, count, empty_prefix)
             for w in workers:
@@ -187,6 +189,7 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout,
                         udp_before=before_udp, udp_after=after_udp,
                         network_namespace=os.readlink('/proc/self/ns/net'),
                         shared_namespace=shared_namespace, socket_audit=socket_audit,
+                        affinity_before=affinity_before, affinity_after=affinity_after,
                         commands=[w['command'] for w in workers])
         except BaseException:
             (output / 'failure.txt').open('x').write(traceback.format_exc())
@@ -201,14 +204,30 @@ def coordinate(peer, pid, port, output, cpus, mode, count, warmup, timeout,
                 process.stdout.close()
 
 
+def affinities(pid, workers, cpus, timing):
+    def threads(process):
+        return {p.name: sorted(os.sched_getaffinity(int(p.name)))
+                for p in Path(f'/proc/{process}/task').iterdir()}
+    result = dict(server=threads(pid), peers=[threads(w['process'].pid) for w in workers])
+    if timing:
+        require(result['server'] and all(mask == [0] for mask in result['server'].values()),
+                'server timing affinity changed')
+        for core, peer in zip(cpus, result['peers']):
+            require(peer and all(mask == [core] for mask in peer.values()),
+                    'peer timing affinity changed')
+    return result
+
+
 def run(server, peer, output, cpus, *, mode, count=10000, warmup=32,
-        gro=True, timeout=120, smoke=False, empty_prefix=0, shared_namespace=False):
+        gro=True, timeout=120, smoke=False, empty_prefix=0, shared_namespace=False,
+        share_client_cpus=False):
     require(not shared_namespace or smoke, 'shared namespace is correctness-only')
     schedule(mode, 24, empty_prefix)
     require(len(cpus) in (1, 4), 'one or four producers required')
     require(all(c in os.sched_getaffinity(0) for c in cpus), 'unavailable CPU')
     require(smoke or (0 in os.sched_getaffinity(0) and 0 not in cpus
-                     and len(cpus) == len(set(cpus))), 'invalid timing affinity')
+                     and (share_client_cpus or len(cpus) == len(set(cpus)))),
+            'invalid timing affinity')
     require(1 <= count <= 1_000_000 and 1 <= warmup <= 100_000, 'invalid work bound')
     require(not any(k in os.environ for k in ('LD_PRELOAD', 'HFAST_GRO_PRELOAD')),
             'instrumented timing')
@@ -219,6 +238,8 @@ def run(server, peer, output, cpus, *, mode, count=10000, warmup=32,
         port = reserve.getsockname()[1]
     binary = server if gro else Path(__file__).with_name('without-udp-gro.py')
     command = [str(binary), '--threads', '1', '--tcp', '0', '--quic', str(port)]
+    if not smoke:
+        command = ['taskset', '-c', '0', *command]
     with (output / 'server.log').open('x') as log:
         server_process = subprocess.Popen(command, stdout=log, stderr=log,
                                           env=dict(os.environ, HFAST_GRO_BINARY=str(server)))
@@ -226,13 +247,15 @@ def run(server, peer, output, cpus, *, mode, count=10000, warmup=32,
             time.sleep(.2)
             require(server_process.poll() is None, 'server startup failure')
             result = coordinate(peer, server_process.pid, port, output, cpus,
-                                mode, count, warmup, timeout, empty_prefix, shared_namespace)
+                                mode, count, warmup, timeout, empty_prefix, shared_namespace,
+                                timing=not smoke)
             require(server_process.poll() is None, 'server exited during workload')
         finally:
             server_process.terminate()
             server_process.wait(timeout=5)
     require(inputs == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (server, peer)},
             'input binary changed')
-    result.update(inputs=inputs, server_command=command, smoke=smoke, gro=gro)
+    result.update(inputs=inputs, server_command=command, smoke=smoke, gro=gro,
+                  share_client_cpus=share_client_cpus)
     (output / 'result.json').open('x').write(json.dumps(result, indent=2) + '\n')
     return result

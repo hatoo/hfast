@@ -1,0 +1,110 @@
+name: Empty CRYPTO qualification
+
+on:
+  push:
+    branches: [codex/validate-empty-crypto-c426-20261123]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          ref: ea8501c534174f7c1b613e0c8b8de2cfefb49ee3
+          path: .baseline
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: hatoo/shb
+          ref: 12e95af17ef6015020776ab65996bef9531099e0
+          path: .crypto-churn-shb
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Candidate correctness and release build
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/candidate-target
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked
+          cargo test --release --locked
+          cargo clippy --locked --bin hfast -- -D warnings
+          cargo build --release --locked
+      - name: Baseline correctness and identical release build settings
+        working-directory: .baseline
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/baseline-target
+        run: |
+          cargo test --locked
+          cargo test --release --locked
+          cargo build --release --locked
+      - name: Freeze servers and bind all runtime sources
+        run: |
+          mkdir -p "$RUNNER_TEMP/qualification/inputs"
+          cp "$RUNNER_TEMP/baseline-target/release/hfast" "$RUNNER_TEMP/qualification/inputs/baseline"
+          cp "$RUNNER_TEMP/candidate-target/release/hfast" "$RUNNER_TEMP/qualification/inputs/candidate"
+          chmod 555 "$RUNNER_TEMP/qualification/inputs/"*
+          python - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          out = Path(os.environ['RUNNER_TEMP']) / 'qualification'
+          def sources(root):
+              paths = sorted((root / 'src').rglob('*.rs')) + [root / 'Cargo.toml', root / 'Cargo.lock']
+              return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+          baseline, candidate = sources(Path('.baseline')), sources(Path('.'))
+          changed = sorted(p for p in baseline.keys() | candidate.keys() if baseline.get(p) != candidate.get(p))
+          assert changed == ['src/quic/assemble.rs', 'src/quic/conn/tests/crypto_handshake.rs'], changed
+          info = dict(baseline_revision=subprocess.check_output(['git', '-C', '.baseline', 'rev-parse', 'HEAD'], text=True).strip(),
+                      candidate_revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                      baseline_sources=baseline, candidate_sources=candidate, changed=changed,
+                      rustc=subprocess.check_output(['rustc', '-Vv'], text=True),
+                      binaries={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (out / 'inputs').iterdir()})
+          (out / 'build-manifest.json').write_text(json.dumps(info, indent=2) + '\n')
+          PY
+      - name: Build fixed native peer and test campaign contracts
+        run: |
+          python benchmarks/build-crypto-churn-peer.py .crypto-churn-shb "$RUNNER_TEMP/peer-build"
+          cp "$RUNNER_TEMP/peer-build/crypto-churn-peer" "$RUNNER_TEMP/qualification/inputs/peer"
+          cp "$RUNNER_TEMP/peer-build/manifest.json" "$RUNNER_TEMP/qualification/peer-manifest.json"
+          python -m unittest discover -s benchmarks -p 'test_crypto*.py' -v
+          python -m unittest discover -s benchmarks -p test_burst_sockets.py -v
+      - name: Independent TLS HTTP and fault oracles
+        run: |
+          python -m pip install -r benchmarks/interop-requirements.txt
+          python benchmarks/crypto-churn-interop.py "$RUNNER_TEMP/qualification/inputs/peer" "$RUNNER_TEMP/qualification/peer-interop" --empty-prefixes
+          for script in interoperability crypto-recovery-check transport-params-check control-recovery-check key-update-check tls-ticket-check; do
+            python "benchmarks/$script.py" "$RUNNER_TEMP/qualification/inputs/candidate"
+          done
+      - name: Native correctness on actual frozen binaries
+        run: |
+          for variant in baseline candidate; do
+            sudo unshare --net sh -c 'ip link set lo up && exec "$@"' crypto-smoke \
+              "$(command -v python)" benchmarks/crypto-churn-check.py \
+              "$RUNNER_TEMP/qualification/inputs/$variant" "$RUNNER_TEMP/qualification/inputs/peer" \
+              "$RUNNER_TEMP/qualification/smoke-$variant" --empty-prefixes
+          done
+      - name: Fixed paired primary and conditional reversed confirmation
+        run: |
+          sudo "$(command -v python)" benchmarks/crypto_campaign.py \
+            "$RUNNER_TEMP/qualification/inputs/baseline" "$RUNNER_TEMP/qualification/inputs/candidate" \
+            "$RUNNER_TEMP/qualification/inputs/peer" "$RUNNER_TEMP/qualification/campaign" \
+            --ordinary-connections 4096 --empty-connections 512 --warmup 16 --timeout 120
+      - name: Preserve complete evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: empty-crypto-qualification
+          path: ${{ runner.temp }}/qualification
+          retention-days: 14
