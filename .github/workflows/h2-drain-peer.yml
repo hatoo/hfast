@@ -1,0 +1,50 @@
+name: H2 sparse drain fixture
+
+on:
+  push:
+    branches: ['codex/test-h2-drain-peer-*']
+  pull_request:
+    paths:
+      - 'benchmarks/build-h2-drain-peer.py'
+      - 'benchmarks/check-h2-drain-peer.py'
+      - 'benchmarks/h2-drain-*'
+      - '.github/workflows/h2-drain-peer.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install independent H2 client
+        run: python -m pip install h2==4.4.1
+      - name: Generate, test and freeze the fixture
+        run: python benchmarks/build-h2-drain-peer.py . "$RUNNER_TEMP/h2-drain-peer"
+      - name: Independently qualify bodies, pause, drain, reset and timeout
+        run: |
+          python benchmarks/check-h2-drain-peer.py "$RUNNER_TEMP/h2-drain-peer/h2-drain-peer" "$RUNNER_TEMP/interop-t1"
+          python benchmarks/check-h2-drain-peer.py "$RUNNER_TEMP/h2-drain-peer/h2-drain-peer" "$RUNNER_TEMP/interop-t2" --threads 2
+      - name: Preserve qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2-drain-fixture
+          path: |
+            ${{ runner.temp }}/h2-drain-peer/manifest.json
+            ${{ runner.temp }}/h2-drain-peer/check-*.log
+            ${{ runner.temp }}/interop-t*/*.json
+            ${{ runner.temp }}/interop-t*/*.jsonl
+            ${{ runner.temp }}/interop-t*/*.log
+          retention-days: 7
