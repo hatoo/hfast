@@ -1,6 +1,9 @@
 //! Lazy receive limits for streams that need more than their initial window.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+
+mod pending;
+use pending::{PendingQueue, UNQUEUED};
 
 use super::{Connection, frame, put_varint, varint_len};
 
@@ -15,7 +18,7 @@ struct Update {
     told: u64,
     sent_in: [u64; COPIES],
     copies: usize,
-    queued: bool,
+    queued: usize,
 }
 
 impl Update {
@@ -29,7 +32,7 @@ impl Update {
 pub(super) struct StreamCredits {
     window: u64,
     streams: HashMap<u64, Update>,
-    pending: VecDeque<u64>,
+    pending: PendingQueue,
     flights: usize,
 }
 
@@ -38,7 +41,7 @@ impl StreamCredits {
         Self {
             window,
             streams: HashMap::new(),
-            pending: VecDeque::new(),
+            pending: PendingQueue::new(),
             flights: 0,
         }
     }
@@ -54,17 +57,16 @@ impl StreamCredits {
             told: self.window,
             sent_in: [0; COPIES],
             copies: 0,
-            queued: false,
+            queued: UNQUEUED,
         });
         update.desired = update.desired.max(desired);
-        if !update.queued && update.needs_update(self.window) {
-            update.queued = true;
-            self.pending.push_back(id);
+        if update.queued == UNQUEUED && update.needs_update(self.window) {
+            update.queued = self.pending.push(id);
         }
     }
 
     pub(super) fn owed(&self) -> bool {
-        !self.pending.is_empty()
+        self.pending.front().is_some()
     }
 
     pub(super) fn in_flight(&self) -> bool {
@@ -80,14 +82,14 @@ impl StreamCredits {
     pub(super) fn remove(&mut self, id: u64) {
         if let Some(update) = self.streams.remove(&id) {
             self.flights -= usize::from(update.copies != 0);
-            if update.queued {
-                self.pending.retain(|&pending| pending != id);
+            if update.queued != UNQUEUED {
+                self.pending.remove(update.queued);
             }
         }
     }
 
     pub(super) fn write(&mut self, body: &mut Vec<u8>, room: usize, pn: u64) {
-        while let Some(&id) = self.pending.front() {
+        while let Some(id) = self.pending.front() {
             let update = self.streams.get_mut(&id).unwrap();
             let need = 1 + varint_len(id) + varint_len(update.desired);
             if body.len() + need > room {
@@ -109,8 +111,8 @@ impl StreamCredits {
             self.flights += usize::from(update.copies == 0);
             update.sent_in[update.copies] = pn;
             update.copies += 1;
-            update.queued = false;
-            self.pending.pop_front();
+            self.pending.remove(update.queued);
+            update.queued = UNQUEUED;
         }
     }
 
@@ -119,7 +121,6 @@ impl StreamCredits {
             return false;
         }
         let mut progress = false;
-        let mut cancelled = false;
         for (&id, update) in &mut self.streams {
             if update.copies == 0 {
                 continue;
@@ -133,29 +134,24 @@ impl StreamCredits {
                 self.flights -= 1;
                 progress = true;
                 // An ACK can cancel a retry, but not a still-unsent increase.
-                if update.queued && !update.needs_update(self.window) {
-                    update.queued = false;
-                    cancelled = true;
+                if update.queued != UNQUEUED && !update.needs_update(self.window) {
+                    self.pending.remove(update.queued);
+                    update.queued = UNQUEUED;
                 }
-            } else if !update.queued
+            } else if update.queued == UNQUEUED
                 && largest.saturating_sub(update.sent_in[update.copies - 1])
                     >= Connection::LOSS_THRESHOLD
             {
-                update.queued = true;
-                self.pending.push_back(id);
+                update.queued = self.pending.push(id);
             }
-        }
-        if cancelled {
-            self.pending.retain(|id| self.streams[id].queued);
         }
         progress
     }
 
     pub(super) fn on_timeout(&mut self) {
         for (&id, update) in &mut self.streams {
-            if update.copies != 0 && !update.queued {
-                update.queued = true;
-                self.pending.push_back(id);
+            if update.copies != 0 && update.queued == UNQUEUED {
+                update.queued = self.pending.push(id);
             }
         }
     }
