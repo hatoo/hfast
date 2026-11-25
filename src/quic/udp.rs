@@ -1,6 +1,7 @@
 //! Reusable datagram batches for the endpoint's IPv4 socket.
 
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
@@ -116,59 +117,84 @@ impl ReceiveBatch {
     }
 
     fn receive_into<const N: usize>(&mut self, socket: &UdpSocket) -> io::Result<usize> {
+        self.receive_with::<N>(|messages| {
+            // All referenced storage remains live and exclusive through this call.
+            if N == 1 {
+                // recv_from cannot recover GRO boundaries, even with only one peer.
+                let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut messages[0].msg_hdr, 0) };
+                if n < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                messages[0].msg_len = n as _;
+                Ok(1)
+            } else {
+                // WAITFORONE blocks only for the first datagram (subject to
+                // SO_RCVTIMEO), then drains without waiting to fill the batch.
+                let n = unsafe {
+                    libc::recvmmsg(
+                        socket.as_raw_fd(),
+                        messages.as_mut_ptr(),
+                        messages.len() as _,
+                        libc::MSG_WAITFORONE,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+        })
+    }
+
+    fn receive_with<const N: usize>(
+        &mut self,
+        receive: impl FnOnce(&mut [libc::mmsghdr]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
         let limit = self.limit.min(N);
-        let mut iovecs: [libc::iovec; N] = unsafe { std::mem::zeroed() };
-        let mut messages: [libc::mmsghdr; N] = unsafe { std::mem::zeroed() };
-        let mut controls: [ReceiveControl; N] = std::array::from_fn(|_| ReceiveControl {
-            bytes: [0; RECEIVE_CONTROL_SIZE],
-        });
+        // The adaptive limit is often much smaller than N. Leave unused stack
+        // entries uninitialized, while fully initializing each submitted entry.
+        let mut iovecs = [const { MaybeUninit::<libc::iovec>::uninit() }; N];
+        let mut messages = [const { MaybeUninit::<libc::mmsghdr>::uninit() }; N];
+        let mut controls = [const { MaybeUninit::<ReceiveControl>::uninit() }; N];
         for i in 0..limit {
-            iovecs[i].iov_base = self.buffers[i].as_mut_ptr().cast();
-            iovecs[i].iov_len = RECEIVE_SIZE;
-            messages[i].msg_hdr.msg_name =
-                (&mut self.addresses[i] as *mut libc::sockaddr_in).cast();
-            messages[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
-            messages[i].msg_hdr.msg_iov = &mut iovecs[i];
-            messages[i].msg_hdr.msg_iovlen = 1;
-            messages[i].msg_hdr.msg_control = (&mut controls[i] as *mut ReceiveControl).cast();
-            messages[i].msg_hdr.msg_controllen = RECEIVE_CONTROL_SIZE;
+            iovecs[i].write(libc::iovec {
+                iov_base: self.buffers[i].as_mut_ptr().cast(),
+                iov_len: RECEIVE_SIZE,
+            });
+            controls[i].write(ReceiveControl {
+                bytes: [0; RECEIVE_CONTROL_SIZE],
+            });
+            // Zero is valid for every mmsghdr field, including output fields.
+            let msg = messages[i].write(unsafe { std::mem::zeroed() });
+            msg.msg_hdr.msg_name = (&mut self.addresses[i] as *mut libc::sockaddr_in).cast();
+            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as _;
+            msg.msg_hdr.msg_iov = iovecs[i].as_mut_ptr();
+            msg.msg_hdr.msg_iovlen = 1;
+            msg.msg_hdr.msg_control = controls[i].as_mut_ptr().cast();
+            msg.msg_hdr.msg_controllen = RECEIVE_CONTROL_SIZE;
         }
-        // WAITFORONE blocks only for the first datagram (subject to SO_RCVTIMEO).
-        // After that it drains what is available without waiting to fill a batch.
-        // All buffers, addresses and iovecs remain live and exclusive for this call.
-        let count = if N == 1 {
-            // recv_from cannot recover GRO boundaries, even with only one peer.
-            let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut messages[0].msg_hdr, 0) };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            messages[0].msg_len = n as _;
-            1
-        } else {
-            unsafe {
-                libc::recvmmsg(
-                    socket.as_raw_fd(),
-                    messages.as_mut_ptr(),
-                    limit as _,
-                    libc::MSG_WAITFORONE,
-                    std::ptr::null_mut(),
-                )
-            }
+        // Only this prefix contains initialized mmsghdr values. None of the
+        // stack arrays move while their pointers are used by the callback.
+        let messages = unsafe {
+            std::slice::from_raw_parts_mut(messages.as_mut_ptr().cast::<libc::mmsghdr>(), limit)
         };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for (i, msg) in messages[..count as usize].iter().enumerate() {
+        let count = receive(messages)?;
+        for (i, msg) in messages[..count].iter().enumerate() {
             self.lengths[i] = msg.msg_len as usize;
+            // count is bounded by the initialized prefix slice above. Controls
+            // were initialized before the call, including bytes it did not write.
+            let control = unsafe { controls[i].assume_init_ref() };
             self.segment_sizes[i] =
-                controls[i].segment_size(&msg.msg_hdr, self.lengths[i], &self.addresses[i]);
+                control.segment_size(&msg.msg_hdr, self.lengths[i], &self.addresses[i]);
         }
         // Grow quickly when there is a backlog, but prepare only a small
         // prefix when the socket is keeping up with the clients.
         if N != 1 {
-            self.limit = (count as usize * 2).clamp(2, BATCH);
+            self.limit = (count * 2).clamp(2, BATCH);
         }
-        Ok(count as usize)
+        Ok(count)
     }
 
     pub fn datagrams(&mut self, index: usize) -> (impl Iterator<Item = &mut [u8]>, SocketAddr) {
@@ -381,6 +407,10 @@ impl SendBatch {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "udp/receive_prefix_tests.rs"]
+mod receive_prefix_tests;
 
 #[cfg(test)]
 mod tests {
