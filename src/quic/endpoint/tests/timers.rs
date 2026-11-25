@@ -73,6 +73,52 @@ fn assert_response(plain: &[u8]) {
 }
 
 #[test]
+fn critical_stream_close_is_sent_before_endpoint_retirement_in_both_key_phases() {
+    for update in [false, true] {
+        for kind in [0, 2, 3] {
+            for reset in [false, true] {
+                let (mut ep, client) = endpoint();
+                let addr = client.local_addr().unwrap();
+                let (conn, mut peer, _) = key_updates::pair(true);
+                insert(&mut ep, addr, conn, Instant::now());
+                if update {
+                    peer.update();
+                }
+                let mut body = Vec::new();
+                frame::put_stream(&mut body, 2, 0, !reset, &[kind]);
+                if reset {
+                    body.extend_from_slice(&[4, 2, 0x41, 0, 1]);
+                }
+                // A completed request later in the same packet cannot turn
+                // terminal failure into a response or overwrite its close.
+                body.extend(request());
+                let original = peer.packet(&ep.conns[&addr].0, 10, &body);
+                ep.datagram(&mut original.clone(), addr);
+                assert!(ep.conns[&addr].0.is_closing());
+                assert_eq!(transport::state(&ep.conns[&addr].0).finished, 0);
+                let deadline = ep.conns[&addr].0.timeout().unwrap();
+                let pn = transport::state(&ep.conns[&addr].0).next_packet - 1;
+                ep.flush_ready();
+                assert_eq!(
+                    receive_one(&mut ep, &client, &peer, pn),
+                    [0x1d, 0x41, 0x04, 0]
+                );
+                ep.datagram(&mut original.clone(), addr);
+                assert_eq!(ep.conns[&addr].0.timeout(), Some(deadline));
+                ep.flush_ready();
+                ep.out.flush(&ep.socket).unwrap();
+                assert_no_packet(&client);
+                ep.tick_at(deadline);
+                assert!(!ep.conns.contains_key(&addr));
+                ep.flush_ready();
+                ep.out.flush(&ep.socket).unwrap();
+                assert_no_packet(&client);
+            }
+        }
+    }
+}
+
+#[test]
 fn empty_quiet_and_strict_idle_boundary() {
     let (mut ep, client) = endpoint();
     ep.tick_at(Instant::now());

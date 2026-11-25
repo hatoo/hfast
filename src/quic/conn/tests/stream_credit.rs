@@ -209,16 +209,16 @@ fn stream_credit_stop_sending_keeps_receive_direction_live() {
 #[test]
 fn stream_credit_uni_duplicate_reordering_and_reset() {
     let mut conn = small_window();
-    conn.on_stream(2, 16, &[0; 16], false).unwrap();
+    conn.on_stream(2, 16, &[0x21; 16], false).unwrap();
     let (pn, plain) = send_data(&mut conn);
     assert_eq!(limits(&plain), [(2, 96)]);
     acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
-    conn.on_stream(2, 0, &[0; 32], false).unwrap();
+    conn.on_stream(2, 0, &[0x21; 32], false).unwrap();
     assert!(!conn.wants_send());
     conn.on_reset(2, 1, 80).unwrap();
     assert_eq!(conn.data_seen, 80);
     assert!(conn.receive_credit.is_none());
-    conn.on_stream(2, 64, &[0; 16], false).unwrap();
+    conn.on_stream(2, 64, &[0x21; 16], false).unwrap();
     assert_eq!(conn.on_reset(2, 1, 81), Err(Error));
     assert_eq!(conn.data_seen, 80);
 }

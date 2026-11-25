@@ -28,8 +28,10 @@ mod stream_credit;
 use stream_credit::{MAX_STREAM_OFFSET, StreamCredits};
 mod send_credit;
 use send_credit::{Fragments, SendCredit};
-mod handshake_close;
-use handshake_close::HandshakeClose;
+mod closing;
+use closing::Closing;
+mod uni_type;
+use uni_type::UniType;
 
 /// The uni stream this server opens for its control stream. Server-initiated
 /// unidirectional streams are 3, 7, 11 (RFC 9000 Section 2.1) and this opens
@@ -384,7 +386,7 @@ pub struct Connection {
     /// A PATH_CHALLENGE waiting to be answered
     path_response: Option<[u8; 8]>,
     pub closed: bool,
-    handshake_close: Option<Box<HandshakeClose>>,
+    closing: Option<Box<Closing>>,
 
     // ---- streams ----
     /// Client bidirectional streams, which requests are, indexed by number
@@ -398,6 +400,8 @@ pub struct Connection {
     uni_sizes: [u64; transport::MAX_STREAMS_UNI],
     /// One bit per uni stream whose final size is known (FIN or RESET_STREAM).
     uni_final: u8,
+    // Only the type varint is retained, at most eight bytes per granted stream.
+    uni_types: [UniType; transport::MAX_STREAMS_UNI],
     /// The initial receive window, replenished as request bytes are discarded.
     stream_max_data: u64,
     /// Only streams that outgrow their initial window need delivery state.
@@ -484,11 +488,12 @@ impl Connection {
             handshake_done: ControlFlight::new(),
             path_response: None,
             closed: false,
-            handshake_close: None,
+            closing: None,
             streams: VecDeque::new(),
             base_stream: 0,
             uni_sizes: [0; transport::MAX_STREAMS_UNI],
             uni_final: 0,
+            uni_types: [UniType::default(); transport::MAX_STREAMS_UNI],
             stream_max_data: initial_max_stream_data,
             receive_credit: None,
             ready: Vec::new(),
@@ -588,7 +593,7 @@ impl Connection {
         if self.closed {
             return Err(Error);
         }
-        if let Some(close) = &mut self.handshake_close {
+        if let Some(close) = &mut self.closing {
             close.receive(datagram, self.local_cid);
             return Ok(());
         }
@@ -618,7 +623,7 @@ impl Connection {
                 continue;
             }
             let received = self.recv_packet(&mut datagram[at..end], space);
-            if received.is_err() && self.handshake_close.is_some() {
+            if received.is_err() && self.closing.as_ref().is_some_and(|c| c.needs_packet()) {
                 self.prepare_handshake_close(dcid)?;
                 return Err(Error);
             }
@@ -874,7 +879,7 @@ impl Connection {
 
     /// A request stream, or one of the client's own unidirectional streams
     ///
-    /// The bytes are not read. A request's stream id is what says which stream
+    /// Request bytes are not read. A request's stream id says which stream
     /// to answer on, and its end is what says to answer at all; nothing in it
     /// changes the answer, so nothing in it is put back together.
     fn on_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
@@ -883,7 +888,12 @@ impl Connection {
             return Err(Error);
         }
         if id & 3 == 2 {
-            return self.receive_uni(id, end, fin);
+            self.receive_uni(id, end, fin)?;
+            let n = id >> 2;
+            if n < self.uni_types.len() as u64 {
+                self.uni_types[n as usize].receive(offset, data);
+            }
+            return self.check_uni_closed(id);
         }
         let available = self.data_credit.told.saturating_sub(self.data_seen);
         let limit = self.receive_limit(id);
@@ -967,7 +977,8 @@ impl Connection {
             return Err(Error);
         }
         if id & 3 == 2 {
-            return self.receive_uni(id, final_size, true);
+            self.receive_uni(id, final_size, true)?;
+            return self.check_uni_closed(id);
         }
         let available = self.data_credit.told.saturating_sub(self.data_seen);
         let limit = self.receive_limit(id);
@@ -1178,7 +1189,7 @@ impl Connection {
                         .ok_or(Error)
                         .and_then(transport::decode)
                         .inspect_err(|_| {
-                            self.handshake_close = Some(Box::new(HandshakeClose::new(self.pto())));
+                            self.closing = Some(Box::new(Closing::new(self.pto())));
                         })?;
                     self.peer = peer;
                     self.send_credit.initialize(&peer);
@@ -1198,7 +1209,7 @@ impl Connection {
         if self.closed {
             return false;
         }
-        if let Some(close) = &self.handshake_close {
+        if let Some(close) = &self.closing {
             return close.pending;
         }
         !self.ready.is_empty()
@@ -1217,7 +1228,7 @@ impl Connection {
         if self.closed {
             return Ok(false);
         }
-        if let Some(close) = &mut self.handshake_close {
+        if let Some(close) = &mut self.closing {
             return Ok(close.transmit(out));
         }
         let start = out.len();
@@ -1495,7 +1506,7 @@ impl Connection {
         if self.closed {
             return None;
         }
-        if let Some(close) = &self.handshake_close {
+        if let Some(close) = &self.closing {
             return Some(close.deadline);
         }
         let key_deadline = self
@@ -1517,7 +1528,7 @@ impl Connection {
     /// Discard expired receive keys and put back flight data only when its own
     /// PTO expires. Key retirement alone must not trigger retransmissions.
     pub fn on_timeout(&mut self, now: Instant) {
-        if let Some(close) = &self.handshake_close {
+        if let Some(close) = &self.closing {
             self.closed |= now >= close.deadline;
             return;
         }
@@ -1625,6 +1636,7 @@ pub(super) mod tests {
     mod connection_wakeup;
     mod control_ack;
     mod credit_wakeup;
+    mod critical_stream;
     mod crypto_handshake;
     mod crypto_output;
     mod datagram_budget;
@@ -1777,19 +1789,19 @@ pub(super) mod tests {
     #[test]
     fn uni_accounting_duplicates_and_overlaps_grant_credit_once() {
         let mut conn = credit_connection();
-        conn.on_stream(2, 0, &[0; 32], false).unwrap();
-        conn.on_stream(2, 0, &[0; 32], false).unwrap();
+        conn.on_stream(2, 0, &[0x21; 32], false).unwrap();
+        conn.on_stream(2, 0, &[0x21; 32], false).unwrap();
         assert_eq!(conn.data_seen, 32);
         assert!(!conn.wants_send());
-        conn.on_stream(2, 16, &[0; 32], false).unwrap();
-        conn.on_stream(2, 0, &[0; 16], false).unwrap();
+        conn.on_stream(2, 16, &[0x21; 32], false).unwrap();
+        conn.on_stream(2, 0, &[0x21; 16], false).unwrap();
         assert_eq!(conn.data_seen, 48);
         conn.on_stream(2, 63, &[0], false).unwrap();
         let (pn, plain) = send_data(&mut conn);
         assert_credit(&plain, None, Some(192));
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         for _ in 0..4 {
-            conn.on_stream(2, 0, &[0; 64], true).unwrap();
+            conn.on_stream(2, 0, &[0x21; 64], true).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         assert!(!conn.wants_send());
@@ -1803,8 +1815,8 @@ pub(super) mod tests {
         let mut conn = connection();
         conn.on_stream(2, 128, &[], true).unwrap();
         assert_eq!(conn.data_seen, 128);
-        conn.on_stream(2, 64, &[0; 64], true).unwrap();
-        conn.on_stream(2, 0, &[0; 64], false).unwrap();
+        conn.on_stream(2, 64, &[0x21; 64], true).unwrap();
+        conn.on_stream(2, 0, &[0x21; 64], false).unwrap();
         conn.on_stream(2, 128, &[], true).unwrap();
         assert_eq!(conn.data_seen, 128);
         assert_eq!(conn.finished, 0);
@@ -1816,14 +1828,14 @@ pub(super) mod tests {
         let mut conn = credit_connection();
         // A higher uni id does not account for unseen lower streams.
         for id in [30, 10, 6, 2] {
-            conn.on_stream(id, 8, &[0; 8], false).unwrap();
+            conn.on_stream(id, 8, &[0x21; 8], false).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         let (pn, plain) = send_data(&mut conn);
         assert_credit(&plain, None, Some(192));
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
         for id in [2, 6, 10, 30] {
-            conn.on_stream(id, 0, &[0; 16], true).unwrap();
+            conn.on_stream(id, 0, &[0x21; 16], true).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         assert!(!conn.wants_send());
@@ -1893,8 +1905,8 @@ pub(super) mod tests {
     #[test]
     fn uni_accounting_survives_request_retirement() {
         let mut conn = credit_connection();
-        conn.on_stream(2, 0, &[0; 32], true).unwrap();
-        conn.on_stream(0, 0, &[0; 32], true).unwrap();
+        conn.on_stream(2, 0, &[0x21; 32], true).unwrap();
+        conn.on_stream(0, 0, &[0x21; 32], true).unwrap();
         let (pn, plain) = send_data(&mut conn);
         assert!(frame::Frames::new(&plain).any(|f| f.unwrap() == frame::Frame::MaxData(192)));
         acknowledge(&mut conn, Space::Data, &[(pn, pn)]);
@@ -1902,7 +1914,7 @@ pub(super) mod tests {
         assert_eq!(conn.base_stream, 1);
         assert!(conn.streams.is_empty());
         for id in [0, 2] {
-            conn.on_stream(id, 0, &[0; 32], true).unwrap();
+            conn.on_stream(id, 0, &[0x21; 32], true).unwrap();
         }
         assert_eq!(conn.data_seen, 64);
         assert_eq!(conn.finished, 1);

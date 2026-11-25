@@ -490,7 +490,7 @@ fn encrypted_valid_and_unknown_transport_parameters_complete_normally() {
             params.extend_from_slice(&[0x3f, 3, 0xff, 0xff, 0xff, 0x3e, 0]);
         }
         let (mut conn, mut peer) = Peer::pair_with_params(params);
-        assert!(conn.connected && !conn.is_closing_handshake());
+        assert!(conn.connected && !conn.is_closing());
         assert_eq!(conn.peer.initial_max_data, 1 << 30);
         assert_eq!(conn.peer.initial_max_stream_data_uni, 1 << 24);
         peer.complete(&mut conn);
@@ -522,7 +522,7 @@ fn assert_transport_parameters_rejected(params: Vec<u8>, reorder: bool) {
         "malformed parameters activated the connection"
     );
     assert!(received.is_err());
-    assert!(conn.is_closing_handshake());
+    assert!(conn.is_closing());
     assert!(conn.one_rtt_local.is_none() && conn.one_rtt_remote.is_none());
     assert!(conn.key_updates.is_none());
     assert_eq!(conn.peer.initial_max_data, 0);
@@ -624,7 +624,7 @@ fn encrypted_nonminimal_scalars_preserve_peer_credit_and_complete_normally() {
         body[0] |= 0xc0;
         let params = replace_scalar(&tls_tickets::client_params(), id, &body);
         let (mut conn, mut peer) = Peer::pair_with_params(params);
-        assert!(conn.connected && !conn.is_closing_handshake());
+        assert!(conn.connected && !conn.is_closing());
         assert_eq!(conn.peer.initial_max_data, 1 << 30);
         assert_eq!(conn.peer.initial_max_stream_data_uni, 1 << 24);
         assert_eq!(

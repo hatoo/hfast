@@ -154,7 +154,7 @@ impl Endpoint {
         };
         *last = Instant::now();
         let received = conn.recv(datagram);
-        if conn.closed || (received.is_err() && !conn.is_closing_handshake()) {
+        if conn.closed || (received.is_err() && !conn.is_closing()) {
             self.conns.remove(&from);
             return;
         }
@@ -328,7 +328,7 @@ mod tests {
         let from = client.local_addr().unwrap();
         ep.datagram(&mut original.clone(), from);
         let conn = &ep.conns[&from].0;
-        assert!(conn.is_closing_handshake() && !conn.connected);
+        assert!(conn.is_closing() && !conn.connected);
         let cid = conn.local_cid;
         let deadline = conn.timeout().unwrap();
         ep.flush_ready();
